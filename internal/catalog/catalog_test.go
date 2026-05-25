@@ -522,6 +522,7 @@ func TestRegistryFallsBackToBinaryAfterNpxAndUvx(t *testing.T) {
 }
 
 func TestRegistryLeavesBinaryDownloadAsLastResort(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
 	service := NewWithBaseDirAndRegistry(t.TempDir(), fakeRegistrySource{
 		snapshot: acpregistry.Snapshot{
 			Version: "1.0.0",

@@ -697,17 +697,25 @@ func synthesizeRegistryLaunch(agent Agent, plan registryLaunchPlan) Agent {
 }
 
 // buildRegistryLaunchPlan picks the gateway launch strategy for a registry entry
-// in host-aware order: npx, uvx, PATH binary, then downloadable binary.
+// in host-aware order: PATH binary, npx, uvx, then downloadable binary.
 func buildRegistryLaunchPlan(entry acpregistry.AgentEntry) registryLaunchPlan {
+	// Prefer a locally available binary from the registry if one is declared.
+	if binary := entry.CurrentBinary; binary != nil && strings.TrimSpace(binary.CommandName) != "" {
+		return registryExternalLaunchPlan(binary.CommandName, append([]string(nil), binary.Args...))
+	}
+
+	// If no binary is available, try the package-based launcher that ships the
+	// agent on demand through npx.
 	if detectNpxPackage(entry.NpxPackage) {
 		return registryExternalLaunchPlan("npx", append([]string{"-y", entry.NpxPackage}, entry.NpxArgs...))
 	}
+
+	// uvx is the next fallback when the agent is published as a Python package.
 	if detectUvxPackage(entry.UvxPackage) {
 		return registryExternalLaunchPlan("uvx", append([]string{entry.UvxPackage}, entry.UvxArgs...))
 	}
-	if entry.CurrentBinary != nil && strings.TrimSpace(entry.CurrentBinary.CommandName) != "" {
-		return registryExternalLaunchPlan(entry.CurrentBinary.CommandName, append([]string(nil), entry.CurrentBinary.Args...))
-	}
+
+	// Nothing usable was advertised by the registry entry.
 	return registryLaunchPlan{}
 }
 

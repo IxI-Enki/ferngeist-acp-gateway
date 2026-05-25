@@ -16,7 +16,7 @@ func TestApplyPersistedSettingsUsesStoredValuesWhenEnvMissing(t *testing.T) {
 		RegistryURL:   "https://stored.example/registry.json",
 		PublicBaseURL: "https://helper.example.com",
 		EnableLAN:     &enableLAN,
-		GatewayName:    "stored-gateway",
+		GatewayName:   "stored-gateway",
 	})
 
 	if updated.RegistryURL != "https://stored.example/registry.json" {
@@ -43,7 +43,7 @@ func TestApplyPersistedSettingsKeepsExplicitEnvOverrides(t *testing.T) {
 		RegistryURL:   "https://env.example/registry.json",
 		PublicBaseURL: "https://env.example.com",
 		EnableLAN:     true,
-		GatewayName:    "env-gateway",
+		GatewayName:   "env-gateway",
 	}
 	enableLAN := false
 
@@ -51,7 +51,7 @@ func TestApplyPersistedSettingsKeepsExplicitEnvOverrides(t *testing.T) {
 		RegistryURL:   "https://stored.example/registry.json",
 		PublicBaseURL: "https://stored.example.com",
 		EnableLAN:     &enableLAN,
-		GatewayName:    "stored-gateway",
+		GatewayName:   "stored-gateway",
 	})
 
 	if updated.RegistryURL != cfg.RegistryURL {
