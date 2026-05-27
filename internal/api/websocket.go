@@ -1,11 +1,9 @@
 package api
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"strings"
 
@@ -57,56 +55,6 @@ func proxyWebSocketToStdio(src *websocket.Conn, writeFunc func([]byte) error, cl
 			return
 		}
 	}
-}
-
-// proxyStdioToWebSocket performs the reverse adaptation by streaming each stdio
-// line as one WebSocket text frame. Each line is also mirrored into the runtime
-// log buffer as `acp.stdout` traffic before being forwarded to the client.
-// The scanner buffer is capped at 1MB to match the WebSocket read limit.
-func proxyStdioToWebSocket(src io.Reader, dst *websocket.Conn, runtimeID string, appendLog func(string, string, string), done chan<- error) {
-	scanner := bufio.NewScanner(src)
-	buffer := make([]byte, 0, 64*1024)
-	scanner.Buffer(buffer, 1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if appendLog != nil {
-			appendLog(runtimeID, "acp.stdout", line)
-		}
-		ctx, cancel := websocketWriteContext()
-		err := dst.Write(ctx, websocket.MessageText, []byte(line))
-		cancel()
-		if err != nil {
-			if closeStatus := websocket.CloseStatus(err); closeStatus == websocket.StatusNormalClosure || closeStatus == websocket.StatusGoingAway {
-				done <- io.EOF
-				return
-			}
-			done <- err
-			return
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		done <- err
-		return
-	}
-	done <- io.EOF
-}
-
-func (s *Server) attachStdioRuntime(w http.ResponseWriter, r *http.Request, runtimeID string) (*websocket.Conn, io.WriteCloser, io.ReadCloser, func(), error) {
-	stdin, stdout, release, err := s.runtime.AttachStdio(runtimeID)
-	if err != nil {
-		writeError(w, http.StatusConflict, err.Error())
-		return nil, nil, nil, nil, err
-	}
-
-	clientConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
-	if err != nil {
-		release()
-		s.logger.Error("websocket upgrade failed", slog.String("error", err.Error()))
-		return nil, nil, nil, nil, err
-	}
-	clientConn.SetReadLimit(acpWebSocketReadLimit)
-	return clientConn, stdin, stdout, release, nil
 }
 
 // websocketScheme determines the WebSocket scheme (ws/wss) to advertise in

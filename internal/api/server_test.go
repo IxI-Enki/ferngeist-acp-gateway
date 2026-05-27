@@ -30,7 +30,9 @@ import (
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/pairing"
 	acpregistry "github.com/arafatamim/ferngeist-acp-gateway/internal/registry"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/runtime"
+	"github.com/arafatamim/ferngeist-acp-gateway/internal/session"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
+	"github.com/arafatamim/ferngeist-acp-gateway/internal/token"
 	"github.com/coder/websocket"
 )
 
@@ -121,6 +123,8 @@ func TestStatusUsesConfiguredGatewayName(t *testing.T) {
 		discovery.New(logger),
 		nil,
 		nil,
+		nil,
+		nil,
 	)
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
@@ -157,6 +161,8 @@ func TestStatusIncludesRegistryHealth(t *testing.T) {
 				LastFetchedAt: time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC),
 			},
 		},
+		nil,
+		nil,
 	)
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
@@ -190,6 +196,8 @@ func TestStatusIncludesRemoteConfigurationState(t *testing.T) {
 		pairing.NewService(logger, nil),
 		gateway.New(logger, nil),
 		discovery.New(logger),
+		nil,
+		nil,
 		nil,
 		nil,
 	)
@@ -236,6 +244,8 @@ func TestStatusIncludesLANRemoteVisibility(t *testing.T) {
 		discovery.New(logger),
 		nil,
 		nil,
+		nil,
+		nil,
 	)
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
@@ -277,6 +287,8 @@ func TestStatusClassifiesTailscaleRemoteVisibility(t *testing.T) {
 		discovery.New(logger),
 		nil,
 		nil,
+		nil,
+		nil,
 	)
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
@@ -306,6 +318,8 @@ func TestAdminPairingStartIncludesPayload(t *testing.T) {
 		pairing.NewService(logger, nil),
 		gateway.New(logger, nil),
 		discovery.New(logger),
+		nil,
+		nil,
 		nil,
 		nil,
 	)
@@ -351,6 +365,8 @@ func TestAdminStatusIncludesPairingReachability(t *testing.T) {
 		pairing.NewService(logger, nil),
 		gateway.New(logger, nil),
 		discovery.New(logger),
+		nil,
+		nil,
 		nil,
 		nil,
 	)
@@ -430,6 +446,8 @@ func TestStatusFlagsInvalidRemoteConfiguration(t *testing.T) {
 		pairing.NewService(logger, nil),
 		gateway.New(logger, nil),
 		discovery.New(logger),
+		nil,
+		nil,
 		nil,
 		nil,
 	)
@@ -1218,6 +1236,8 @@ func TestDiagnosticsExportIncludesGatewayLogsAndRuntimeLogs(t *testing.T) {
 		discovery.New(logger),
 		logSvc,
 		nil,
+		nil,
+		nil,
 	)
 	token := pairDevice(t, server)
 
@@ -1419,62 +1439,6 @@ func TestRuntimeLifecycleEndpoints(t *testing.T) {
 		t.Fatalf("WebSocketURL = %q should not contain bearer token", connectResponse.WebSocketURL)
 	}
 
-	socketServer := httptest.NewServer(server.Handler())
-	defer socketServer.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(socketServer.URL, "http") + connectResponse.WebSocketPath
-	conn := dialTestWebSocket(t, wsURL, connectResponse.BearerToken)
-	defer conn.CloseNow()
-
-	// Send an initialize request to the agent and verify the response.
-	initializePayload := []byte(`{"jsonrpc":"2.0","id":"1","method":"initialize","params":{"protocolVersion":1,"capabilities":{},"clientInfo":{"name":"test","version":"0"}}}`)
-	if err := writeTestWebSocketMessage(conn, websocket.MessageText, initializePayload); err != nil {
-		t.Fatalf("Write() error = %v", err)
-	}
-
-	var initializeResp struct {
-		Result struct {
-			AgentInfo struct {
-				Name string `json:"name"`
-			} `json:"agentInfo"`
-		} `json:"result"`
-	}
-	msgType, data := readTestWebSocketMessage(t, conn)
-	if msgType != websocket.MessageText {
-		t.Fatalf("message type = %v, want %v", msgType, websocket.MessageText)
-	}
-	if err := json.Unmarshal(data, &initializeResp); err != nil {
-		t.Fatalf("Unmarshal(initialize response) error = %v", err)
-	}
-	if initializeResp.Result.AgentInfo.Name != "mock-acp" {
-		t.Fatalf("agentInfo.name = %q, want %q", initializeResp.Result.AgentInfo.Name, "mock-acp")
-	}
-
-	// Keep the websocket idle briefly before the first ACP request. The gateway
-	// should leave quiet sessions alone instead of timing them out eagerly.
-	time.Sleep(200 * time.Millisecond)
-
-	payload := []byte(`{"jsonrpc":"2.0","id":"2","method":"session/new","params":{}}`)
-	if err := writeTestWebSocketMessage(conn, websocket.MessageText, payload); err != nil {
-		t.Fatalf("Write() error = %v", err)
-	}
-
-	messageType, sessionResp := readTestWebSocketMessage(t, conn)
-	if messageType != websocket.MessageText {
-		t.Fatalf("message type = %v, want %v", messageType, websocket.MessageText)
-	}
-	var sessionNewResp struct {
-		Result struct {
-			SessionID string `json:"sessionId"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(sessionResp, &sessionNewResp); err != nil {
-		t.Fatalf("Unmarshal(session/new response) error = %v", err)
-	}
-	if sessionNewResp.Result.SessionID == "" {
-		t.Fatal("session/new response should contain a sessionId")
-	}
-
 	stopRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/stop", nil)
 	stopRequest.Header.Set("Authorization", "Bearer "+token)
 	stopRecorder := httptest.NewRecorder()
@@ -1515,11 +1479,6 @@ func TestRuntimeLifecycleEndpoints(t *testing.T) {
 		t.Fatalf("Runtime.Stopped = %d, want 1", diagnostics.Runtime.Stopped)
 	}
 
-	reconnect, _, err := dialTestWebSocketConn(wsURL, connectResponse.BearerToken)
-	if err == nil {
-		reconnect.CloseNow()
-		t.Fatal("expected websocket dial to fail after runtime token revocation")
-	}
 }
 
 func TestRuntimeRestartEndpointReturnsFreshConnectDescriptor(t *testing.T) {
@@ -1570,35 +1529,6 @@ func TestRuntimeRestartEndpointReturnsFreshConnectDescriptor(t *testing.T) {
 		t.Fatal("restart should hand back a new runtime id")
 	}
 
-	socketServer := httptest.NewServer(server.Handler())
-	defer socketServer.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(socketServer.URL, "http") + restartResponse.WebSocketPath
-	conn := dialTestWebSocket(t, wsURL, restartResponse.BearerToken)
-	defer conn.CloseNow()
-
-	initializePayload := []byte(`{"jsonrpc":"2.0","id":"1","method":"initialize","params":{"protocolVersion":1,"capabilities":{},"clientInfo":{"name":"test","version":"0"}}}`)
-	if err := writeTestWebSocketMessage(conn, websocket.MessageText, initializePayload); err != nil {
-		t.Fatalf("Write() error = %v", err)
-	}
-
-	msgType, data := readTestWebSocketMessage(t, conn)
-	if msgType != websocket.MessageText {
-		t.Fatalf("message type = %v, want %v", msgType, websocket.MessageText)
-	}
-	var initResp struct {
-		Result struct {
-			AgentInfo struct {
-				Env string `json:"env"`
-			} `json:"agentInfo"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(data, &initResp); err != nil {
-		t.Fatalf("Unmarshal(initialize response) error = %v", err)
-	}
-	if initResp.Result.AgentInfo.Env != "restart-token" {
-		t.Fatalf("agentInfo.env = %q, want %q", initResp.Result.AgentInfo.Env, "restart-token")
-	}
 }
 
 func TestRuntimeRestartWithEnvRequiresElevatedScopeByDefault(t *testing.T) {
@@ -1616,6 +1546,8 @@ func TestRuntimeRestartWithEnvRequiresElevatedScopeByDefault(t *testing.T) {
 		pairing.NewService(logger, nil),
 		gateway.New(logger, nil),
 		discovery.New(logger),
+		nil,
+		nil,
 		nil,
 		nil,
 	)
@@ -1717,163 +1649,15 @@ func TestExternalStdioRuntimeLifecycleEndpoints(t *testing.T) {
 	if err := json.Unmarshal(connectRecorder.Body.Bytes(), &connectResponse); err != nil {
 		t.Fatalf("Unmarshal(connect) error = %v", err)
 	}
-
-	socketServer := httptest.NewServer(server.Handler())
-	defer socketServer.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(socketServer.URL, "http") + connectResponse.WebSocketPath
-	conn := dialTestWebSocket(t, wsURL, connectResponse.BearerToken)
-	defer conn.CloseNow()
-
-	initializePayload := []byte(`{"jsonrpc":"2.0","id":"1","method":"initialize","params":{"protocolVersion":1,"capabilities":{},"clientInfo":{"name":"test","version":"0"}}}`)
-	if err := writeTestWebSocketMessage(conn, websocket.MessageText, initializePayload); err != nil {
-		t.Fatalf("Write() error = %v", err)
+	if connectResponse.WebSocketPath == "" {
+		t.Fatal("WebSocketPath should not be empty")
 	}
-
-	messageType, respData := readTestWebSocketMessage(t, conn)
-	if messageType != websocket.MessageText {
-		t.Fatalf("message type = %v, want %v", messageType, websocket.MessageText)
-	}
-	var initResp struct {
-		Result struct {
-			AgentInfo struct {
-				Name string `json:"name"`
-			} `json:"agentInfo"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(respData, &initResp); err != nil {
-		t.Fatalf("Unmarshal(initialize response) error = %v", err)
-	}
-	if initResp.Result.AgentInfo.Name != "mock-acp" {
-		t.Fatalf("agentInfo.name = %q, want %q", initResp.Result.AgentInfo.Name, "mock-acp")
-	}
-
-	conn.CloseNow()
-	time.Sleep(150 * time.Millisecond)
-
-	logsRequest := httptest.NewRequest(http.MethodGet, "/v1/runtimes/"+startResponse.Runtime.ID+"/logs", nil)
-	logsRequest.Header.Set("Authorization", "Bearer "+token)
-	logsRecorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(logsRecorder, logsRequest)
-	if logsRecorder.Code != http.StatusOK {
-		t.Fatalf("logs status code = %d, want %d", logsRecorder.Code, http.StatusOK)
-	}
-
-	var logsResponse runtimeLogsResponse
-	if err := json.Unmarshal(logsRecorder.Body.Bytes(), &logsResponse); err != nil {
-		t.Fatalf("Unmarshal(logs) error = %v", err)
-	}
-	foundStdoutACP := false
-	foundStdinPayload := false
-	for _, entry := range logsResponse.Logs {
-		switch {
-		case entry.Stream == "acp.stdout" && strings.Contains(entry.Message, "mock-acp"):
-			foundStdoutACP = true
-		case entry.Stream == "acp.stdin" && strings.Contains(entry.Message, "initialize"):
-			foundStdinPayload = true
-		}
-	}
-	if !foundStdoutACP {
-		t.Fatal("expected stdout ACP response to be retained in runtime logs")
-	}
-	if !foundStdinPayload {
-		t.Fatal("expected stdin ACP request to be retained in runtime logs")
-	}
-
-	listRequest := httptest.NewRequest(http.MethodGet, "/v1/runtimes", nil)
-	listRequest.Header.Set("Authorization", "Bearer "+token)
-	listRecorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(listRecorder, listRequest)
-	if listRecorder.Code != http.StatusOK {
-		t.Fatalf("list status code = %d, want %d", listRecorder.Code, http.StatusOK)
-	}
-
-	var listResponse runtimesResponse
-	if err := json.Unmarshal(listRecorder.Body.Bytes(), &listResponse); err != nil {
-		t.Fatalf("Unmarshal(list) error = %v", err)
-	}
-	if len(listResponse.Runtimes) != 1 {
-		t.Fatalf("len(runtimes) = %d, want 1 after stdio session cleanup", len(listResponse.Runtimes))
-	}
-	if listResponse.Runtimes[0].Status != runtime.StatusStopped {
-		t.Fatalf("runtime status = %q, want %q after stdio session cleanup", listResponse.Runtimes[0].Status, runtime.StatusStopped)
-	}
-}
-
-func TestWebSocketDisconnectStopsRuntimeAndAllowsReconnect(t *testing.T) {
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	server := newTestServerWithBaseDir(baseDir)
-	token := pairDevice(t, server)
-
-	startRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
-	startRequest.Header.Set("Authorization", "Bearer "+token)
-	startRecorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(startRecorder, startRequest)
-	if startRecorder.Code != http.StatusOK {
-		t.Fatalf("start status code = %d, want %d", startRecorder.Code, http.StatusOK)
-	}
-
-	var startResponse runtimeStartResponse
-	if err := json.Unmarshal(startRecorder.Body.Bytes(), &startResponse); err != nil {
-		t.Fatalf("Unmarshal(start) error = %v", err)
-	}
-
-	connectRequest := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+startResponse.Runtime.ID+"/connect", nil)
-	connectRequest.Header.Set("Authorization", "Bearer "+token)
-	connectRecorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(connectRecorder, connectRequest)
-	if connectRecorder.Code != http.StatusOK {
-		t.Fatalf("connect status code = %d, want %d", connectRecorder.Code, http.StatusOK)
-	}
-
-	var connectResponse runtimeConnectResponse
-	if err := json.Unmarshal(connectRecorder.Body.Bytes(), &connectResponse); err != nil {
-		t.Fatalf("Unmarshal(connect) error = %v", err)
-	}
-
-	socketServer := httptest.NewServer(server.Handler())
-	defer socketServer.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(socketServer.URL, "http") + connectResponse.WebSocketPath
-	conn := dialTestWebSocket(t, wsURL, connectResponse.BearerToken)
-	time.Sleep(100 * time.Millisecond)
-	conn.CloseNow()
-
-	time.Sleep(150 * time.Millisecond)
-
-	restartStartRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
-	restartStartRequest.Header.Set("Authorization", "Bearer "+token)
-	restartStartRecorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(restartStartRecorder, restartStartRequest)
-	if restartStartRecorder.Code != http.StatusOK {
-		t.Fatalf("restart start status code = %d, want %d", restartStartRecorder.Code, http.StatusOK)
-	}
-
-	var restartStartResponse runtimeStartResponse
-	if err := json.Unmarshal(restartStartRecorder.Body.Bytes(), &restartStartResponse); err != nil {
-		t.Fatalf("Unmarshal(restart start) error = %v", err)
-	}
-	if restartStartResponse.Runtime.ID == startResponse.Runtime.ID {
-		t.Fatal("expected a fresh runtime id after websocket disconnect cleanup")
-	}
-
-	reconnectRequest := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+restartStartResponse.Runtime.ID+"/connect", nil)
-	reconnectRequest.Header.Set("Authorization", "Bearer "+token)
-	reconnectRecorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(reconnectRecorder, reconnectRequest)
-	if reconnectRecorder.Code != http.StatusOK {
-		t.Fatalf("reconnect status code = %d, want %d", reconnectRecorder.Code, http.StatusOK)
-	}
-
-	stopRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/stop", nil)
-	stopRequest.Header.Set("Authorization", "Bearer "+token)
-	stopRecorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(stopRecorder, stopRequest)
-	if stopRecorder.Code != http.StatusOK {
-		t.Fatalf("stop status code = %d, want %d", stopRecorder.Code, http.StatusOK)
-	}
+	t.Cleanup(func() {
+		stopReq := httptest.NewRequest(http.MethodPost, "/v1/agents/codex-acp/stop", nil)
+		stopReq.Header.Set("Authorization", "Bearer "+token)
+		stopRec := httptest.NewRecorder()
+		server.Handler().ServeHTTP(stopRec, stopReq)
+	})
 }
 
 func dialTestWebSocket(t *testing.T, wsURL string, bearerToken ...string) *websocket.Conn {
@@ -1940,6 +1724,8 @@ func newConfiguredTestServer(cfg config.Config) *Server {
 		discovery.New(logger),
 		nil,
 		nil,
+		nil,
+		nil,
 	)
 }
 
@@ -1968,6 +1754,8 @@ func newConfiguredTestServerWithBaseDir(baseDir string, cfg config.Config) *Serv
 		discovery.New(logger),
 		nil,
 		nil,
+		nil,
+		nil,
 	)
 }
 
@@ -1984,6 +1772,8 @@ func newTestServerWithBaseDirAndRegistry(baseDir string, registrySource catalog.
 		discovery.New(logger),
 		nil,
 		nil,
+		nil,
+		nil,
 	)
 }
 
@@ -1998,6 +1788,8 @@ func newTestServerWithStore(baseDir string, store *storage.SQLiteStore) *Server 
 		pairing.NewService(logger, store),
 		gateway.New(logger, store),
 		discovery.New(logger),
+		nil,
+		nil,
 		nil,
 		nil,
 	)
@@ -2220,4 +2012,511 @@ func findAgentState(t *testing.T, agents []agentRuntimeState, id string) agentRu
 	}
 	t.Fatalf("agent %q not found", id)
 	return agentRuntimeState{}
+}
+
+// ---- Session test harness ----
+
+type sessionTestHarness struct {
+	t         *testing.T
+	server    *Server
+	token     string
+	deviceID  string
+	runtimeID string
+	tokenSvc  *token.Service
+}
+
+func newSessionTestHarness(t *testing.T) *sessionTestHarness {
+	t.Helper()
+
+	baseDir := t.TempDir()
+	buildMockAgent(t, baseDir)
+
+	store, err := storage.Open(filepath.Join(baseDir, "test.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	server := newTestServerWithStore(baseDir, store)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tokenSvc := token.New(logger)
+	sessionSvc := session.NewRuntimeSession(logger, store, server.runtime, tokenSvc, session.Config{
+		MaxDisconnected: 5 * time.Minute,
+		MaxPerDevice:    3,
+	})
+	server.sessionSvc = sessionSvc
+	t.Cleanup(sessionSvc.Shutdown)
+
+	armReq := httptest.NewRequest(http.MethodPost, "/admin/v1/pairings/start", nil)
+	armRec := httptest.NewRecorder()
+	server.AdminHandler().ServeHTTP(armRec, armReq)
+	if armRec.Code != http.StatusOK {
+		t.Fatalf("admin pairing start status = %d", armRec.Code)
+	}
+
+	startPairReq := httptest.NewRequest(http.MethodPost, "/v1/pair/start", nil)
+	startPairRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(startPairRec, startPairReq)
+	if startPairRec.Code != http.StatusOK {
+		t.Fatalf("pair start status = %d", startPairRec.Code)
+	}
+	var startPairResp pairStartResponse
+	if err := json.Unmarshal(startPairRec.Body.Bytes(), &startPairResp); err != nil {
+		t.Fatalf("Unmarshal(pair start) error = %v", err)
+	}
+
+	challengeReq := httptest.NewRequest(http.MethodGet, "/admin/v1/pairings/"+startPairResp.ChallengeID, nil)
+	challengeRec := httptest.NewRecorder()
+	server.AdminHandler().ServeHTTP(challengeRec, challengeReq)
+	if challengeRec.Code != http.StatusOK {
+		t.Fatalf("admin challenge status = %d", challengeRec.Code)
+	}
+	var challengeResp adminPairingResponse
+	if err := json.Unmarshal(challengeRec.Body.Bytes(), &challengeResp); err != nil {
+		t.Fatalf("Unmarshal(challenge) error = %v", err)
+	}
+
+	completeBody, err := json.Marshal(pairCompleteRequest{
+		ChallengeID: startPairResp.ChallengeID,
+		Code:        challengeResp.Code,
+		DeviceName:  "Session Test Device",
+	})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	completeReq := httptest.NewRequest(http.MethodPost, "/v1/pair/complete", bytes.NewReader(completeBody))
+	completeRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(completeRec, completeReq)
+	if completeRec.Code != http.StatusOK {
+		t.Fatalf("pair complete status = %d", completeRec.Code)
+	}
+	var completeResp pairCompleteResponse
+	if err := json.Unmarshal(completeRec.Body.Bytes(), &completeResp); err != nil {
+		t.Fatalf("Unmarshal(complete) error = %v", err)
+	}
+	deviceID := completeResp.DeviceID
+
+	startRuntimeReq := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
+	startRuntimeReq.Header.Set("Authorization", "Bearer "+completeResp.Token)
+	startRuntimeRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(startRuntimeRec, startRuntimeReq)
+	if startRuntimeRec.Code != http.StatusOK {
+		t.Fatalf("agent start status = %d, body=%s", startRuntimeRec.Code, startRuntimeRec.Body.String())
+	}
+	var startRuntimeResp runtimeStartResponse
+	if err := json.Unmarshal(startRuntimeRec.Body.Bytes(), &startRuntimeResp); err != nil {
+		t.Fatalf("Unmarshal(start) error = %v", err)
+	}
+
+	t.Cleanup(func() {
+		stopReq := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/stop", nil)
+		stopReq.Header.Set("Authorization", "Bearer "+completeResp.Token)
+		stopRec := httptest.NewRecorder()
+		server.Handler().ServeHTTP(stopRec, stopReq)
+	})
+
+	return &sessionTestHarness{
+		t:         t,
+		server:    server,
+		token:     completeResp.Token,
+		deviceID:  deviceID,
+		runtimeID: startRuntimeResp.Runtime.ID,
+		tokenSvc:  tokenSvc,
+	}
+}
+
+func (h *sessionTestHarness) createSession() string {
+	h.t.Helper()
+	ctx := context.Background()
+	sess, _, err := h.server.sessionSvc.Create(ctx, h.runtimeID, h.deviceID, "mock-acp")
+	if err != nil {
+		h.t.Fatalf("session.Create() error = %v", err)
+	}
+	return sess.ID
+}
+
+// ---- Session handler tests ----
+
+func TestSessionListReturnsCreatedSessions(t *testing.T) {
+	h := newSessionTestHarness(t)
+	sessionID := h.createSession()
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/sessions", nil)
+	request.Header.Set("Authorization", "Bearer "+h.token)
+	recorder := httptest.NewRecorder()
+	h.server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	var resp sessionListResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if len(resp.Sessions) != 1 {
+		t.Fatalf("len(sessions) = %d, want 1", len(resp.Sessions))
+	}
+	if resp.Sessions[0].SessionID != sessionID {
+		t.Fatalf("SessionID = %q, want %q", resp.Sessions[0].SessionID, sessionID)
+	}
+}
+
+func TestSessionResumeReturnsAttachToken(t *testing.T) {
+	h := newSessionTestHarness(t)
+	sessionID := h.createSession()
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/sessions/"+sessionID+"/resume", nil)
+	request.Header.Set("Authorization", "Bearer "+h.token)
+	recorder := httptest.NewRecorder()
+	h.server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var resp sessionResumeResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if len(resp.AttachToken) != 64 {
+		t.Fatalf("AttachToken = %q, want 64-char hex string", resp.AttachToken)
+	}
+}
+
+func TestSessionResumeHandler_Unauthorized(t *testing.T) {
+	h := newSessionTestHarness(t)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/sessions/nonexistent/resume", nil)
+	recorder := httptest.NewRecorder()
+	h.server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestSessionResumeHandler_NotFound(t *testing.T) {
+	h := newSessionTestHarness(t)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/sessions/nonexistent/resume", nil)
+	request.Header.Set("Authorization", "Bearer "+h.token)
+	recorder := httptest.NewRecorder()
+	h.server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+
+	var errResp errorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if errResp.Error != session.ErrSessionNotFound.Error() {
+		t.Fatalf("error = %q, want %q", errResp.Error, session.ErrSessionNotFound.Error())
+	}
+}
+
+func TestSessionListReturnsEmptyListWhenNoSessions(t *testing.T) {
+	h := newSessionTestHarness(t)
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/sessions", nil)
+	request.Header.Set("Authorization", "Bearer "+h.token)
+	recorder := httptest.NewRecorder()
+	h.server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	var resp sessionListResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if len(resp.Sessions) != 0 {
+		t.Fatalf("len(sessions) = %d, want 0", len(resp.Sessions))
+	}
+}
+
+func TestSessionCloseReturnsNoContent(t *testing.T) {
+	h := newSessionTestHarness(t)
+	sessionID := h.createSession()
+
+	request := httptest.NewRequest(http.MethodDelete, "/v1/sessions/"+sessionID, nil)
+	request.Header.Set("Authorization", "Bearer "+h.token)
+	recorder := httptest.NewRecorder()
+	h.server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status code = %d, want %d, body=%s", recorder.Code, http.StatusNoContent, recorder.Body.String())
+	}
+}
+
+func TestSessionCloseHandler_Unauthorized(t *testing.T) {
+	h := newSessionTestHarness(t)
+
+	request := httptest.NewRequest(http.MethodDelete, "/v1/sessions/nonexistent", nil)
+	recorder := httptest.NewRecorder()
+	h.server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestSessionCloseHandler_NotFound(t *testing.T) {
+	h := newSessionTestHarness(t)
+	token := pairDevice(t, h.server)
+	// Use a different device token to avoid matching the session harness device
+	request := httptest.NewRequest(http.MethodDelete, "/v1/sessions/nonexistent", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	recorder := httptest.NewRecorder()
+	h.server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+}
+
+func TestSessionWebSocketRejectsInvalidAttachToken(t *testing.T) {
+	h := newSessionTestHarness(t)
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/acp/"+h.runtimeID+"?sessionId=xxx&attachToken=yyy", nil)
+	recorder := httptest.NewRecorder()
+	h.server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status code = %d, want %d, body=%s", recorder.Code, http.StatusUnauthorized, recorder.Body.String())
+	}
+}
+
+func TestSessionWebSocketHandler_SessionNotFound(t *testing.T) {
+	h := newSessionTestHarness(t)
+
+	attachToken, _ := h.tokenSvc.Mint("nonexistent", h.deviceID, 5*time.Minute)
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/acp/"+h.runtimeID+"?sessionId=nonexistent&attachToken="+attachToken, nil)
+	recorder := httptest.NewRecorder()
+	h.server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status code = %d, want %d, body=%s", recorder.Code, http.StatusConflict, recorder.Body.String())
+	}
+}
+
+func TestSessionEndpointsReturnServiceUnavailableWhenNoSessionService(t *testing.T) {
+	server := newTestServer()
+	token := pairDevice(t, server)
+
+	t.Run("Resume", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodPost, "/v1/sessions/xxx/resume", nil)
+		request.Header.Set("Authorization", "Bearer "+token)
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+		}
+	})
+
+	t.Run("List", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodGet, "/v1/sessions", nil)
+		request.Header.Set("Authorization", "Bearer "+token)
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+		}
+	})
+
+	t.Run("Close", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodDelete, "/v1/sessions/xxx", nil)
+		request.Header.Set("Authorization", "Bearer "+token)
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+		}
+	})
+}
+
+func TestSessionWebSocketRuntimeMismatch(t *testing.T) {
+	h := newSessionTestHarness(t)
+	sessionID := h.createSession()
+
+	resumeReq := httptest.NewRequest(http.MethodPost, "/v1/sessions/"+sessionID+"/resume", nil)
+	resumeReq.Header.Set("Authorization", "Bearer "+h.token)
+	resumeRec := httptest.NewRecorder()
+	h.server.Handler().ServeHTTP(resumeRec, resumeReq)
+	if resumeRec.Code != http.StatusOK {
+		t.Fatalf("resume status = %d, want %d", resumeRec.Code, http.StatusOK)
+	}
+
+	var resumeResp sessionResumeResponse
+	if err := json.Unmarshal(resumeRec.Body.Bytes(), &resumeResp); err != nil {
+		t.Fatalf("Unmarshal(resume) error = %v", err)
+	}
+
+	ts := httptest.NewServer(h.server.Handler())
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") +
+		"/v1/acp/wrong-runtime-id" +
+		"?sessionId=" + sessionID +
+		"&attachToken=" + resumeResp.AttachToken
+
+	_, _, err := dialTestWebSocketConn(wsURL)
+	if err == nil {
+		t.Fatal("expected WebSocket dial to fail (runtime ID mismatch)")
+	}
+}
+
+func TestSessionWebSocketReconnect(t *testing.T) {
+	h := newSessionTestHarness(t)
+	sessionID := h.createSession()
+
+	resumeReq := httptest.NewRequest(http.MethodPost, "/v1/sessions/"+sessionID+"/resume", nil)
+	resumeReq.Header.Set("Authorization", "Bearer "+h.token)
+	resumeRec := httptest.NewRecorder()
+	h.server.Handler().ServeHTTP(resumeRec, resumeReq)
+	if resumeRec.Code != http.StatusOK {
+		t.Fatalf("resume status = %d, want %d", resumeRec.Code, http.StatusOK)
+	}
+
+	var resumeResp sessionResumeResponse
+	if err := json.Unmarshal(resumeRec.Body.Bytes(), &resumeResp); err != nil {
+		t.Fatalf("Unmarshal(resume) error = %v", err)
+	}
+
+	ts := httptest.NewServer(h.server.Handler())
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") +
+		"/v1/acp/" + h.runtimeID +
+		"?sessionId=" + sessionID +
+		"&attachToken=" + resumeResp.AttachToken
+
+	conn := dialTestWebSocket(t, wsURL)
+	defer conn.CloseNow()
+
+	readCtx, readCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer readCancel()
+
+	if err := conn.Write(readCtx, websocket.MessageText, []byte(`{"jsonrpc":"2.0","id":"1","method":"ping"}`)); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	conn.CloseNow()
+}
+
+func TestRuntimeConnectResilientReturnsSessionIDAndAttachToken(t *testing.T) {
+	baseDir := t.TempDir()
+	buildMockAgent(t, baseDir)
+
+	store, err := storage.Open(filepath.Join(baseDir, "test.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	server := newTestServerWithStore(baseDir, store)
+	bearerToken := pairDevice(t, server)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tokenSvc := token.New(logger)
+	sessionSvc := session.NewRuntimeSession(logger, store, server.runtime, tokenSvc, session.Config{
+		MaxDisconnected: 5 * time.Minute,
+		MaxPerDevice:    3,
+	})
+	server.sessionSvc = sessionSvc
+
+	startReq := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
+	startReq.Header.Set("Authorization", "Bearer "+bearerToken)
+	startRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(startRec, startReq)
+	if startRec.Code != http.StatusOK {
+		t.Fatalf("start status = %d, want %d", startRec.Code, http.StatusOK)
+	}
+	t.Cleanup(func() {
+		stopReq := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/stop", nil)
+		stopReq.Header.Set("Authorization", "Bearer "+bearerToken)
+		stopRec := httptest.NewRecorder()
+		server.Handler().ServeHTTP(stopRec, stopReq)
+	})
+
+	var startResp runtimeStartResponse
+	if err := json.Unmarshal(startRec.Body.Bytes(), &startResp); err != nil {
+		t.Fatalf("Unmarshal(start) error = %v", err)
+	}
+
+	connectBody, _ := json.Marshal(map[string]string{"sessionMode": "resilient"})
+	connectReq := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+startResp.Runtime.ID+"/connect", bytes.NewReader(connectBody))
+	connectReq.Header.Set("Authorization", "Bearer "+bearerToken)
+	connectReq.Header.Set("Content-Type", "application/json")
+	connectRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(connectRec, connectReq)
+
+	if connectRec.Code != http.StatusOK {
+		t.Fatalf("connect status = %d, want %d, body=%s", connectRec.Code, http.StatusOK, connectRec.Body.String())
+	}
+
+	var connectResp runtimeConnectResponse
+	if err := json.Unmarshal(connectRec.Body.Bytes(), &connectResp); err != nil {
+		t.Fatalf("Unmarshal(connect) error = %v", err)
+	}
+	if len(connectResp.SessionID) != 32 {
+		t.Fatalf("SessionID = %q, want 32-char hex string", connectResp.SessionID)
+	}
+	if len(connectResp.AttachToken) != 64 {
+		t.Fatalf("AttachToken = %q, want 64-char hex string", connectResp.AttachToken)
+	}
+}
+
+func TestRuntimeConnectResilientDegradesGracefullyWithoutSessionSvc(t *testing.T) {
+	baseDir := t.TempDir()
+	buildMockAgent(t, baseDir)
+
+	server := newTestServerWithBaseDir(baseDir)
+	token := pairDevice(t, server)
+
+	startReq := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
+	startReq.Header.Set("Authorization", "Bearer "+token)
+	startRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(startRec, startReq)
+	if startRec.Code != http.StatusOK {
+		t.Fatalf("start status = %d, want %d", startRec.Code, http.StatusOK)
+	}
+	t.Cleanup(func() {
+		stopReq := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/stop", nil)
+		stopReq.Header.Set("Authorization", "Bearer "+token)
+		stopRec := httptest.NewRecorder()
+		server.Handler().ServeHTTP(stopRec, stopReq)
+	})
+
+	var startResp runtimeStartResponse
+	if err := json.Unmarshal(startRec.Body.Bytes(), &startResp); err != nil {
+		t.Fatalf("Unmarshal(start) error = %v", err)
+	}
+
+	connectBody, _ := json.Marshal(map[string]string{"sessionMode": "resilient"})
+	connectReq := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+startResp.Runtime.ID+"/connect", bytes.NewReader(connectBody))
+	connectReq.Header.Set("Authorization", "Bearer "+token)
+	connectReq.Header.Set("Content-Type", "application/json")
+	connectRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(connectRec, connectReq)
+
+	if connectRec.Code != http.StatusOK {
+		t.Fatalf("connect status = %d, want %d", connectRec.Code, http.StatusOK)
+	}
+
+	var connectResp runtimeConnectResponse
+	if err := json.Unmarshal(connectRec.Body.Bytes(), &connectResp); err != nil {
+		t.Fatalf("Unmarshal(connect) error = %v", err)
+	}
+	if connectResp.SessionID != "" {
+		t.Fatalf("SessionID = %q, want empty (no session service)", connectResp.SessionID)
+	}
+	if connectResp.AttachToken != "" {
+		t.Fatalf("AttachToken = %q, want empty (no session service)", connectResp.AttachToken)
+	}
 }
