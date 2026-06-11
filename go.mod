@@ -3,6 +3,7 @@ module github.com/arafatamim/ferngeist-acp-gateway
 go 1.26.0
 
 require (
+	github.com/coder/acp-go-sdk v0.13.0
 	github.com/coder/websocket v1.8.14
 	github.com/grandcat/zeroconf v1.0.0
 	github.com/mdp/qrterminal/v3 v3.2.1

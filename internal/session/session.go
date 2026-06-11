@@ -27,6 +27,7 @@ import (
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/runtime"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
 	"github.com/coder/acp-go-sdk"
+	"github.com/coder/websocket"
 )
 
 const (
@@ -42,7 +43,6 @@ const (
 var (
 	ErrSessionNotFound     = errors.New("session not found")
 	ErrSessionNotActive    = errors.New("session is not in an active state")
-	ErrSessionAlreadyBound = errors.New("session already has a connected client")
 	ErrAttachTokenInvalid  = errors.New("attach token is invalid or expired")
 	ErrSessionLimitReached = errors.New("session limit for this device has been reached")
 	ErrDeviceMismatch      = errors.New("session does not belong to this device")
@@ -137,10 +137,12 @@ type Session struct {
 	leasedPipes runtime.Pipes        // exclusive stdio lease
 	cancelPump  context.CancelFunc   // stops the StdoutDrainLoop on session close
 
-	connected  bool        // true when a WebSocket client is currently attached
-	inboundSeq atomic.Int64 // monotonic counter for client->agent diagnostic frames
+	connected   bool            // true when a WebSocket client is currently attached
+	currentConn *websocket.Conn // the active client conn, or nil; used to evict on takeover
+	connGen     int64           // bumped on every attach; fences stale detaches from evicted conns
+	inboundSeq  atomic.Int64    // monotonic counter for client->agent diagnostic frames
 
-	mu sync.Mutex // protects Status, DisconnectedAt, and connected
+	mu sync.Mutex // protects Status, DisconnectedAt, connected, currentConn, connGen
 }
 
 // NewRuntimeSession creates a new session service and starts the reaper goroutine.
@@ -249,7 +251,6 @@ func (rs *RuntimeSession) Create(ctx context.Context, runtimeID, deviceID, agent
 		logger:             rs.logger,
 		appendLog:          rs.pm.AppendLog,
 		onPushNotification: onPushNotification,
-		onClientDetach:     func() { rs.DetachClient(sessionID) },
 	}
 
 	go pump.StdoutDrainLoop(pumpCtx)
@@ -311,6 +312,28 @@ func (rs *RuntimeSession) Create(ctx context.Context, runtimeID, deviceID, agent
 	return sess, attachToken, nil
 }
 
+// FindReconnectableByRuntime returns the ID of the existing reconnectable
+// session (active or disconnected) for a runtime owned by the given device, if
+// one exists. A runtime has at most one session because the session holds the
+// runtime's exclusive lease. This lets a reconnect reuse the live session — and
+// its still-running agent — instead of attempting to create a second session,
+// which would fail with ErrRuntimeLeaseHeld because the lease is still held.
+func (rs *RuntimeSession) FindReconnectableByRuntime(runtimeID, deviceID string) (string, bool) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	for _, sess := range rs.sessions {
+		sess.mu.Lock()
+		match := sess.RuntimeID == runtimeID && sess.DeviceID == deviceID &&
+			(sess.Status == StatusActive || sess.Status == StatusDisconnected)
+		id := sess.ID
+		sess.mu.Unlock()
+		if match {
+			return id, true
+		}
+	}
+	return "", false
+}
+
 // Resume mints a new single-use attach token for reconnecting to an existing session.
 func (rs *RuntimeSession) Resume(ctx context.Context, sessionID, deviceID string) (string, error) {
 	rs.mu.Lock()
@@ -336,15 +359,24 @@ func (rs *RuntimeSession) Resume(ctx context.Context, sessionID, deviceID string
 	return token, nil
 }
 
-// AttachClient validates the attach token and marks the session as attached.
-// Returns the session's RuntimeID so the handler can verify the path parameter.
-func (rs *RuntimeSession) AttachClient(ctx context.Context, sessionID, attachToken string) (string, error) {
+// AttachClient validates the attach token and claims the session for a new
+// client, taking over from any previously-bound connection. It returns the
+// session's RuntimeID (so the handler can verify the path parameter) and a
+// connection generation that the caller must pass to BindConn and DetachClient
+// so a superseded connection cannot bind or detach over a newer one.
+//
+// Takeover (rather than rejecting with a 409) is deliberate: a resilient
+// session's previous connection is almost always a dead mobile socket the
+// gateway has not yet observed as closed (half-open TCP, no FIN). Refusing the
+// reconnect would strand the session until the dead peer is detected, so a valid
+// attach always wins and evicts the stale connection.
+func (rs *RuntimeSession) AttachClient(ctx context.Context, sessionID, attachToken string) (string, int64, error) {
 	validatedSessionID, claimDeviceID, err := rs.tokenSvc.Validate(attachToken)
 	if err != nil {
-		return "", ErrAttachTokenInvalid
+		return "", 0, ErrAttachTokenInvalid
 	}
 	if validatedSessionID != sessionID {
-		return "", ErrAttachTokenInvalid
+		return "", 0, ErrAttachTokenInvalid
 	}
 
 	rs.mu.Lock()
@@ -352,46 +384,85 @@ func (rs *RuntimeSession) AttachClient(ctx context.Context, sessionID, attachTok
 	rs.mu.Unlock()
 
 	if !ok {
-		return "", ErrSessionNotFound
+		return "", 0, ErrSessionNotFound
 	}
 
 	sess.mu.Lock()
-	defer sess.mu.Unlock()
-
 	if sess.DeviceID != claimDeviceID {
-		return "", ErrDeviceMismatch
+		sess.mu.Unlock()
+		return "", 0, ErrDeviceMismatch
 	}
-
 	if sess.Status == StatusFailed {
-		return "", ErrSessionNotActive
+		sess.mu.Unlock()
+		return "", 0, ErrSessionNotActive
 	}
 
-	if sess.connected {
-		return "", ErrSessionAlreadyBound
-	}
-
-	now := time.Now().UTC()
+	// Supersede any prior connection. The live conn is set later by BindConn,
+	// once the WebSocket upgrade succeeds; until then the pump has no client.
+	oldConn := sess.currentConn
+	sess.connGen++
+	gen := sess.connGen
+	sess.currentConn = nil
+	sess.connected = true
 	sess.Status = StatusActive
 	sess.DisconnectedAt = nil
+	record := storage.SessionRecord{
+		SessionID:   sess.ID,
+		RuntimeID:   sess.RuntimeID,
+		DeviceID:    sess.DeviceID,
+		AgentID:     sess.AgentID,
+		Status:      StatusActive,
+		Leaseholder: sess.Leaseholder,
+		CreatedAt:   sess.CreatedAt,
+	}
+	runtimeID := sess.RuntimeID
+	pump := sess.pump
+	sess.mu.Unlock()
 
-	rs.store.SaveSession(ctx, storage.SessionRecord{
-		SessionID:           sess.ID,
-		RuntimeID:           sess.RuntimeID,
-		DeviceID:            sess.DeviceID,
-		AgentID:             sess.AgentID,
-		Status:              StatusActive,
-		Leaseholder:         sess.Leaseholder,
-		CreatedAt:           sess.CreatedAt,
-		LastClientConnectAt: &now,
-	})
+	// Evict the superseded connection outside the lock. Closing it unblocks the
+	// old handler's read loop, whose deferred DetachClient is fenced by gen and
+	// therefore becomes a no-op.
+	if oldConn != nil {
+		oldConn.CloseNow()
+	}
+	pump.ClearClient()
 
-	sess.connected = true
+	now := time.Now().UTC()
+	record.LastClientConnectAt = &now
+	rs.store.SaveSession(ctx, record)
 
-	return sess.RuntimeID, nil
+	return runtimeID, gen, nil
 }
 
-// DetachClient marks the session as disconnected. The pump keeps running.
-func (rs *RuntimeSession) DetachClient(sessionID string) error {
+// BindConn attaches the upgraded WebSocket to the session pump for the given
+// generation. It returns false if a newer attach has already superseded this
+// generation, in which case the caller should discard the connection.
+func (rs *RuntimeSession) BindConn(sessionID string, conn *websocket.Conn, gen int64) bool {
+	rs.mu.Lock()
+	sess, ok := rs.sessions[sessionID]
+	rs.mu.Unlock()
+	if !ok {
+		return false
+	}
+
+	sess.mu.Lock()
+	if sess.connGen != gen {
+		sess.mu.Unlock()
+		return false
+	}
+	sess.currentConn = conn
+	pump := sess.pump
+	sess.mu.Unlock()
+
+	pump.SetClient(conn)
+	return true
+}
+
+// DetachClient marks the session as disconnected, but only when gen still
+// matches the current connection generation. A superseded (evicted) connection
+// calling DetachClient is a no-op, so it cannot clobber the connection that
+// replaced it. The pump keeps running regardless.
+func (rs *RuntimeSession) DetachClient(sessionID string, gen int64) error {
 	rs.mu.Lock()
 	sess, ok := rs.sessions[sessionID]
 	rs.mu.Unlock()
@@ -400,16 +471,18 @@ func (rs *RuntimeSession) DetachClient(sessionID string) error {
 	}
 
 	sess.mu.Lock()
-	defer sess.mu.Unlock()
-
+	if sess.connGen != gen {
+		// A newer connection owns the session now; this detach is stale.
+		sess.mu.Unlock()
+		return nil
+	}
 	now := time.Now().UTC()
 	sess.Status = StatusDisconnected
 	sess.DisconnectedAt = &now
-
-	sess.pump.ClearClient()
+	sess.currentConn = nil
 	sess.connected = false
-
-	rs.store.SaveSession(context.Background(), storage.SessionRecord{
+	pump := sess.pump
+	record := storage.SessionRecord{
 		SessionID:              sess.ID,
 		RuntimeID:              sess.RuntimeID,
 		DeviceID:               sess.DeviceID,
@@ -419,7 +492,11 @@ func (rs *RuntimeSession) DetachClient(sessionID string) error {
 		CreatedAt:              sess.CreatedAt,
 		LastClientDisconnectAt: &now,
 		DisconnectedSince:      &now,
-	})
+	}
+	sess.mu.Unlock()
+
+	pump.ClearClient()
+	rs.store.SaveSession(context.Background(), record)
 
 	return nil
 }
