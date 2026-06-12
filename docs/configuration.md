@@ -18,6 +18,14 @@ Ferngeist Gateway is configured through environment variables and persisted stat
 | `FERNGEIST_GATEWAY_REQUIRE_PROOF_OF_POSSESSION` | Require proof-of-possession pairing | `true` in public mode |
 | `FERNGEIST_GATEWAY_ALLOW_LEGACY_BEARER_CREDENTIALS` | Allow legacy bearer-only credentials | `false` in public mode |
 
+## Resilient session settings
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `FERNGEIST_GATEWAY_SESSION_MAX_DISCONNECTED_SECONDS` | TTL for disconnected sessions before reaper closes them | `900` (15 min) |
+| `FERNGEIST_GATEWAY_MAX_SESSIONS_PER_DEVICE` | Max concurrent sessions per device | `5` |
+| `FERNGEIST_GATEWAY_SESSION_REAPER_INTERVAL_SECONDS` | Interval between reaper sweeps | `30` |
+
 ## Pairing controls
 
 | Variable | Purpose |
