@@ -698,7 +698,9 @@ func synthesizeRegistryLaunch(agent Agent, plan registryLaunchPlan) Agent {
 func buildRegistryLaunchPlan(entry acpregistry.AgentEntry) registryLaunchPlan {
 	// Prefer a locally available binary from the registry if one is declared.
 	if binary := entry.CurrentBinary; binary != nil && strings.TrimSpace(binary.CommandName) != "" {
-		return registryExternalLaunchPlan(binary.CommandName, append([]string(nil), binary.Args...))
+		if _, err := exec.LookPath(binary.CommandName); err == nil {
+			return registryExternalLaunchPlan(binary.CommandName, append([]string(nil), binary.Args...))
+		}
 	}
 
 	// If no binary is available, try the package-based launcher that ships the
@@ -710,6 +712,12 @@ func buildRegistryLaunchPlan(entry acpregistry.AgentEntry) registryLaunchPlan {
 	// uvx is the next fallback when the agent is published as a Python package.
 	if detectUvxPackage(entry.UvxPackage) {
 		return registryExternalLaunchPlan("uvx", append([]string{entry.UvxPackage}, entry.UvxArgs...))
+	}
+
+	// If a binary was declared but not found in PATH, still use it as the
+	// launch target — it has an ArchiveURL and can be downloaded.
+	if binary := entry.CurrentBinary; binary != nil && strings.TrimSpace(binary.CommandName) != "" {
+		return registryExternalLaunchPlan(binary.CommandName, append([]string(nil), binary.Args...))
 	}
 
 	// Nothing usable was advertised by the registry entry.
