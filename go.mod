@@ -8,10 +8,12 @@ require (
 	github.com/grandcat/zeroconf v1.0.0
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/urfave/cli/v3 v3.8.0
+	golang.org/x/oauth2 v0.36.0
 	modernc.org/sqlite v1.47.0
 )
 
 require (
+	cloud.google.com/go/compute/metadata v0.3.0 // indirect
 	github.com/cenkalti/backoff v2.2.1+incompatible // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
