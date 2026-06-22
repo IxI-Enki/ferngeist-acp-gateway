@@ -1814,6 +1814,11 @@ func (f fakeRegistryStatusProvider) Status() acpregistry.Status {
 
 func pairDevice(t *testing.T, server *Server) string {
 	t.Helper()
+	return pairDeviceResponse(t, server).Token
+}
+
+func pairDeviceResponse(t *testing.T, server *Server) pairCompleteResponse {
+	t.Helper()
 
 	armRequest := httptest.NewRequest(http.MethodPost, "/admin/v1/pairings/start", nil)
 	armRecorder := httptest.NewRecorder()
@@ -1867,7 +1872,7 @@ func pairDevice(t *testing.T, server *Server) string {
 	if err := json.Unmarshal(completeRecorder.Body.Bytes(), &completeResponse); err != nil {
 		t.Fatalf("Unmarshal(complete) error = %v", err)
 	}
-	return completeResponse.Token
+	return completeResponse
 }
 
 type proofTestCredential struct {

@@ -226,7 +226,7 @@ func NewServer(
 	mux.HandleFunc("POST /v1/runtimes/{runtimeId}/connect", server.handleRuntimeConnect)
 	mux.HandleFunc("POST /v1/runtimes/{runtimeId}/restart", server.handleRuntimeRestart)
 	server.registerSessionRoutes(mux)
-	mux.HandleFunc("POST /v1/devices/fcm-token", server.handleRegisterFCMToken)
+	mux.HandleFunc("POST /v1/devices/push-token", server.handleRegisterPushToken)
 	adminMux.HandleFunc("GET /admin/v1/status", server.handleAdminStatus)
 	adminMux.HandleFunc("POST /admin/v1/pairings/start", server.handleAdminPairingStart)
 	adminMux.HandleFunc("GET /admin/v1/pairings/{challengeId}", server.handleAdminPairingStatus)

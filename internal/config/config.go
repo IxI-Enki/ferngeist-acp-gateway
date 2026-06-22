@@ -59,6 +59,15 @@ type Config struct {
 	SessionMaxDisconnected time.Duration
 	// MaxSessionsPerDevice limits how many concurrent sessions a single device can hold.
 	MaxSessionsPerDevice int
+	// FCMCredentialsFile is the path to a Firebase service-account JSON used to
+	// authenticate FCM HTTP v1 push delivery. When empty, push notifications fall
+	// back to the log-only stub so local/dev runs work without a Firebase project.
+	FCMCredentialsFile string
+	// GatewayID is this gateway's stable instance identifier. It is not read from
+	// the environment — the daemon populates it at boot from persisted storage —
+	// and is handed to clients at pairing so they can address this gateway and
+	// resolve its pushes for deep-linking.
+	GatewayID string
 }
 
 type PersistedSettings struct {
@@ -97,6 +106,7 @@ func Load() Config {
 		AllowRuntimeRestartEnv: envBool("FERNGEIST_GATEWAY_ALLOW_REMOTE_RUNTIME_RESTART_ENV"),
 		SessionMaxDisconnected: envDurationSecondsOrDefault("FERNGEIST_GATEWAY_SESSION_MAX_DISCONNECTED_SECONDS", defaultSessionMaxDisconnected),
 		MaxSessionsPerDevice:   envIntOrDefault("FERNGEIST_GATEWAY_MAX_SESSIONS_PER_DEVICE", defaultMaxSessionsPerDevice),
+		FCMCredentialsFile:     strings.TrimSpace(os.Getenv("FERNGEIST_GATEWAY_FCM_CREDENTIALS_FILE")),
 	}
 	return cfg.applySecurityDefaults()
 }

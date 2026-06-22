@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arafatamim/ferngeist-acp-gateway/internal/push"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/runtime"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
 	"github.com/coder/websocket"
@@ -85,6 +86,130 @@ func (m *mockProcessManager) triggerExit(runtimeID string) {
 	m.mu.Unlock()
 	if ok {
 		cb(runtimeID)
+	}
+}
+
+// recordingPushService captures Notify calls for assertions. Notify is invoked
+// asynchronously by the session, so reads poll via waitForPushCount.
+type recordingPushService struct {
+	mu    sync.Mutex
+	calls []push.Notification
+}
+
+func (r *recordingPushService) Notify(_ context.Context, _ string, n push.Notification) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, n)
+	return nil
+}
+
+func (r *recordingPushService) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls)
+}
+
+func (r *recordingPushService) last() push.Notification {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls[len(r.calls)-1]
+}
+
+func waitForPushCount(t *testing.T, r *recordingPushService, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if r.count() >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected >= %d push calls, got %d", want, r.count())
+}
+
+func setupPushTest(t *testing.T) (*RuntimeSession, *mockProcessManager, *recordingPushService) {
+	t.Helper()
+	store, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	mockPM := newMockPM()
+	pushSvc := &recordingPushService{}
+	rs := NewRuntimeSession(slog.New(slog.NewTextHandler(io.Discard, nil)), store, mockPM, newMockTokenSvc(), Config{
+		MaxDisconnected: 5 * time.Minute,
+		GatewayID:       "gw-1",
+		PushSvc:         pushSvc,
+	})
+	t.Cleanup(rs.Shutdown)
+	return rs, mockPM, pushSvc
+}
+
+// TestProcessExitCrashSendsPush verifies a genuine, unexpected process exit
+// delivers an agent-crash push and marks the session failed.
+func TestProcessExitCrashSendsPush(t *testing.T) {
+	rs, mockPM, pushSvc := setupPushTest(t)
+	ctx := context.Background()
+
+	sess, _, err := rs.Create(ctx, "rt-crash", "dev-crash", "agent-crash")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Simulate the agent's session/new response having been snooped, so the push
+	// carries the ACP session id the client navigates by — not the gateway's own
+	// resilient session id (sess.ID), which lives in a different namespace.
+	const acpID = "ses_crash_test"
+	sess.pump.acpMu.Lock()
+	sess.pump.acpSessionID = acpID
+	sess.pump.acpMu.Unlock()
+
+	// Agent dies on its own while the session is active — a genuine crash.
+	mockPM.triggerExit("rt-crash")
+
+	waitForPushCount(t, pushSvc, 1)
+	n := pushSvc.last()
+	if n.Category != push.CategoryAgentCrash {
+		t.Errorf("category = %q, want %q", n.Category, push.CategoryAgentCrash)
+	}
+	if n.SessionID != acpID || n.ServerID != "gw-1" {
+		t.Errorf("notification = %+v, want sessionID=%q serverID=gw-1", n, acpID)
+	}
+	if st, _ := rs.GetSessionStatus(sess.ID); st != StatusFailed {
+		t.Errorf("status = %q, want %q", st, StatusFailed)
+	}
+}
+
+// TestProcessExitDuringCloseSendsNoCrashPush verifies that an intentional
+// teardown (session already StatusClosing, as Close and the reaper set it before
+// stopping the runtime) does not deliver a false crash push or clobber the status.
+func TestProcessExitDuringCloseSendsNoCrashPush(t *testing.T) {
+	rs, mockPM, pushSvc := setupPushTest(t)
+	ctx := context.Background()
+
+	sess, _, err := rs.Create(ctx, "rt-close", "dev-close", "agent-close")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Mark the session closing, mirroring Close/reaper before StopByRuntimeID.
+	rs.mu.Lock()
+	s := rs.sessions[sess.ID]
+	rs.mu.Unlock()
+	s.mu.Lock()
+	s.Status = StatusClosing
+	s.mu.Unlock()
+
+	mockPM.triggerExit("rt-close")
+
+	// The guard decision is synchronous, so no push goroutine is spawned; sleep a
+	// little anyway to give any erroneous async push time to land before asserting.
+	time.Sleep(150 * time.Millisecond)
+	if c := pushSvc.count(); c != 0 {
+		t.Fatalf("expected no crash push on intentional close, got %d", c)
+	}
+	if st, _ := rs.GetSessionStatus(sess.ID); st != StatusClosing {
+		t.Errorf("status = %q, want %q (closing must be preserved, not overwritten to failed)", st, StatusClosing)
 	}
 }
 
@@ -948,6 +1073,100 @@ func TestPumpSnoopInitializeAlreadySet(t *testing.T) {
 	if !pump.SupportsClose() {
 		t.Error("expected SupportsClose still true")
 	}
+}
+
+// TestPumpSnoopSessionID verifies the ACP session id is captured from a
+// session/new response, ignored on unrelated frames, and not overwritten once set.
+func TestPumpSnoopSessionID(t *testing.T) {
+	pump := &StdioPump{}
+
+	// Unrelated frames don't set it.
+	pump.snoopSessionID(`{"result":{"protocolVersion":1}}`)
+	pump.snoopSessionID(`{"method":"session/update","params":{}}`)
+	if got := pump.AcpSessionID(); got != "" {
+		t.Fatalf("AcpSessionID = %q, want empty before session/new", got)
+	}
+
+	// The session/new response carries result.sessionId — captured here.
+	pump.snoopSessionID(`{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_abc123"}}`)
+	if got := pump.AcpSessionID(); got != "ses_abc123" {
+		t.Fatalf("AcpSessionID = %q, want %q", got, "ses_abc123")
+	}
+
+	// A later session/new (e.g. reconnect) does not clobber the captured id.
+	pump.snoopSessionID(`{"result":{"sessionId":"ses_other"}}`)
+	if got := pump.AcpSessionID(); got != "ses_abc123" {
+		t.Fatalf("AcpSessionID = %q, want it to stay %q", got, "ses_abc123")
+	}
+}
+
+// TestPumpSnoopInboundSessionID verifies the ACP session id is captured from a
+// client→agent frame's params.sessionId — the path that covers resilient
+// reconnects, where the agent never re-emits a session/new response.
+func TestPumpSnoopInboundSessionID(t *testing.T) {
+	pump := &StdioPump{}
+
+	// Frames without params.sessionId don't set it (e.g. initialize).
+	pump.snoopInboundSessionID([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}`))
+	if got := pump.AcpSessionID(); got != "" {
+		t.Fatalf("AcpSessionID = %q, want empty before a frame carries sessionId", got)
+	}
+
+	// A session/prompt (or session/load) carries params.sessionId — captured here.
+	pump.snoopInboundSessionID([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"ses_inbound","prompt":[]}}`))
+	if got := pump.AcpSessionID(); got != "ses_inbound" {
+		t.Fatalf("AcpSessionID = %q, want %q", got, "ses_inbound")
+	}
+
+	// A later inbound frame does not clobber the captured id.
+	pump.snoopInboundSessionID([]byte(`{"method":"session/cancel","params":{"sessionId":"ses_other"}}`))
+	if got := pump.AcpSessionID(); got != "ses_inbound" {
+		t.Fatalf("AcpSessionID = %q, want it to stay %q", got, "ses_inbound")
+	}
+}
+
+// TestPumpTurnCompletePushUsesACPSessionID verifies the drain loop snoops the
+// ACP session id from session/new and then stamps it onto a turn-complete push.
+func TestPumpTurnCompletePushUsesACPSessionID(t *testing.T) {
+	r, w := io.Pipe()
+
+	pushCh := make(chan push.Notification, 4)
+	pump := &StdioPump{
+		pipes: &runtime.LeasedPipes{
+			Stdin:  nopWriteCloser{},
+			Stdout: r,
+		},
+		runtimeID: "rt-acp-push",
+		sessionID: "resilient-id",
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		appendLog: func(string, string, string) {},
+		onPushNotification: func(sessionID, acpSessionID, category, title, body string) {
+			pushCh <- push.Notification{Category: category, ServerID: sessionID, SessionID: acpSessionID}
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pump.StdoutDrainLoop(ctx)
+
+	// session/new first so the ACP id is captured before the turn completes.
+	w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_live"}}` + "\n"))
+	w.Write([]byte(`{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}` + "\n"))
+
+	select {
+	case n := <-pushCh:
+		if n.Category != push.CategoryTurnComplete {
+			t.Fatalf("category = %q, want %q", n.Category, push.CategoryTurnComplete)
+		}
+		if n.SessionID != "ses_live" {
+			t.Fatalf("push SessionID = %q, want the snooped ACP id %q", n.SessionID, "ses_live")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a turn-complete push")
+	}
+
+	w.Close()
+	r.Close()
 }
 
 func TestIsTurnCompleteWithAllStopReasons(t *testing.T) {

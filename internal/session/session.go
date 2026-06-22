@@ -99,6 +99,9 @@ type Config struct {
 	// PushSvc is the push notification service for turn-complete notifications.
 	// nil-able — when nil, push notifications are disabled.
 	PushSvc push.PushService
+	// GatewayID is this gateway's stable instance id, sent as the server identity
+	// in push notifications so clients can deep-link into the right chat.
+	GatewayID string
 }
 
 // RuntimeSession is the central session orchestrator. It owns the in-memory
@@ -137,12 +140,11 @@ type Session struct {
 	leasedPipes runtime.Pipes        // exclusive stdio lease
 	cancelPump  context.CancelFunc   // stops the StdoutDrainLoop on session close
 
-	connected   bool            // true when a WebSocket client is currently attached
 	currentConn *websocket.Conn // the active client conn, or nil; used to evict on takeover
 	connGen     int64           // bumped on every attach; fences stale detaches from evicted conns
 	inboundSeq  atomic.Int64    // monotonic counter for client->agent diagnostic frames
 
-	mu sync.Mutex // protects Status, DisconnectedAt, connected, currentConn, connGen
+	mu sync.Mutex // protects Status, DisconnectedAt, currentConn, connGen
 }
 
 // NewRuntimeSession creates a new session service and starts the reaper goroutine.
@@ -226,22 +228,31 @@ func (rs *RuntimeSession) Create(ctx context.Context, runtimeID, deviceID, agent
 
 		pumpCtx, pumpCancel := context.WithCancel(context.Background())
 
-	onPushNotification := func(sid, rid, title, body string) {
+	onPushNotification := func(sid, acpSessionID, category, title, body string) {
 		rs.mu.Lock()
 		s, ok := rs.sessions[sid]
 		rs.mu.Unlock()
-		if !ok || s.DeviceID == "" {
+		if !ok || s.DeviceID == "" || rs.cfg.PushSvc == nil {
 			return
 		}
-		if rs.cfg.PushSvc != nil {
+		deviceID := s.DeviceID
+		// Dispatch asynchronously: this runs on the stdout drain-loop goroutine,
+		// and a push is a token lookup plus a network round-trip to the provider.
+		// Blocking here would stall agent stdout draining — and any attached
+		// client's live stream — until the push completes or times out.
+		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			_ = rs.cfg.PushSvc.SendNotification(ctx, s.DeviceID, title, body,
-				map[string]string{
-					"sessionId": sid,
-					"runtimeId": rid,
-				})
-		}
+			_ = rs.cfg.PushSvc.Notify(ctx, deviceID, push.Notification{
+				Title:    title,
+				Body:     body,
+				Category: category,
+				ServerID: rs.cfg.GatewayID,
+				// The ACP session id (not sid, the gateway's resilient id) so the push
+				// matches what the client navigates and keys ActiveChat by.
+				SessionID: acpSessionID,
+			})
+		}()
 	}
 
 	pump := &StdioPump{
@@ -272,35 +283,53 @@ func (rs *RuntimeSession) Create(ctx context.Context, runtimeID, deviceID, agent
 	rs.pm.OnProcessExit(runtimeID, func(rid string) {
 		rs.mu.Lock()
 		var deviceIDForPush string
-		var connected bool
+		var acpSessionIDForPush string
+		var crashed bool
 		if s, ok := rs.sessions[sessionID]; ok {
 			s.mu.Lock()
-			s.Status = StatusFailed
-			connected = s.connected
-			deviceIDForPush = s.DeviceID
+			// The supervisor fires this callback on every process exit — including
+			// the intentional StopByRuntimeID issued by Close and the reaper, both
+			// of which mark the session StatusClosing *before* stopping the runtime.
+			// Only an exit from a non-closing session is a genuine crash; otherwise
+			// we must not persist a bogus "failed" record or push a false alarm.
+			if s.Status != StatusClosing {
+				crashed = true
+				s.Status = StatusFailed
+				deviceIDForPush = s.DeviceID
+				// ACP session id (the id the client navigates by), for the crash push.
+				acpSessionIDForPush = s.pump.AcpSessionID()
+			}
 			s.mu.Unlock()
-			rs.store.SaveSession(context.Background(), storage.SessionRecord{
-				SessionID:   sessionID,
-				RuntimeID:   runtimeID,
-				DeviceID:    deviceID,
-				AgentID:     agentID,
-				Status:      StatusFailed,
-				Leaseholder: sessionID,
-				CreatedAt:   s.CreatedAt,
-			})
+			if crashed {
+				rs.store.SaveSession(context.Background(), storage.SessionRecord{
+					SessionID:   sessionID,
+					RuntimeID:   runtimeID,
+					DeviceID:    deviceID,
+					AgentID:     agentID,
+					Status:      StatusFailed,
+					Leaseholder: sessionID,
+					CreatedAt:   s.CreatedAt,
+				})
+			}
 		}
 		rs.mu.Unlock()
 
-		if !connected && deviceIDForPush != "" && rs.cfg.PushSvc != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			_ = rs.cfg.PushSvc.SendNotification(ctx, deviceIDForPush,
-				"Agent Crashed",
-				"Your agent has stopped unexpectedly.",
-				map[string]string{
-					"sessionId": sessionID,
-					"runtimeId": runtimeID,
+		// Notify on a genuine crash regardless of client attachment; the client
+		// decides whether to surface it based on its own foreground/background
+		// state. Dispatched asynchronously so a slow push provider never blocks
+		// the supervisor's process-exit handling.
+		if crashed && deviceIDForPush != "" && rs.cfg.PushSvc != nil {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				_ = rs.cfg.PushSvc.Notify(ctx, deviceIDForPush, push.Notification{
+					Title:     "Agent Crashed",
+					Body:      "Your agent has stopped unexpectedly.",
+					Category:  push.CategoryAgentCrash,
+					ServerID:  rs.cfg.GatewayID,
+					SessionID: acpSessionIDForPush,
 				})
+			}()
 		}
 	})
 
@@ -403,7 +432,6 @@ func (rs *RuntimeSession) AttachClient(ctx context.Context, sessionID, attachTok
 	sess.connGen++
 	gen := sess.connGen
 	sess.currentConn = nil
-	sess.connected = true
 	sess.Status = StatusActive
 	sess.DisconnectedAt = nil
 	record := storage.SessionRecord{
@@ -480,7 +508,6 @@ func (rs *RuntimeSession) DetachClient(sessionID string, gen int64) error {
 	sess.Status = StatusDisconnected
 	sess.DisconnectedAt = &now
 	sess.currentConn = nil
-	sess.connected = false
 	pump := sess.pump
 	record := storage.SessionRecord{
 		SessionID:              sess.ID,

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/arafatamim/ferngeist-acp-gateway/internal/push"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/runtime"
 	"github.com/coder/acp-go-sdk"
 	"github.com/coder/websocket"
@@ -23,7 +24,10 @@ const acpWebSocketWriteTimeout = 30 * time.Second
 // StdioPump owns the agent's stdout drain loop and provides stdin write access
 // for the session. It runs independently of any WebSocket client — agent output
 // is forwarded to the WebSocket when attached or discarded when no client is
-// connected. Turn-complete, permission-request, and error detection fire push notifications.
+// connected. Turn-complete, permission-request, and error detection fire push
+// notifications regardless of client attachment: the gateway cannot tell whether
+// the app is foregrounded or backgrounded (only whether a socket is attached, a
+// poor proxy), so it always emits and lets the client decide whether to display.
 type StdioPump struct {
 	pipes     *runtime.LeasedPipes
 	runtimeID string
@@ -31,7 +35,7 @@ type StdioPump struct {
 	logger    *slog.Logger
 	appendLog func(string, string, string)
 
-	onPushNotification func(sessionID, runtimeID, title, body string) // fires push when agent needs user attention and no client is connected
+	onPushNotification func(sessionID, acpSessionID, category, title, body string) // fires on a notable agent event; the client decides whether to display
 
 	clientMu      sync.Mutex
 	client        *websocket.Conn // current connected WebSocket, or nil
@@ -45,14 +49,22 @@ type StdioPump struct {
 	initMu       sync.Mutex
 	initResponse []byte
 
+	// Cached ACP session id ("ses_…"), snooped from the agent's session/new
+	// response. Sent as the push SessionID so it matches the id the client
+	// navigates and keys ActiveChat by — the gateway's own resilient session id
+	// (sessionID above) is a different namespace and never matches the client.
+	acpMu        sync.Mutex
+	acpSessionID string
+
 	lastStdoutAt time.Time // updated on each agent stdout line; used by reaper to avoid killing active agents
 	lastStdoutMu sync.Mutex
 }
 
 // StdoutDrainLoop continuously reads from agent stdout and forwards frames
 // to an attached WebSocket client. When no client is connected, frames are
-// discarded after turn-complete detection and log append. The loop stops when
-// the context is cancelled.
+// discarded after notable-event detection and log append. Push notifications
+// fire on notable events regardless of whether a client is attached. The loop
+// stops when the context is cancelled.
 func (p *StdioPump) StdoutDrainLoop(ctx context.Context) {
 	scanner := bufio.NewScanner(p.pipes.Stdout)
 
@@ -77,20 +89,19 @@ func (p *StdioPump) StdoutDrainLoop(ctx context.Context) {
 		}
 
 		p.snoopInitialize(line)
+		p.snoopSessionID(line)
 
+		// Fire a push on notable events regardless of client attachment — the
+		// client suppresses it when foregrounded and shows it when backgrounded
+		// or killed, which is a distinction the gateway cannot make itself.
 		if p.onPushNotification != nil {
-			p.clientMu.Lock()
-			clientLive := p.client != nil
-			p.clientMu.Unlock()
-			if !clientLive {
-				switch {
-				case isTurnComplete([]byte(line)):
-					p.onPushNotification(p.sessionID, p.runtimeID, "Turn Complete", "Your agent has finished processing.")
-				case isPermissionRequest([]byte(line)):
-					p.onPushNotification(p.sessionID, p.runtimeID, "Permission Required", "Your agent needs approval to run a tool.")
-				case isJSONRPCError([]byte(line)):
-					p.onPushNotification(p.sessionID, p.runtimeID, "Agent Error", "Your agent encountered an unexpected error.")
-				}
+			switch {
+			case isTurnComplete([]byte(line)):
+				p.onPushNotification(p.sessionID, p.AcpSessionID(), push.CategoryTurnComplete, "Turn Complete", "Your agent has finished processing.")
+			case isPermissionRequest([]byte(line)):
+				p.onPushNotification(p.sessionID, p.AcpSessionID(), push.CategoryPermissionRequest, "Permission Required", "Your agent needs approval to run a tool.")
+			case isJSONRPCError([]byte(line)):
+				p.onPushNotification(p.sessionID, p.AcpSessionID(), push.CategoryError, "Agent Error", "Your agent encountered an unexpected error.")
 			}
 		}
 
@@ -152,6 +163,41 @@ func (p *StdioPump) initResponseCached() bool {
 	p.initMu.Lock()
 	defer p.initMu.Unlock()
 	return p.initResponse != nil
+}
+
+// snoopSessionID inspects an outbound frame for the agent's `session/new`
+// response and caches the ACP session id it returns. Only the session/new
+// response carries a top-level result.sessionId, so this never misfires on
+// other frames. The id is captured once and reused for the session's lifetime;
+// it is sent as the push SessionID so notifications match the id the client
+// navigates and suppresses by.
+func (p *StdioPump) snoopSessionID(line string) {
+	p.acpMu.Lock()
+	cached := p.acpSessionID != ""
+	p.acpMu.Unlock()
+	if cached {
+		return
+	}
+	var probe struct {
+		Result *struct {
+			SessionID string `json:"sessionId"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(line), &probe); err != nil ||
+		probe.Result == nil || probe.Result.SessionID == "" {
+		return
+	}
+	p.acpMu.Lock()
+	p.acpSessionID = probe.Result.SessionID
+	p.acpMu.Unlock()
+}
+
+// AcpSessionID returns the snooped ACP session id, or "" if no session/new
+// response has been observed yet.
+func (p *StdioPump) AcpSessionID() string {
+	p.acpMu.Lock()
+	defer p.acpMu.Unlock()
+	return p.acpSessionID
 }
 
 // rewriteResponseID returns the cached JSON-RPC response with its `id` replaced
@@ -230,9 +276,8 @@ func isTurnComplete(data []byte) bool {
 
 // isPermissionRequest checks if a stdout line is a session/request_permission
 // notification. The agent sends this during a turn when it needs user approval
-// before executing a tool. Detected here so a push notification can be fired
-// when no client is connected. Uses acp.AgentNotification for typed method
-// name access.
+// before executing a tool. Detected here so a push notification can be fired.
+// Uses acp.AgentNotification for typed method name access.
 func isPermissionRequest(data []byte) bool {
 	var n acp.AgentNotification
 	if err := json.Unmarshal(data, &n); err != nil {
@@ -254,7 +299,38 @@ func isJSONRPCError(data []byte) bool {
 }
 
 func (p *StdioPump) WriteToAgent(payload []byte) error {
+	p.snoopInboundSessionID(payload)
 	return p.pipes.WriteToAgent(payload)
+}
+
+// snoopInboundSessionID captures the ACP session id from a client→agent frame's
+// params.sessionId (session/prompt, session/load, session/cancel, …). The
+// outbound snoop only sees session/new responses, so on a resilient reconnect —
+// where the client restores context via session/load and the agent never
+// re-emits session/new — it would never observe the id and the push SessionID
+// would be empty. The inbound frames always carry it, so this fills the gap.
+// Only client frames reach this path; the gateway's own session/close is written
+// via the leased pipes directly, so it never contaminates the cache with the
+// resilient (non-ACP) session id.
+func (p *StdioPump) snoopInboundSessionID(payload []byte) {
+	p.acpMu.Lock()
+	cached := p.acpSessionID != ""
+	p.acpMu.Unlock()
+	if cached {
+		return
+	}
+	var probe struct {
+		Params *struct {
+			SessionID string `json:"sessionId"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil ||
+		probe.Params == nil || probe.Params.SessionID == "" {
+		return
+	}
+	p.acpMu.Lock()
+	p.acpSessionID = probe.Params.SessionID
+	p.acpMu.Unlock()
 }
 
 func (p *StdioPump) SetClient(conn *websocket.Conn) {

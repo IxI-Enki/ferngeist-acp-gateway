@@ -1,0 +1,61 @@
+name: CI
+
+# Runs on every push to main and on all pull requests.
+# Gates merges on vet, the full test suite, and — critically for the
+# concurrency-heavy session/pump code — a race-detector pass. The race
+# detector requires cgo, so that job runs on Linux where the runner ships
+# a C toolchain; the plain build/test jobs keep cgo disabled to match the
+# release pipeline (pure-Go sqlite, static binaries).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: vet + test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache-dependency-path: go.sum
+
+      - name: Vet
+        env:
+          CGO_ENABLED: "0"
+        run: go vet ./...
+
+      - name: Test
+        env:
+          CGO_ENABLED: "0"
+        run: go test -count=1 ./...
+
+  race:
+    name: race detector
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache-dependency-path: go.sum
+
+      # cgo is required for -race. ubuntu-latest ships gcc, so no extra
+      # toolchain install is needed. The reaper/smoke tests self-skip when
+      # CI is set (GitHub Actions sets CI=true automatically).
+      - name: Test with race detector
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -count=1 ./...

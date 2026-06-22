@@ -29,12 +29,16 @@ type pairCompleteRequest struct {
 }
 
 // pairCompleteResponse contains the credential issued after successful pairing.
+// GatewayID is this gateway's stable, user-independent instance id; the client
+// stores it as the server identity it later matches incoming pushes against to
+// deep-link into the right chat.
 type pairCompleteResponse struct {
 	DeviceID   string    `json:"deviceId"`
 	DeviceName string    `json:"deviceName"`
 	Token      string    `json:"token"`
 	ExpiresAt  time.Time `json:"expiresAt"`
 	Scopes     []string  `json:"scopes,omitempty"`
+	GatewayID  string    `json:"gatewayId,omitempty"`
 }
 
 // pairStatusResponse exposes the state of a pairing challenge to public clients.
@@ -166,6 +170,7 @@ func (s *Server) handlePairComplete(w http.ResponseWriter, r *http.Request) {
 		Token:      credential.Token,
 		ExpiresAt:  credential.ExpiresAt,
 		Scopes:     credential.Scopes,
+		GatewayID:  s.cfg.GatewayID,
 	})
 }
 

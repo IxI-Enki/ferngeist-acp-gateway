@@ -16,10 +16,13 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/arafatamim/ferngeist-acp-gateway/internal/push"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/session"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/token"
 )
+
+const testGatewayID = "test-gateway-id"
 
 type mockPushService struct {
 	mu    sync.Mutex
@@ -27,16 +30,14 @@ type mockPushService struct {
 }
 
 type pushCall struct {
-	DeviceID string
-	Title    string
-	Body     string
-	Data     map[string]string
+	DeviceID     string
+	Notification push.Notification
 }
 
-func (m *mockPushService) SendNotification(_ context.Context, deviceID, title, body string, data map[string]string) error {
+func (m *mockPushService) Notify(_ context.Context, deviceID string, n push.Notification) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.calls = append(m.calls, pushCall{DeviceID: deviceID, Title: title, Body: body, Data: data})
+	m.calls = append(m.calls, pushCall{DeviceID: deviceID, Notification: n})
 	return nil
 }
 
@@ -46,6 +47,20 @@ func (m *mockPushService) Calls() []pushCall {
 	r := make([]pushCall, len(m.calls))
 	copy(r, m.calls)
 	return r
+}
+
+// waitForPushCount blocks until at least want push calls have been recorded, or
+// fails the test after timeout.
+func waitForPushCount(t *testing.T, m *mockPushService, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if len(m.Calls()) >= want {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("expected at least %d push calls, got %d", want, len(m.Calls()))
 }
 
 type resilientTestHarness struct {
@@ -84,6 +99,7 @@ func newResilientTestHarness(t *testing.T) *resilientTestHarness {
 		MaxDisconnected: 5 * time.Minute,
 		MaxPerDevice:    3,
 		PushSvc:         mockPush,
+		GatewayID:       testGatewayID,
 	})
 	server.sessionSvc = sessionSvc
 	t.Cleanup(sessionSvc.Shutdown)
@@ -322,12 +338,27 @@ func TestResilientSession_FullLifecycle(t *testing.T) {
 		t.Fatalf("stopReason = %q, want %q", resultData.StopReason, "end_turn")
 	}
 
+	// The turn above completed while a client was attached. The gateway sends a
+	// push regardless of socket state — the client decides whether to display it —
+	// so that turn-complete should have produced exactly one push already.
+	waitForPushCount(t, h.pushSvc, 1, 5*time.Second)
+	connectedPush := h.pushSvc.Calls()[0]
+	if connectedPush.Notification.Category != push.CategoryTurnComplete {
+		t.Fatalf("connected push category = %q, want %q", connectedPush.Notification.Category, push.CategoryTurnComplete)
+	}
+	// The push carries the ACP session id the client navigates and suppresses by
+	// ("mock_sess_1", from the mock agent's session/new) — not the gateway's own
+	// resilient session id (connectResp.SessionID), which is a different namespace.
+	const acpSessionID = "mock_sess_1"
+	if connectedPush.Notification.SessionID != acpSessionID {
+		t.Fatalf("connected push sessionId = %q, want %q", connectedPush.Notification.SessionID, acpSessionID)
+	}
+
 	conn.CloseNow()
 
 	waitForSessionStatus(t, h.store, connectResp.SessionID, session.StatusDisconnected, 5*time.Second)
 
-	// After disconnection, trigger a prompt via the pump directly to
-	// verify the push notification fires (no client to receive it).
+	// A turn completing with no client attached also fires a push.
 	pump, err := h.server.sessionSvc.GetPump(connectResp.SessionID)
 	if err != nil {
 		t.Fatalf("GetPump() error = %v", err)
@@ -336,24 +367,13 @@ func TestResilientSession_FullLifecycle(t *testing.T) {
 		t.Fatalf("WriteToAgent() error = %v", err)
 	}
 
-	// Wait for push notification to be recorded.
-	var calls []pushCall
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		calls = h.pushSvc.Calls()
-		if len(calls) > 0 {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	waitForPushCount(t, h.pushSvc, 2, 5*time.Second)
+	disconnectedPush := h.pushSvc.Calls()[1]
+	if disconnectedPush.Notification.SessionID != acpSessionID {
+		t.Fatalf("push sessionId = %q, want %q", disconnectedPush.Notification.SessionID, acpSessionID)
 	}
-	if len(calls) != 1 {
-		t.Fatalf("expected 1 push call after disconnect, got %d", len(calls))
-	}
-	if calls[0].Data["sessionId"] != connectResp.SessionID {
-		t.Fatalf("push data sessionId = %q, want %q", calls[0].Data["sessionId"], connectResp.SessionID)
-	}
-	if calls[0].Data["runtimeId"] != h.runtimeID {
-		t.Fatalf("push data runtimeId = %q, want %q", calls[0].Data["runtimeId"], h.runtimeID)
+	if disconnectedPush.Notification.ServerID != testGatewayID {
+		t.Fatalf("push serverId = %q, want %q", disconnectedPush.Notification.ServerID, testGatewayID)
 	}
 
 	newToken := h.resumeSession(connectResp.SessionID)

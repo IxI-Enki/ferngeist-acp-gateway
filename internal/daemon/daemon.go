@@ -45,6 +45,15 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 		return fmt.Errorf("clear stale runtime tokens: %w", err)
 	}
 
+	// Establish this gateway's stable instance id (generated once, persisted).
+	// Clients receive it at pairing and use it to address the gateway and resolve
+	// its pushes for deep-linking.
+	gatewayID, err := store.EnsureGatewayID(context.Background())
+	if err != nil {
+		return fmt.Errorf("establish gateway id: %w", err)
+	}
+	cfg.GatewayID = gatewayID
+
 	// Reconcile sessions orphaned by a previous shutdown.
 	// Any session that was active or disconnected at shutdown is now stale
 	// since its backing process no longer exists.
@@ -66,11 +75,12 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 	})
 	gatewaySvc := gateway.New(logger, store)
 	tokenSvc := token.New(logger)
-	pushSvc := push.NewLogPushService(logger.With("component", "push"))
+	pushSvc := newPushService(ctx, logger, store, cfg.FCMCredentialsFile)
 	sessionSvc := session.NewRuntimeSession(logger, store, runtimeSvc, tokenSvc, session.Config{
 		MaxDisconnected: cfg.SessionMaxDisconnected,
 		MaxPerDevice:    cfg.MaxSessionsPerDevice,
 		PushSvc:         pushSvc,
+		GatewayID:       cfg.GatewayID,
 	})
 	discoverySvc := discovery.New(logger)
 
@@ -132,6 +142,34 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 
 	logger.Info("gateway daemon stopped")
 	return nil
+}
+
+// newPushService builds the platform-neutral push dispatcher and registers the
+// Android delivery provider: FCM HTTP v1 when a service-account credentials file
+// is configured, otherwise a log-only provider. A misconfigured credentials file
+// is non-fatal — the daemon logs the error and degrades to the log provider so a
+// bad push config never prevents the gateway from booting. Additional platforms
+// (iOS/web) register more providers here without touching the dispatcher or the
+// session layer.
+func newPushService(ctx context.Context, logger *slog.Logger, store *storage.SQLiteStore, credentialsFile string) push.PushService {
+	pushLogger := logger.With("component", "push")
+
+	var androidProvider push.Provider
+	if credentialsFile == "" {
+		logger.Info("push notifications: no FCM credentials configured, using log-only provider")
+		androidProvider = push.NewLogProvider(pushLogger)
+	} else if fcm, err := push.NewFCMProvider(ctx, credentialsFile, pushLogger); err != nil {
+		logger.Warn("push notifications: FCM init failed, falling back to log-only provider",
+			slog.String("error", err.Error()))
+		androidProvider = push.NewLogProvider(pushLogger)
+	} else {
+		logger.Info("push notifications: FCM HTTP v1 delivery enabled")
+		androidProvider = fcm
+	}
+
+	return push.NewDispatcher(store, map[string]push.Provider{
+		"android": androidProvider,
+	}, pushLogger)
 }
 
 // DiscoveryTXTRecords keeps the mDNS payload intentionally small and stable so
