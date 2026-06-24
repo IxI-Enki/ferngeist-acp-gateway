@@ -175,8 +175,41 @@ func TestProcessExitCrashSendsPush(t *testing.T) {
 	if n.SessionID != acpID || n.ServerID != "gw-1" {
 		t.Errorf("notification = %+v, want sessionID=%q serverID=gw-1", n, acpID)
 	}
-	if st, _ := rs.GetSessionStatus(sess.ID); st != StatusFailed {
-		t.Errorf("status = %q, want %q", st, StatusFailed)
+	// A genuine crash fully reclaims the session: it is removed from the registry
+	// (so its dead runtime lease and per-device quota slot are freed) rather than
+	// lingering as a "failed" record.
+	if _, err := rs.GetSessionStatus(sess.ID); err != ErrSessionNotFound {
+		t.Errorf("expected crashed session to be reclaimed (ErrSessionNotFound), got %v", err)
+	}
+}
+
+// TestProcessExitCrashReleasesLease verifies a crash frees the runtime's exclusive
+// lease so a fresh session can be created on the same runtime — the regression that
+// otherwise leaves the runtime permanently un-leasable (ErrRuntimeLeaseHeld) and
+// forces the gateway to hand the client a session-less connect descriptor.
+func TestProcessExitCrashReleasesLease(t *testing.T) {
+	rs, mockPM, _ := setupPushTest(t)
+	ctx := context.Background()
+
+	sess, _, err := rs.Create(ctx, "rt-release", "dev-release", "agent-release")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Same runtime cannot host a second session while the first holds the lease.
+	if _, _, err := rs.Create(ctx, "rt-release", "dev-release-2", "agent-x"); !errors.Is(err, ErrRuntimeLeaseHeld) {
+		t.Fatalf("expected ErrRuntimeLeaseHeld before crash, got %v", err)
+	}
+
+	// Agent crashes; the lease must be released as part of reclamation.
+	mockPM.triggerExit("rt-release")
+	if _, err := rs.GetSessionStatus(sess.ID); err != ErrSessionNotFound {
+		t.Fatalf("expected reclaimed session, got %v", err)
+	}
+
+	// A fresh session on the same runtime now succeeds.
+	if _, _, err := rs.Create(ctx, "rt-release", "dev-release", "agent-fresh"); err != nil {
+		t.Fatalf("expected Create on reclaimed runtime to succeed, got %v", err)
 	}
 }
 
@@ -347,6 +380,39 @@ func TestCreateSessionLimit(t *testing.T) {
 	_, _, err = rs.Create(ctx, "rt-lim-2", "dev-lim", "agent-2")
 	if err != ErrSessionLimitReached {
 		t.Errorf("expected ErrSessionLimitReached, got %v", err)
+	}
+}
+
+// TestCreateSessionLimitIgnoresDeadSessions verifies that failed/closing records —
+// which persist in storage after crashes and across daemon restarts — do not count
+// against the per-device limit. Otherwise a device that crashed N agents could never
+// start another session, even with nothing running.
+func TestCreateSessionLimitIgnoresDeadSessions(t *testing.T) {
+	rs, store, _, _, ctx := setupTest(t, Config{MaxPerDevice: 1})
+	defer rs.Shutdown()
+	defer store.Close()
+
+	// Pre-seed a dead (failed) record for the device, as a prior crash would leave.
+	if err := store.SaveSession(ctx, storage.SessionRecord{
+		SessionID:   "dead-1",
+		RuntimeID:   "rt-dead",
+		DeviceID:    "dev-quota",
+		AgentID:     "agent-dead",
+		Status:      StatusFailed,
+		Leaseholder: "dead-1",
+		CreatedAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed failed session: %v", err)
+	}
+
+	// Despite the device being "at" the limit by raw row count, a live session is allowed.
+	if _, _, err := rs.Create(ctx, "rt-live", "dev-quota", "agent-live"); err != nil {
+		t.Fatalf("expected Create to ignore the dead record, got %v", err)
+	}
+
+	// A second live session does hit the limit.
+	if _, _, err := rs.Create(ctx, "rt-live-2", "dev-quota", "agent-live-2"); err != ErrSessionLimitReached {
+		t.Errorf("expected ErrSessionLimitReached for second live session, got %v", err)
 	}
 }
 

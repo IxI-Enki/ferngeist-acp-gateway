@@ -33,8 +33,21 @@ func (rs *RuntimeSession) Create(ctx context.Context, runtimeID, deviceID, agent
 
 	if rs.cfg.MaxPerDevice > 0 {
 		existing, err := rs.store.ListSessionsByDevice(ctx, deviceID)
-		if err == nil && len(existing) >= rs.cfg.MaxPerDevice {
-			return nil, "", ErrSessionLimitReached
+		if err == nil {
+			// Only live sessions (active or disconnected) consume a device's quota.
+			// Failed and closing records are dead — they linger in storage after a
+			// crash or a daemon restart's startup reconciliation, and counting them
+			// would permanently exhaust the limit, blocking every new session for the
+			// device even though none are actually running.
+			live := 0
+			for _, rec := range existing {
+				if rec.Status == StatusActive || rec.Status == StatusDisconnected {
+					live++
+				}
+			}
+			if live >= rs.cfg.MaxPerDevice {
+				return nil, "", ErrSessionLimitReached
+			}
 		}
 	}
 
@@ -144,8 +157,9 @@ func (rs *RuntimeSession) sendPushNotification(deviceID, acpSessionID, title, bo
 
 // handleProcessExit is called by the OnProcessExit callback when a runtime
 // process terminates. It detects genuine crashes (exits not preceded by a
-// Close that set StatusClosing), persists the failed status, and fires a push
-// notification if the session belongs to a device.
+// Close that set StatusClosing), reclaims the crashed session (cancels the
+// pump, releases the runtime lease, deletes the registry and store records),
+// and fires a push notification if the session belongs to a device.
 func (rs *RuntimeSession) handleProcessExit(sessionID, runtimeID, deviceID, agentID string) {
 	rs.mu.Lock()
 	var deviceIDForPush string
@@ -157,9 +171,12 @@ func (rs *RuntimeSession) handleProcessExit(sessionID, runtimeID, deviceID, agen
 		// the intentional StopByRuntimeID issued by Close and the reaper, both
 		// of which mark the session StatusClosing *before* stopping the runtime.
 		// Only an exit from a non-closing session is a genuine crash; otherwise
-		// we must not persist a bogus "failed" record or push a false alarm.
+		// we must not reclaim the session or push a false alarm.
 		if s.Status != StatusClosing {
 			crashed = true
+			// Vestigial: this in-memory write is no longer persisted (the session
+			// is deleted below), but kept for any future diagnostics that read
+			// the in-memory status before reclamation completes.
 			s.Status = StatusFailed
 			deviceIDForPush = s.DeviceID
 			// ACP session id (the id the client navigates by), for the crash push.
@@ -167,15 +184,18 @@ func (rs *RuntimeSession) handleProcessExit(sessionID, runtimeID, deviceID, agen
 		}
 		s.mu.Unlock()
 		if crashed {
-			rs.store.SaveSession(context.Background(), storage.SessionRecord{
-				SessionID:   sessionID,
-				RuntimeID:   runtimeID,
-				DeviceID:    deviceID,
-				AgentID:     agentID,
-				Status:      StatusFailed,
-				Leaseholder: sessionID,
-				CreatedAt:   s.CreatedAt,
-			})
+			// A crashed session is dead and unrecoverable — its agent process is gone.
+			// Reclaim it fully so it cannot keep holding the runtime's exclusive lease
+			// (which would reject a fresh session on the same runtime with
+			// ErrRuntimeLeaseHeld) or linger as a "failed" record. Mirrors Close's
+			// teardown, minus stopping the already-dead runtime. The crash push below
+			// still fires so the client is notified.
+			if s.cancelPump != nil {
+				s.cancelPump()
+			}
+			rs.pm.ReleaseLease(runtimeID, s.Leaseholder)
+			delete(rs.sessions, sessionID)
+			rs.store.DeleteSession(context.Background(), sessionID)
 		}
 	}
 	rs.mu.Unlock()
@@ -423,10 +443,10 @@ func (rs *RuntimeSession) Close(ctx context.Context, sessionID, deviceID string)
 	// Uses acp.CloseSessionRequest for typed param construction.
 	if sess.pump.SupportsClose() {
 		closeMsg, _ := json.Marshal(struct {
-			JSONRPC string                   `json:"jsonrpc"`
-			Method  string                   `json:"method"`
-			ID      string                   `json:"id"`
-			Params  acp.CloseSessionRequest  `json:"params"`
+			JSONRPC string                  `json:"jsonrpc"`
+			Method  string                  `json:"method"`
+			ID      string                  `json:"id"`
+			Params  acp.CloseSessionRequest `json:"params"`
 		}{
 			JSONRPC: "2.0",
 			Method:  "session/close",

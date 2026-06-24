@@ -208,8 +208,9 @@ func TestIntegration_DeviceMismatch(t *testing.T) {
 }
 
 // TestIntegration_ProcessExitCallback verifies that when the underlying agent
-// process exits (triggered via the ProcessManager exit callback), the
-// corresponding session transitions to StatusFailed in the store.
+// process exits (triggered via the ProcessManager exit callback), the crashed
+// session is fully reclaimed — its store record deleted and its runtime lease
+// released — so the dead session cannot block future sessions on that runtime.
 func TestIntegration_ProcessExitCallback(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "exit_cb_test.db")
 	store, err := storage.Open(dbPath)
@@ -235,12 +236,13 @@ func TestIntegration_ProcessExitCallback(t *testing.T) {
 
 	time.Sleep(10 * time.Millisecond)
 
-	rec, err := store.GetSession(ctx, sess.ID)
-	if err != nil {
-		t.Fatalf("GetSession: %v", err)
+	if _, err := store.GetSession(ctx, sess.ID); err == nil {
+		t.Errorf("expected crashed session record to be deleted from store")
 	}
-	if rec.Status != StatusFailed {
-		t.Errorf("expected store status failed after agent exit, got %s", rec.Status)
+
+	// The released lease lets a fresh session reuse the same runtime.
+	if _, _, err := rs.Create(ctx, runtimeID, "dev_cb", "agent_cb2"); err != nil {
+		t.Errorf("expected Create on reclaimed runtime to succeed, got %v", err)
 	}
 }
 
