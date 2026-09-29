@@ -67,6 +67,13 @@ Base path: `/v1`
       (`agent is not detected on this host`). Registry agents with a supported
       distribution install on start, so their `detected: false` is transient
       (see `424` below).
+    - `registry` — provenance block for registry-sourced agents: `name`, `version`,
+      `repository`, `website`, `icon`, `validationStatus`, and distribution/install
+      details. `icon` is the agent's logo URL as published by the ACP registry
+      (omitted when the registry entry has none). It appears only for
+      `source: "registry"`; embedded and custom agents have no icon — clients
+      should fall back to a neutral glyph. The URL is forwarded verbatim from the
+      registry, not re-derived, and is always an SVG.
 
 ### Pairing
 

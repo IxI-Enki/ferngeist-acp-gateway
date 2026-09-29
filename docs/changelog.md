@@ -111,6 +111,12 @@ clients.
   (`embedded` | `registry` | `custom`), and client-registered custom agents
   appear in the list alongside catalog agents. Older clients ignore the field
   and see the same catalog they saw before. (2026-09-16)
+- `[additive]` `GET /v1/agents` — the per-agent `registry` block gains an
+  `icon` field carrying the agent's logo URL as published by the ACP registry.
+  Omitted when the entry has none. Present only for `source: "registry"`;
+  embedded and custom agents have no icon and should fall back to a neutral
+  glyph. The URL is forwarded verbatim (always SVG), not re-derived, so older
+  clients keep working unchanged. (2026-09-29)
 
 ## History
 

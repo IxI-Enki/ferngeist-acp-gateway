@@ -94,6 +94,7 @@ type RegistryInfo struct {
 	Version                 string   `json:"version,omitempty"`
 	Repository              string   `json:"repository,omitempty"`
 	Website                 string   `json:"website,omitempty"`
+	Icon                    string   `json:"icon,omitempty"`
 	DistributionKinds       []string `json:"distributionKinds,omitempty"`
 	CurrentBinaryPath       string   `json:"currentBinaryPath,omitempty"`
 	CurrentBinaryArchiveURL string   `json:"currentBinaryArchiveUrl,omitempty"`
@@ -132,14 +133,14 @@ type Service struct {
 	// mu guards agents and every field Refresh reads or writes: HTTP
 	// handlers call List/Get concurrently on the shared Service, and each
 	// of those re-runs Refresh (which replaces the agents slice).
-	mu               sync.RWMutex
-	agents           []Agent
-	adapters         []Agent
-	baseDir          string
-	registry         RegistrySource
+	mu                 sync.RWMutex
+	agents             []Agent
+	adapters           []Agent
+	baseDir            string
+	registry           RegistrySource
 	resolveNpmBinaries func(string) []string
-	customs          func() []CustomAgent
-	lastRefresh      time.Time
+	customs            func() []CustomAgent
+	lastRefresh        time.Time
 }
 
 // catalogRefreshInterval avoids ~5 LookPath/Stat per agent + SQLite on every
@@ -388,7 +389,8 @@ func (s *Service) Invalidate() {
 }
 
 // refreshLocked is Refresh without locking; caller holds s.mu (write).
-func (s *Service) refreshLocked() {	registrySnapshot, registryErr, registryEnabled := s.loadRegistry()
+func (s *Service) refreshLocked() {
+	registrySnapshot, registryErr, registryEnabled := s.loadRegistry()
 	adapterByID := make(map[string]Agent, len(s.adapters))
 	for _, adapter := range s.adapters {
 		adapterByID[adapter.ID] = adapter
@@ -840,6 +842,7 @@ func registryInfoFromEntry(entry acpregistry.AgentEntry) RegistryInfo {
 		Version:           entry.Version,
 		Repository:        entry.Repository,
 		Website:           entry.Website,
+		Icon:              entry.Icon,
 		DistributionKinds: append([]string(nil), entry.DistributionKinds...),
 		NpxPackage:        entry.NpxPackage,
 		NpxArgs:           append([]string(nil), entry.NpxArgs...),
@@ -880,6 +883,7 @@ func applyRegistryInfo(agent Agent, base RegistryInfo, snapshot acpregistry.Snap
 	registryInfo := registryInfoFromEntry(entry)
 	base.ValidationStatus = registryInfo.ValidationStatus
 	base.Name = registryInfo.Name
+	base.Icon = registryInfo.Icon
 	base.Version = registryInfo.Version
 	base.Repository = registryInfo.Repository
 	base.Website = registryInfo.Website

@@ -71,6 +71,31 @@ func TestClientFetchesAndNormalizesRegistrySnapshot(t *testing.T) {
 	}
 }
 
+func TestClientForwardsRegistryIcon(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"version":"1.0.0",
+			"agents":[
+				{"id":"gemini","icon":"https://cdn.agentclientprotocol.com/registry/v1/latest/gemini.svg"},
+				{"id":"claude"}
+			]
+		}`))
+	}))
+	defer server.Close()
+
+	snapshot, err := New(server.URL, time.Hour).Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	if got, want := snapshot.Agents["gemini"].Icon, "https://cdn.agentclientprotocol.com/registry/v1/latest/gemini.svg"; got != want {
+		t.Fatalf("gemini Icon = %q, want %q", got, want)
+	}
+	if got := snapshot.Agents["claude"].Icon; got != "" {
+		t.Fatalf("claude Icon = %q, want empty", got)
+	}
+}
+
 func TestClientParsesNpxDistributionArgs(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

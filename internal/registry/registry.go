@@ -23,6 +23,7 @@ type AgentEntry struct {
 	Version           string
 	Repository        string
 	Website           string
+	Icon              string
 	DistributionKinds []string
 	BinaryTargets     map[string]BinaryTarget
 	CurrentBinary     *BinaryTarget
@@ -79,6 +80,7 @@ type registryAgentDocument struct {
 	Version      string                     `json:"version"`
 	Repository   string                     `json:"repository"`
 	Website      string                     `json:"website"`
+	Icon         string                     `json:"icon"`
 	Distribution map[string]json.RawMessage `json:"distribution"`
 }
 
@@ -213,6 +215,7 @@ func (c *Client) refresh(ctx context.Context) (Snapshot, error) {
 			Version:           agent.Version,
 			Repository:        agent.Repository,
 			Website:           agent.Website,
+			Icon:              agent.Icon,
 			DistributionKinds: distributionKinds,
 			BinaryTargets:     binaryTargets,
 			CurrentBinary:     currentBinaryTarget(binaryTargets),
