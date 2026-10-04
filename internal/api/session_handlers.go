@@ -160,7 +160,7 @@ func (s *Server) handleSessionWebSocket(w http.ResponseWriter, r *http.Request, 
 	// the session is released instead of lingering as falsely "connected".
 	pingCtx, stopPing := context.WithCancel(context.Background())
 	defer stopPing()
-	go keepAliveWebSocket(pingCtx, conn, s.logger)
+	go keepAliveWebSocket(pingCtx, conn, s.logger, pump.LastClientWriteAt)
 
 	// Intercept a duplicate `initialize` from a reconnecting client: the agent is
 	// already initialized, so replay the cached response instead of forwarding a

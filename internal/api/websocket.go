@@ -25,7 +25,15 @@ const (
 // peer: the connection is force-closed so the read loop returns and the session
 // detaches. This bounds how long a session can sit falsely "connected" behind a
 // half-open socket (e.g. the mobile app was killed without a clean close).
-func keepAliveWebSocket(ctx context.Context, conn *websocket.Conn, logger *slog.Logger) {
+//
+// A late pong is not proof of a dead peer while writes are still completing:
+// the ping is queued behind everything already sent, so during a long
+// session/load replay the phone answers only once it has read the bulk ahead of
+// it. Closing then killed every attempt to load a long transcript at its first
+// ping, in a reconnect loop. lastWrite reports the last completed client write;
+// a peer that drained one within the last interval is alive (a half-open socket
+// stops draining, and the pump's per-frame write timeout closes it).
+func keepAliveWebSocket(ctx context.Context, conn *websocket.Conn, logger *slog.Logger, lastWrite func() time.Time) {
 	ticker := time.NewTicker(wsKeepAliveInterval)
 	defer ticker.Stop()
 	for {
@@ -37,6 +45,9 @@ func keepAliveWebSocket(ctx context.Context, conn *websocket.Conn, logger *slog.
 			err := conn.Ping(pingCtx)
 			cancel()
 			if err != nil {
+				if ctx.Err() == nil && time.Since(lastWrite()) < wsKeepAliveInterval {
+					continue
+				}
 				if ctx.Err() == nil {
 					logger.Warn("websocket keepalive ping failed; closing", "error", err)
 					_ = conn.CloseNow()
