@@ -42,7 +42,7 @@ Format:
 
 The **build** version (the daemon binary's `--version` and the mDNS
 `gateway_version` TXT record) is separate from the **contract** version above.
-Releases are tagged with semver (`v0.6.0` … `v0.11.2` so far); the Taskfile
+Releases are tagged with semver (`v0.6.0` … `v0.11.3` so far); the Taskfile
 derives the build version from `git describe`. They are independent and should
 not be coupled. Full release notes live in GitHub Releases.
 
@@ -157,7 +157,15 @@ clients.
 
 ## History
 
-- `v0.11.2` (latest tagged release) — the per-agent `registry` block on
+- `v0.11.3` (latest tagged release) — reconnect and long-transcript stability:
+  a reattached client's `session/load` replay now carries the user's own turns,
+  a prompt issued on an earlier connection ends with the new
+  `_ferngeist/turn_ended` notification rather than an unmatchable reply, and a
+  client whose outbound backlog overflows (128 MiB) is disconnected instead of
+  being sent a stream with holes in it. A long replay is also no longer killed
+  by the WebSocket keepalive. Protocol version remains `v1`: every change is
+  additive or preserves existing client behavior.
+- `v0.11.2` — the per-agent `registry` block on
   `GET /v1/agents` forwards the ACP registry's `icon` URL, so clients can render
   each registry agent's real logo. The field is omitted when the registry entry
   has none; embedded and custom agents are unchanged. Protocol version remains
