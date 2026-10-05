@@ -139,7 +139,56 @@ func TestBufferLoadHistoryEvictsOldest(t *testing.T) {
 	if got := len(r.history[sid]); got != 1 {
 		t.Fatalf("expected oldest frame evicted leaving 1, got %d", got)
 	}
-	if !strings.Contains(r.history[sid][0], "xxxx") {
+	if !strings.Contains(r.history[sid][0].line, "xxxx") {
 		t.Fatal("expected the most recent (large) frame to be retained")
+	}
+}
+
+func promptRequest(sessionID, text string) []byte {
+	return []byte(`{"jsonrpc":"2.0","id":9,"method":"session/prompt","params":{"sessionId":"` + sessionID +
+		`","prompt":[{"type":"text","text":"` + text + `"}]}}`)
+}
+
+// A live prompt is a request, never echoed as an update, so the replay must
+// carry it itself or consecutive replies arrive with no user turn between them.
+func TestRecoverReplaysPromptsAsUserMessages(t *testing.T) {
+	r := newTestLoadRecovery()
+	const sid = "ses_live"
+	r.OnOutbound(promptRequest(sid, "first question"))
+	r.OnFrame(updateFrame(sid, "first answer"))
+	r.OnOutbound(promptRequest(sid, "second question"))
+	r.OnFrame(updateFrame(sid, "second answer"))
+
+	r.OnOutbound(loadRequest("2", sid))
+	frames, handled := r.OnFrame(`{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"already loaded"}}`)
+	if !handled || len(frames) != 5 {
+		t.Fatalf("expected 4 history frames + success, got %d: %v", len(frames), frames)
+	}
+	for i, want := range []string{"first question", "first answer", "second question", "second answer"} {
+		if !strings.Contains(frames[i], want) {
+			t.Fatalf("frame %d should carry %q, got %s", i, want, frames[i])
+		}
+	}
+	if !strings.Contains(frames[2], `"user_message_chunk"`) {
+		t.Fatalf("prompt should replay as a user message, got %s", frames[2])
+	}
+}
+
+// Past the cap the buffer drops whole turns, so a replay never opens mid-reply.
+func TestBufferLoadHistoryEvictsToATurnBoundary(t *testing.T) {
+	r := newTestLoadRecovery()
+	const sid = "ses_turns"
+	half := strings.Repeat("x", maxLoadHistoryBytes/2)
+	r.OnOutbound(promptRequest(sid, "q1"))
+	r.OnFrame(updateFrame(sid, half))
+	r.OnFrame(updateFrame(sid, "end of reply one"))
+	r.OnOutbound(promptRequest(sid, "q2"))
+	r.OnFrame(updateFrame(sid, half))
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	first := r.history[sid][0]
+	if !first.user || !strings.Contains(first.line, "q2") {
+		t.Fatalf("history should start at the second prompt, starts with %s", first.line)
 	}
 }

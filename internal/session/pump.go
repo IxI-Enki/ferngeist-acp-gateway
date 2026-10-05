@@ -215,6 +215,10 @@ type StdioPump struct {
 	// across a disconnect. See LoadRecovery. Nil when disabled.
 	loadRecovery *LoadRecovery
 
+	// Translates client request ids so requests from successive connections
+	// never share one. See requestIDs.
+	reqIDs requestIDs
+
 	lastStdoutAt time.Time // updated on each agent stdout line; used by reaper to avoid killing active agents
 	lastStdoutMu sync.Mutex
 
@@ -432,6 +436,8 @@ func (p *StdioPump) handleStdoutLine(line string) {
 	// and a JSON-RPC stream missing frames is worse than a reconnect.
 	var evict *websocket.Conn
 	p.clientMu.Lock()
+	// Under clientMu: a reply routed for one generation must not reach the next.
+	outFrames = p.reqIDs.reply(p.connGen, probe, outFrames)
 	if p.client != nil && p.writerQ != nil {
 		for i, frame := range outFrames {
 			if p.writerQ.push(frame) {
@@ -891,6 +897,10 @@ func verbForKind(kind string) string {
 }
 
 func (p *StdioPump) WriteToAgent(payload []byte) error {
+	p.clientMu.Lock()
+	gen := p.connGen
+	p.clientMu.Unlock()
+	payload = p.reqIDs.outbound(gen, payload)
 	p.markTurnStart(payload)
 	p.snoopInboundSessionID(payload)
 	p.snoopInboundCwd(payload)

@@ -26,12 +26,19 @@ const maxLoadHistoryBytes = 8 << 20 // 8 MiB
 // unchanged.
 type LoadRecovery struct {
 	mu           sync.Mutex
-	history      map[string][]string // acpSessionId -> ordered session/update frames
-	histSize     map[string]int      // acpSessionId -> approximate buffered bytes
+	history      map[string][]historyFrame // acpSessionId -> ordered session/update frames
+	histSize     map[string]int            // acpSessionId -> approximate buffered bytes
+	userFrames   map[string]int            // acpSessionId -> buffered user_message_chunk frames
 	response     map[string][]byte   // acpSessionId -> first successful session/load response
 	pendingLoads map[string]string   // load request id -> acpSessionId
 
 	logger *slog.Logger
+}
+
+// historyFrame is one buffered session/update; user marks a user_message_chunk.
+type historyFrame struct {
+	line string
+	user bool
 }
 
 // newLoadRecovery builds a LoadRecovery bound to the given logger.
@@ -48,10 +55,18 @@ func (r *LoadRecovery) OnOutbound(payload []byte) {
 		Method string          `json:"method"`
 		ID     json.RawMessage `json:"id"`
 		Params *struct {
-			SessionID string `json:"sessionId"`
+			SessionID string            `json:"sessionId"`
+			Prompt    []json.RawMessage `json:"prompt"`
 		} `json:"params"`
 	}
-	if err := json.Unmarshal(payload, &req); err != nil || req.Method != "session/load" {
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return
+	}
+	if req.Method == "session/prompt" && req.Params != nil && req.Params.SessionID != "" {
+		r.bufferPrompt(req.Params.SessionID, req.Params.Prompt)
+		return
+	}
+	if req.Method != "session/load" {
 		return
 	}
 	if req.Params == nil || req.Params.SessionID == "" || len(req.ID) == 0 {
@@ -125,7 +140,10 @@ func (r *LoadRecovery) OnFrameProbe(line string, probe frameProbe, ok bool) ([]s
 		return nil, false
 	}
 
-	frames := append([]string(nil), r.history[sid]...)
+	frames := make([]string, 0, len(r.history[sid]))
+	for _, frame := range r.history[sid] {
+		frames = append(frames, frame.line)
+	}
 	cached := r.response[sid]
 	r.mu.Unlock()
 
@@ -157,24 +175,69 @@ func (r *LoadRecovery) bufferHistoryProbe(line string, probe frameProbe, ok bool
 		probe.Method != "session/update" || probe.Params == nil || probe.Params.SessionID == "" {
 		return
 	}
-	sid := probe.Params.SessionID
+	user := probe.Params.Update != nil && probe.Params.Update.Discriminator == "user_message_chunk"
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.history == nil {
-		r.history = make(map[string][]string)
-		r.histSize = make(map[string]int)
+	r.appendHistoryLocked(probe.Params.SessionID, line, user)
+}
+
+// bufferPrompt records a prompt the client sent as the user_message_chunk
+// updates a load replay would carry. Agents do not echo a live prompt, so
+// without this a re-load replays every reply since the gateway took the session
+// with no user turn between them, and the client folds them into one message.
+func (r *LoadRecovery) bufferPrompt(sessionID string, blocks []json.RawMessage) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, block := range blocks {
+		frame, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"method":  "session/update",
+			"params": map[string]any{
+				"sessionId": sessionID,
+				"update":    map[string]any{"sessionUpdate": "user_message_chunk", "content": block},
+			},
+		})
+		if err == nil {
+			r.appendHistoryLocked(sessionID, string(frame), true)
+		}
 	}
-	r.history[sid] = append(r.history[sid], line)
+}
+
+// appendHistoryLocked appends one frame, then evicts the oldest past
+// maxLoadHistoryBytes. After an eviction it keeps dropping up to the next user
+// message, so a replay never opens partway through a reply. Caller holds mu.
+func (r *LoadRecovery) appendHistoryLocked(sid, line string, user bool) {
+	if r.history == nil {
+		r.history = make(map[string][]historyFrame)
+		r.histSize = make(map[string]int)
+		r.userFrames = make(map[string]int)
+	}
+	r.history[sid] = append(r.history[sid], historyFrame{line: line, user: user})
 	r.histSize[sid] += len(line)
+	if user {
+		r.userFrames[sid]++
+	}
 	// Note: a single frame exceeding maxLoadHistoryBytes is never evicted (the
 	// loop requires len > 1). The effective per-session bound is
 	// max(maxLoadHistoryBytes, single-frame-size), which is acceptable because
 	// one frame is the minimum needed for replay.
+	evicted := false
 	for r.histSize[sid] > maxLoadHistoryBytes && len(r.history[sid]) > 1 {
-		dropped := r.history[sid][0]
-		r.history[sid] = r.history[sid][1:]
-		r.histSize[sid] -= len(dropped)
+		r.dropOldestLocked(sid)
+		evicted = true
+	}
+	for evicted && r.userFrames[sid] > 0 && !r.history[sid][0].user {
+		r.dropOldestLocked(sid)
+	}
+}
+
+func (r *LoadRecovery) dropOldestLocked(sid string) {
+	dropped := r.history[sid][0]
+	r.history[sid] = r.history[sid][1:]
+	r.histSize[sid] -= len(dropped.line)
+	if dropped.user {
+		r.userFrames[sid]--
 	}
 }
 
