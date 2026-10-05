@@ -514,7 +514,8 @@ mid-turn, and always fire on each tool call that completes or fails.
 - `GET /v1/acp/{runtimeId}`
   - WebSocket endpoint for ACP traffic.
   - Pass `?sessionId=<id>&attachToken=<token>` as query params. The session ID and initial attach token are obtained from `POST /v1/runtimes/{id}/connect`. For reconnects, a fresh attach token is obtained from `POST /v1/sessions/{id}/resume`.
-  - On reconnect, the client is responsible for calling the ACP `session/load` method on the agent for context restoration. The gateway does not replay old frames.
+  - On reconnect, the client is responsible for calling the ACP `session/load` method for context restoration — the gateway does not replay history on its own. If the agent rejects that load as already loaded (common when the agent process still holds the session), the gateway substitutes the `session/update` frames it buffered since taking over the session and answers the `session/load` itself, so the client still receives the transcript instead of hanging. Only `session/update` notifications are buffered — never live requests such as permission prompts — and the buffer is bounded (8 MiB per session), trimmed from the oldest end to a turn boundary.
+  - On reconnect, a prompt issued on an earlier connection cannot be answered with a JSON-RPC result, because the id it would carry was never issued on the new connection; its turn ends with a `_ferngeist/turn_ended` notification instead (see `docs/changelog.md`).
 
 ### Attach tokens
 

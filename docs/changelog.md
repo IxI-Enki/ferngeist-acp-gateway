@@ -117,6 +117,43 @@ clients.
   embedded and custom agents have no icon and should fall back to a neutral
   glyph. The URL is forwarded verbatim (always SVG), not re-derived, so older
   clients keep working unchanged. (2026-09-29)
+- `[additive]` `_ferngeist/turn_ended` — a new gateway→client notification on
+  the ACP WebSocket, sent when a `session/prompt` issued on an **earlier**
+  connection finishes while a new connection is attached:
+  `{"jsonrpc":"2.0","method":"_ferngeist/turn_ended","params":{"sessionId":…,"stopReason":…}}`.
+  Client request ids are now translated to gateway-unique ids on the way to the
+  agent and restored on the way back, so a reply reaches the connection that
+  asked for it. A prompt from an earlier connection therefore cannot be
+  answered with a JSON-RPC result — the id it would carry was never issued on
+  the current connection — and its turn ends with this notification instead;
+  replies to any other earlier-connection request are withheld. A client that
+  ignores unknown methods simply never sees a reply for that prompt — the frame
+  it used to receive carried the old connection's id, which it could not match
+  to a request anyway — while a client that handles the notification can clear
+  that turn's streaming state. Underscore-prefixed per ACP's extension rule.
+  (2026-10-05)
+- `[additive]` `session/load` replay on reconnect — the replay now carries
+  `user_message_chunk` updates for the user's prompts, not only the agent's
+  replies, so a reattached client no longer folds every reply since the gateway
+  took over the session into one message with no user turn between them. The
+  per-session buffer is bounded (8 MiB) and trims from the oldest end to a turn
+  boundary, so a replay never opens partway through a reply. Clients that
+  render `user_message_chunk` see the missing user turns restored; clients that
+  ignore it are unaffected. (2026-10-05)
+- Backlog overflow disconnects instead of corrupting the stream — the per-client
+  outbound queue was a 64-frame channel that silently discarded the overflow,
+  so a `session/load` burst (one frame per streamed chunk — thousands of frames
+  in milliseconds against a client draining one WebSocket write at a time)
+  reached the client with holes in it: turns glued together, or the
+  `session/load` response itself missing. The queue is now unbounded in frames
+  and capped at 128 MiB of queued bytes; a client past the cap is disconnected
+  and logged (`client backlog exceeds cap`) rather than sent a corrupt stream.
+  A long replay is also no longer killed at its first keepalive ping: the
+  keepalive's 10 s pong wait no longer closes a connection whose writes are
+  still completing. No `protocolVersion` bump and no client change required —
+  the JSON shapes are unchanged, and a client that reconnects and re-issues
+  `session/load`, the disconnect-tolerant path it already implements, recovers.
+  (2026-10-05)
 
 ## History
 
