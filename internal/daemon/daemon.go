@@ -14,7 +14,6 @@ import (
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/catalog"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/config"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/discovery"
-	"github.com/arafatamim/ferngeist-acp-gateway/internal/gateway"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/logging"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/pairing"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/push"
@@ -24,7 +23,6 @@ import (
 	gatewayruntime "github.com/arafatamim/ferngeist-acp-gateway/internal/runtime"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/session"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
-	"github.com/arafatamim/ferngeist-acp-gateway/internal/token"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/update"
 )
 
@@ -91,10 +89,6 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 	}
 	defer store.Close()
 
-	if err := store.DeleteAllRuntimeTokens(context.Background()); err != nil {
-		return fmt.Errorf("clear stale runtime tokens: %w", err)
-	}
-
 	// Establish this gateway's stable instance id (generated once, persisted).
 	// Clients receive it at pairing and use it to address the gateway and resolve
 	// its pushes for deep-linking.
@@ -115,7 +109,7 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 
 	registryClient := acpregistry.New(cfg.RegistryURL, 6*time.Hour)
 	defer registryClient.Close()
-	catalogSvc := catalog.NewWithBaseDirAndRegistry(".", registryClient)
+	catalogSvc := catalog.New(".", registryClient)
 	catalogSvc.SetNpmResolver(catalog.ResolveNpmBinaryNames)
 	// Custom agents live in SQLite; the catalog pulls them on every refresh so
 	// client edits show up without a daemon restart.
@@ -138,7 +132,7 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 		return out
 	})
 	installer := acquire.New(logger, cfg.ManagedBinDir, store)
-	runtimeSvc := gatewayruntime.NewSupervisorWithBaseDirAndInstaller(logger, ".", store, installer)
+	runtimeSvc := gatewayruntime.NewSupervisor(logger, ".", store, installer)
 	pairingSvc := pairing.NewServiceWithOptions(logger, store, pairing.Options{
 		ArmTTL:                 cfg.PairingArmTTL,
 		CredentialTTL:          cfg.CredentialTTL,
@@ -146,8 +140,7 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 		AllowDiagnosticsExport: cfg.AllowDiagnosticsExport,
 		AllowRuntimeRestartEnv: cfg.AllowRuntimeRestartEnv,
 	})
-	gatewaySvc := gateway.New(logger, store)
-	tokenSvc := token.New(logger)
+	tokenSvc := session.NewTokenService(logger)
 	pushSvc, vapidPublicKey, err := newPushService(logger, store)
 	if err != nil {
 		return fmt.Errorf("establish web push keys: %w", err)
@@ -262,7 +255,6 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 		catalogSvc,
 		runtimeSvc,
 		pairingSvc,
-		gatewaySvc,
 		discoverySvc,
 		logSvc,
 		registryClient,

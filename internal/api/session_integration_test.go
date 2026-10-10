@@ -19,7 +19,6 @@ import (
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/push"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/session"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
-	"github.com/arafatamim/ferngeist-acp-gateway/internal/token"
 )
 
 const testGatewayID = "test-gateway-id"
@@ -93,7 +92,7 @@ func newResilientTestHarness(t *testing.T) *resilientTestHarness {
 	server := newTestServerWithStore(baseDir, store)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tokenSvc := token.New(logger)
+	tokenSvc := session.NewTokenService(logger)
 	mockPush := &mockPushService{}
 	sessionSvc := session.NewRuntimeSession(logger, store, server.runtime, tokenSvc, session.Config{
 		MaxDisconnected: 5 * time.Minute,

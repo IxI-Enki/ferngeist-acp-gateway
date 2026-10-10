@@ -33,7 +33,7 @@ func TestStartIsIdempotentPerAgent(t *testing.T) { // TestStartIsIdempotentPerAg
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -42,15 +42,8 @@ func TestStartIsIdempotentPerAgent(t *testing.T) { // TestStartIsIdempotentPerAg
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{
-				Mode: "immediate",
-			},
-		},
-		HealthCheck: catalog.HealthCheckConfig{
-			Mode: "none",
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
 	}
 
@@ -74,7 +67,7 @@ func TestStartNewLaunchesSeparateRuntime(t *testing.T) {
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -83,12 +76,9 @@ func TestStartNewLaunchesSeparateRuntime(t *testing.T) {
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	first, err := supervisor.StartNew(agent)
@@ -114,7 +104,7 @@ func TestStartNewLaunchesSeparateRuntime(t *testing.T) {
 }
 
 func TestStartPrefersUnleasedRuntime(t *testing.T) { // TestStartPrefersUnleasedRuntime verifies Start deterministically reuses an unleased runtime even when map iteration order surfaces leased siblings first.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 	supervisor.now = func() time.Time { return now }
 
@@ -143,7 +133,7 @@ func TestStartPrefersUnleasedRuntime(t *testing.T) { // TestStartPrefersUnleased
 	}
 
 	// A free runtime also beats replacing a legacy-leased one.
-	supervisor2 := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor2 := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor2.now = func() time.Time { return now }
 	seed2 := func(id, leaseholder string) {
 		supervisor2.runtimes[id] = Runtime{
@@ -169,7 +159,7 @@ func TestStopByAgentIDStopsAllRuntimes(t *testing.T) {
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -178,12 +168,9 @@ func TestStopByAgentIDStopsAllRuntimes(t *testing.T) {
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	a, err := supervisor.StartNew(agent)
@@ -213,58 +200,11 @@ func TestStopByAgentIDStopsAllRuntimes(t *testing.T) {
 	}
 }
 
-func TestStartReplacesAttachedRuntimeForReconnect(t *testing.T) { // TestStartReplacesAttachedRuntimeForReconnect verifies that Start creates a new runtime when the previous one has an attached legacy client.
+func TestConnectReturnsDescriptorForRunningRuntime(t *testing.T) { // TestConnectReturnsDescriptorForRunningRuntime verifies that Connect returns a WebSocket path for a running runtime.
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{
-				Mode: "immediate",
-			},
-		},
-		HealthCheck: catalog.HealthCheckConfig{
-			Mode: "none",
-		},
-	}
-
-	first, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	legacyPipes, err := supervisor.AcquireLease(first.ID, "legacy")
-	if err != nil {
-		t.Fatalf("AcquireLease() error = %v", err)
-	}
-	defer func() { _ = legacyPipes.Release() }()
-
-	second, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() reconnect error = %v", err)
-	}
-	if first.ID == second.ID {
-		t.Fatalf("runtime IDs match after reconnect: %q", first.ID)
-	}
-
-	_, _ = supervisor.StopByAgentID(agent.ID)
-}
-
-func TestConnectReturnsDescriptorForRunningRuntime(t *testing.T) { // TestConnectReturnsDescriptorForRunningRuntime verifies that Connect returns a WebSocket path and bearer token for a running runtime.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	runtime, err := supervisor.Start(catalog.Agent{
@@ -273,15 +213,8 @@ func TestConnectReturnsDescriptorForRunningRuntime(t *testing.T) { // TestConnec
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{
-				Mode: "immediate",
-			},
-		},
-		HealthCheck: catalog.HealthCheckConfig{
-			Mode: "none",
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
 	})
 	if err != nil {
@@ -296,8 +229,8 @@ func TestConnectReturnsDescriptorForRunningRuntime(t *testing.T) { // TestConnec
 	if descriptor.WebSocketPath == "" {
 		t.Fatal("WebSocketPath should not be empty")
 	}
-	if descriptor.BearerToken == "" {
-		t.Fatal("BearerToken should not be empty")
+	if descriptor.AgentID != "mock-acp" {
+		t.Fatalf("AgentID = %q, want %q", descriptor.AgentID, "mock-acp")
 	}
 
 	_, _ = supervisor.StopByAgentID("mock-acp")
@@ -307,19 +240,16 @@ func TestRestartLaunchesNewRuntimeWithMergedEnv(t *testing.T) { // TestRestartLa
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	runtimeInfo, err := supervisor.Start(catalog.Agent{
 		ID:          "mock-acp",
 		DisplayName: "Mock ACP",
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -387,22 +317,15 @@ func TestStoppedRuntimeAppearsInList(t *testing.T) { // TestStoppedRuntimeAppear
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	runtimeInfo, err := supervisor.Start(catalog.Agent{
 		ID:          "mock-acp",
 		DisplayName: "Mock ACP",
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{
-				Mode: "immediate",
-			},
-		},
-		HealthCheck: catalog.HealthCheckConfig{
-			Mode: "none",
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
 	})
 	if err != nil {
@@ -437,22 +360,15 @@ func TestStoppedRuntimeCountedInSummary(t *testing.T) { // TestStoppedRuntimeCou
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	runtimeInfo, err := supervisor.Start(catalog.Agent{
 		ID:          "mock-acp",
 		DisplayName: "Mock ACP",
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{
-				Mode: "immediate",
-			},
-		},
-		HealthCheck: catalog.HealthCheckConfig{
-			Mode: "none",
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
 	})
 	if err != nil {
@@ -477,7 +393,7 @@ func TestStoppedRuntimeCountedInSummary(t *testing.T) { // TestStoppedRuntimeCou
 }
 
 func TestStoppedRuntimeIsPrunedAfterRetentionWindow(t *testing.T) { // TestStoppedRuntimeIsPrunedAfterRetentionWindow verifies that stopped runtimes are removed from List, Logs, and Summary after the retention period.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 	supervisor.now = func() time.Time { return now }
 
@@ -506,14 +422,13 @@ func TestStoppedRuntimeIsPrunedAfterRetentionWindow(t *testing.T) { // TestStopp
 // --- Input validation ---
 
 func TestStartRejectsUndetectedAgent(t *testing.T) { // TestStartRejectsUndetectedAgent verifies that Start returns ErrAgentNotDetected for agents not marked as detected.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 
 	_, err := supervisor.Start(catalog.Agent{
 		ID:          "codex-acp",
 		DisplayName: "Codex ACP",
 		Detected:    false,
 		Launch:      catalog.LaunchConfig{Mode: "external"},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	})
 	if err != ErrAgentNotDetected {
 		t.Fatalf("Start() error = %v, want %v", err, ErrAgentNotDetected)
@@ -529,33 +444,26 @@ func TestStartSupportsExternalStdioRuntime(t *testing.T) { // TestStartSupportsE
 	buildMockStdioAgent(t, filepath.Join(binDir, namedBinary("codex-acp")))
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	runtimeInfo, err := supervisor.Start(catalog.Agent{
 		ID:          "codex-acp",
 		DisplayName: "Codex ACP",
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "external",
-			Command:   "codex-acp",
-			Args:      []string{},
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{
-				Mode: "immediate",
-			},
+			Mode:    "external",
+			Command: "codex-acp",
+			Args:    []string{},
 			Restart: catalog.RestartConfig{
 				Mode: "never",
 			},
-		},
-		HealthCheck: catalog.HealthCheckConfig{
-			Mode: "none",
 		},
 	})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
-	if runtimeInfo.Transport != "stdio" {
-		t.Fatalf("Transport = %q, want %q", runtimeInfo.Transport, "stdio")
+	if runtimeInfo.LaunchMode != "external" {
+		t.Fatalf("LaunchMode = %q, want %q", runtimeInfo.LaunchMode, "external")
 	}
 
 	rawPipes, err := supervisor.AcquireLease(runtimeInfo.ID, "legacy")
@@ -627,27 +535,20 @@ func main() {
 		t.Fatalf("go build flaky agent error = %v", err)
 	}
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	runtimeInfo, err := supervisor.Start(catalog.Agent{
 		ID:          "flaky-acp",
 		DisplayName: "Flaky ACP",
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", namedBinary("flaky-acp-agent")),
-			Transport: "stdio",
-			Args:      []string{},
-			Readiness: catalog.ReadinessConfig{
-				Mode: "immediate",
-			},
+			Mode:    "process",
+			Command: filepath.Join("bin", namedBinary("flaky-acp-agent")),
+			Args:    []string{},
 			Restart: catalog.RestartConfig{
 				Mode:       "on_failure",
 				MaxRetries: 1,
 			},
-		},
-		HealthCheck: catalog.HealthCheckConfig{
-			Mode: "none",
 		},
 	})
 	if err != nil {
@@ -708,26 +609,19 @@ func main() {
 		t.Fatalf("go build always-fail agent error = %v", err)
 	}
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	runtimeInfo, err := supervisor.Start(catalog.Agent{
 		ID:          "always-fail-acp",
 		DisplayName: "Always Fail ACP",
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", namedBinary("always-fail-acp-agent")),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{
-				Mode: "immediate",
-			},
+			Mode:    "process",
+			Command: filepath.Join("bin", namedBinary("always-fail-acp-agent")),
 			Restart: catalog.RestartConfig{
 				Mode:       "on_failure",
 				MaxRetries: 1,
 			},
-		},
-		HealthCheck: catalog.HealthCheckConfig{
-			Mode: "none",
 		},
 	})
 	if err != nil {
@@ -795,23 +689,20 @@ func main() {
 		t.Fatalf("go build long-lived agent error = %v", err)
 	}
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	rt, err := supervisor.Start(catalog.Agent{
 		ID:          "long-lived-acp",
 		DisplayName: "Long Lived ACP",
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", namedBinary("long-lived-acp-agent")),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", namedBinary("long-lived-acp-agent")),
 			Restart: catalog.RestartConfig{
 				Mode:       "on_failure",
 				MaxRetries: 3,
 			},
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -899,26 +790,19 @@ func TestOptionalInstalledOpenCodeACPSmoke(t *testing.T) { // TestOptionalInstal
 		t.Skip("opencode is not installed on PATH")
 	}
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(), nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(), nil, nil)
 	runtimeInfo, err := supervisor.Start(catalog.Agent{
 		ID:          "opencode",
 		DisplayName: "OpenCode",
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "external",
-			Command:   "opencode",
-			Args:      []string{"acp"},
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{
-				Mode: "immediate",
-			},
+			Mode:    "external",
+			Command: "opencode",
+			Args:    []string{"acp"},
 			Restart: catalog.RestartConfig{
 				Mode: "never",
 			},
-		},
-		HealthCheck: catalog.HealthCheckConfig{
-			Mode: "none",
 		},
 	})
 	if err != nil {
@@ -972,7 +856,7 @@ func TestOptionalInstalledOpenCodeACPSmoke(t *testing.T) { // TestOptionalInstal
 // --- Summary ---
 
 func TestSummaryIncludesRecentFailures(t *testing.T) { // TestSummaryIncludesRecentFailures verifies that Summary exposes RecentFailures with LastError and log lines for failed runtimes.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 	supervisor.now = func() time.Time { return now }
 
@@ -1022,7 +906,7 @@ func TestSummaryIncludesRecentFailures(t *testing.T) { // TestSummaryIncludesRec
 }
 
 func TestSummaryCountsLifecycleTransitions(t *testing.T) { // TestSummaryCountsLifecycleTransitions verifies that Summary counts each lifecycle status (Starting, Running, Stopping, Stopped, Failed, CircuitOpen) correctly.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 
 	supervisor.runtimes["run-starting"] = Runtime{ID: "run-starting", AgentID: "a", AgentName: "A", Status: StatusStarting, CreatedAt: now}
@@ -1076,7 +960,7 @@ func TestSummaryIncludesPersistedFailures(t *testing.T) { // TestSummaryIncludes
 		t.Fatalf("SaveRuntimeFailure() error = %v", err)
 	}
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(), store)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(), store, nil)
 	summary := supervisor.Summary()
 
 	if len(summary.RecentFailures) != 1 {
@@ -1096,22 +980,15 @@ func TestShutdownStopsRunningProcess(t *testing.T) { // TestShutdownStopsRunning
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	runtimeInfo, err := supervisor.Start(catalog.Agent{
 		ID:          "mock-acp",
 		DisplayName: "Mock ACP",
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{
-				Mode: "immediate",
-			},
-		},
-		HealthCheck: catalog.HealthCheckConfig{
-			Mode: "none",
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
 	})
 	if err != nil {
@@ -1141,7 +1018,7 @@ func TestStartAutoAcquiresMissingExternalBinary(t *testing.T) { // TestStartAuto
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	installer := acquire.New(logger, t.TempDir(), nil)
-	supervisor := NewSupervisorWithBaseDirAndInstaller(logger, t.TempDir(), nil, installer)
+	supervisor := NewSupervisor(logger, t.TempDir(), nil, installer)
 
 	runtimeInfo, err := supervisor.Start(catalog.Agent{
 		ID:          "codex-acp",
@@ -1150,13 +1027,10 @@ func TestStartAutoAcquiresMissingExternalBinary(t *testing.T) { // TestStartAuto
 		Protocol:    "acp",
 		Security:    catalog.SecurityConfig{CuratedLaunch: true, AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "external",
-			Command:   "codex-acp",
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
-			Restart:   catalog.RestartConfig{Mode: "never"},
+			Mode:    "external",
+			Command: "codex-acp",
+			Restart: catalog.RestartConfig{Mode: "never"},
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 		Registry: catalog.RegistryInfo{
 			CurrentBinaryPath:       namedBinary("mock-stdio-agent"),
 			CurrentBinaryArchiveURL: server.URL + "/" + namedBinary("mock-stdio-agent"),
@@ -1184,7 +1058,7 @@ func TestAcquireLeaseReturnsPipesRunningRuntime(t *testing.T) { // TestAcquireLe
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -1193,12 +1067,9 @@ func TestAcquireLeaseReturnsPipesRunningRuntime(t *testing.T) { // TestAcquireLe
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	rt, err := supervisor.Start(agent)
@@ -1222,7 +1093,7 @@ func TestReleaseLeaseFreesLeaseForReAcquire(t *testing.T) { // TestReleaseLeaseF
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -1231,12 +1102,9 @@ func TestReleaseLeaseFreesLeaseForReAcquire(t *testing.T) { // TestReleaseLeaseF
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	rt, err := supervisor.Start(agent)
@@ -1272,7 +1140,7 @@ func TestAcquireLeaseDoubleAcquireError(t *testing.T) { // TestAcquireLeaseDoubl
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -1281,12 +1149,9 @@ func TestAcquireLeaseDoubleAcquireError(t *testing.T) { // TestAcquireLeaseDoubl
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	rt, err := supervisor.Start(agent)
@@ -1312,7 +1177,7 @@ func TestReleaseLeaseWrongLeaseholder(t *testing.T) { // TestReleaseLeaseWrongLe
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -1321,12 +1186,9 @@ func TestReleaseLeaseWrongLeaseholder(t *testing.T) { // TestReleaseLeaseWrongLe
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	rt, err := supervisor.Start(agent)
@@ -1354,7 +1216,7 @@ func TestOnProcessExitCallback(t *testing.T) { // TestOnProcessExitCallback veri
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -1363,12 +1225,9 @@ func TestOnProcessExitCallback(t *testing.T) { // TestOnProcessExitCallback veri
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	rt, err := supervisor.Start(agent)
@@ -1407,7 +1266,7 @@ func TestAppendLog(t *testing.T) { // TestAppendLog verifies that AppendLog writ
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -1416,12 +1275,9 @@ func TestAppendLog(t *testing.T) { // TestAppendLog verifies that AppendLog writ
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	rt, err := supervisor.Start(agent)
@@ -1455,7 +1311,7 @@ func TestWriteToAgent(t *testing.T) { // TestWriteToAgent verifies that WriteToA
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -1464,12 +1320,9 @@ func TestWriteToAgent(t *testing.T) { // TestWriteToAgent verifies that WriteToA
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	rt, err := supervisor.Start(agent)
@@ -1496,7 +1349,7 @@ func TestStartDoesNotKillSessionLeasedRuntime(t *testing.T) { // TestStartDoesNo
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -1505,12 +1358,9 @@ func TestStartDoesNotKillSessionLeasedRuntime(t *testing.T) { // TestStartDoesNo
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	first, err := supervisor.Start(agent)
@@ -1542,7 +1392,7 @@ func TestStopByRuntimeID_ReleasesPipes(t *testing.T) { // TestStopByRuntimeID_Re
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -1551,12 +1401,9 @@ func TestStopByRuntimeID_ReleasesPipes(t *testing.T) { // TestStopByRuntimeID_Re
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	rt, err := supervisor.Start(agent)
@@ -1585,59 +1432,11 @@ func TestStopByRuntimeID_ReleasesPipes(t *testing.T) { // TestStopByRuntimeID_Re
 
 // --- LeasedPipes Release behavior ---
 
-func TestLeasedPipesRelease(t *testing.T) { // TestLeasedPipesRelease verifies that a legacy ("legacy") lease Release closes stdin and frees the lease for re-acquire.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
-		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
-	}
-
-	rt, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	pipes, err := supervisor.AcquireLease(rt.ID, "legacy")
-	if err != nil {
-		t.Fatalf("AcquireLease() error = %v", err)
-	}
-
-	if err := pipes.Release(); err != nil {
-		t.Fatalf("Release() error = %v", err)
-	}
-
-	pipes2, err := supervisor.AcquireLease(rt.ID, "new-holder")
-	if err != nil {
-		t.Fatalf("AcquireLease() after release error = %v", err)
-	}
-	_ = pipes2.Release()
-
-	if _, err := pipes.(*LeasedPipes).Stdin.Write([]byte("test")); err == nil {
-		t.Fatal("expected error writing to stdin after legacy Release()")
-	}
-
-	_, _ = supervisor.StopByAgentID(agent.ID)
-}
-
 func TestLeasedPipesRelease_SessionLease(t *testing.T) { // TestLeasedPipesRelease_SessionLease verifies that a session lease Release does not close stdin and allows subsequent writes and re-acquire.
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -1646,12 +1445,9 @@ func TestLeasedPipesRelease_SessionLease(t *testing.T) { // TestLeasedPipesRelea
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	rt, err := supervisor.Start(agent)
@@ -1684,7 +1480,7 @@ func TestLeasedPipesRelease_SessionLease(t *testing.T) { // TestLeasedPipesRelea
 // --- More input validation ---
 
 func TestStartRejectsUnsupportedLaunch(t *testing.T) { // TestStartRejectsUnsupportedLaunch verifies that Start returns ErrUnsupportedLaunch for an unknown launch mode.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 
 	_, err := supervisor.Start(catalog.Agent{
 		ID:          "bad-agent",
@@ -1692,87 +1488,34 @@ func TestStartRejectsUnsupportedLaunch(t *testing.T) { // TestStartRejectsUnsupp
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "unsupported",
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode: "unsupported",
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	})
 	if err != ErrUnsupportedLaunch {
 		t.Fatalf("Start() error = %v, want %v", err, ErrUnsupportedLaunch)
 	}
 }
 
-func TestStartRejectsNoTransport(t *testing.T) { // TestStartRejectsNoTransport verifies that Start returns ErrRuntimeNotConnectable for non-stdio transports.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
-
-	_, err := supervisor.Start(catalog.Agent{
-		ID:          "http-agent",
-		DisplayName: "HTTP Agent",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Transport: "http",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
-		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
-	})
-	if err != ErrRuntimeNotConnectable {
-		t.Fatalf("Start() error = %v, want %v", err, ErrRuntimeNotConnectable)
-	}
-}
-
 func TestStartRejectsNotDetectedNoInstaller(t *testing.T) { // TestStartRejectsNotDetectedNoInstaller verifies that Start returns ErrAgentNotDetected for undetected agents without an installer.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 
 	_, err := supervisor.Start(catalog.Agent{
 		ID:          "missing-agent",
 		DisplayName: "Missing Agent",
 		Detected:    false,
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode: "process",
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	})
 	if err != ErrAgentNotDetected {
 		t.Fatalf("Start() error = %v, want %v", err, ErrAgentNotDetected)
 	}
 }
 
-func TestStartFailsOnUnsupportedReadinessMode(t *testing.T) { // TestStartFailsOnUnsupportedReadinessMode verifies that Start returns an error for invalid readiness mode.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
-
-	_, err := supervisor.Start(catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "invalid"},
-		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
-	})
-	if err == nil {
-		t.Fatal("expected error for unsupported readiness mode")
-	}
-	if !strings.Contains(err.Error(), "unsupported readiness mode") {
-		t.Fatalf("error = %v, want error containing 'unsupported readiness mode'", err)
-	}
-}
-
 // --- Logging edge cases ---
 
 func TestAppendLogEmptyID(t *testing.T) { // TestAppendLogEmptyID verifies that AppendLog with an empty runtime ID does not create log entries.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	supervisor.AppendLog("", "gateway", "test")
@@ -1784,7 +1527,7 @@ func TestAppendLogEmptyID(t *testing.T) { // TestAppendLogEmptyID verifies that 
 }
 
 func TestLogsNotFound(t *testing.T) { // TestLogsNotFound verifies that Logs returns ErrRuntimeNotFound for a nonexistent ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	_, err := supervisor.Logs("nonexistent")
 	if err != ErrRuntimeNotFound {
 		t.Fatalf("Logs() error = %v, want %v", err, ErrRuntimeNotFound)
@@ -1792,18 +1535,6 @@ func TestLogsNotFound(t *testing.T) { // TestLogsNotFound verifies that Logs ret
 }
 
 // --- Helper function tests ---
-
-func TestReadinessMode(t *testing.T) { // TestReadinessMode verifies that readinessMode returns the expected defaults for stdio and non-stdio transports.
-	if mode := readinessMode(catalog.LaunchConfig{Readiness: catalog.ReadinessConfig{Mode: "immediate"}}); mode != "immediate" {
-		t.Fatalf("readinessMode(explicit) = %q, want %q", mode, "immediate")
-	}
-	if mode := readinessMode(catalog.LaunchConfig{Transport: "stdio"}); mode != "immediate" {
-		t.Fatalf("readinessMode(stdio default) = %q, want %q", mode, "immediate")
-	}
-	if mode := readinessMode(catalog.LaunchConfig{Transport: "http"}); mode != "" {
-		t.Fatalf("readinessMode(non-stdio) = %q, want empty", mode)
-	}
-}
 
 func TestRestartMaxRetriesNegative(t *testing.T) { // TestRestartMaxRetriesNegative verifies that restartMaxRetries clamps negative values to zero.
 	if n := restartMaxRetries(catalog.RestartConfig{MaxRetries: -1}); n != 0 {
@@ -1827,24 +1558,6 @@ func TestRestartBackoffConfig(t *testing.T) { // TestRestartBackoffConfig verifi
 }
 
 // --- Health check ---
-
-func TestHealthCheckModeNever(t *testing.T) { // TestHealthCheckModeNever verifies that healthCheckMode returns "none" for both the "none" and empty modes.
-	if mode := healthCheckMode(catalog.HealthCheckConfig{Mode: "none"}); mode != "none" {
-		t.Fatalf("healthCheckMode(none) = %q, want %q", mode, "none")
-	}
-	if mode := healthCheckMode(catalog.HealthCheckConfig{Mode: ""}); mode != "none" {
-		t.Fatalf("healthCheckMode(empty) = %q, want %q", mode, "none")
-	}
-}
-
-func TestRunHealthCheckUnsupported(t *testing.T) { // TestRunHealthCheckUnsupported verifies that runHealthCheck returns nil for "none" mode and an error for unsupported modes.
-	if err := runHealthCheck(catalog.LaunchConfig{}, catalog.HealthCheckConfig{Mode: "none"}); err != nil {
-		t.Fatalf("runHealthCheck(none) = %v, want nil", err)
-	}
-	if err := runHealthCheck(catalog.LaunchConfig{}, catalog.HealthCheckConfig{Mode: "http"}); err == nil {
-		t.Fatal("runHealthCheck(http) should return error")
-	}
-}
 
 // --- resolveLaunch ---
 
@@ -1911,19 +1624,16 @@ func TestFailureSummaryFromRecord(t *testing.T) { // TestFailureSummaryFromRecor
 	}
 }
 
-func TestShouldRestartEdgeCases(t *testing.T) { // TestShouldRestartEdgeCases verifies that shouldRestart returns false for "never" mode, non-stdio transports, exceeded retries, and true for valid restart config.
-	s := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+func TestShouldRestartEdgeCases(t *testing.T) { // TestShouldRestartEdgeCases verifies that shouldRestart returns false for "never" mode, exceeded retries, and true for valid restart config.
+	s := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 
-	if s.shouldRestart(catalog.RestartConfig{Mode: "never"}, "stdio", 0) {
+	if s.shouldRestart(catalog.RestartConfig{Mode: "never"}, 0) {
 		t.Fatal("shouldRestart(never) should be false")
 	}
-	if s.shouldRestart(catalog.RestartConfig{Mode: "on_failure"}, "http", 0) {
-		t.Fatal("shouldRestart(non-stdio) should be false")
-	}
-	if s.shouldRestart(catalog.RestartConfig{Mode: "on_failure", MaxRetries: 1}, "stdio", 1) {
+	if s.shouldRestart(catalog.RestartConfig{Mode: "on_failure", MaxRetries: 1}, 1) {
 		t.Fatal("shouldRestart(exceeded) should be false")
 	}
-	if !s.shouldRestart(catalog.RestartConfig{Mode: "on_failure", MaxRetries: 3}, "stdio", 0) {
+	if !s.shouldRestart(catalog.RestartConfig{Mode: "on_failure", MaxRetries: 3}, 0) {
 		t.Fatal("shouldRestart(valid) should be true")
 	}
 }
@@ -1957,7 +1667,7 @@ func TestPersistRuntimeWithStore(t *testing.T) { // TestPersistRuntimeWithStore 
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, store)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, store, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -1966,12 +1676,9 @@ func TestPersistRuntimeWithStore(t *testing.T) { // TestPersistRuntimeWithStore 
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	rt, err := supervisor.Start(agent)
@@ -1988,7 +1695,7 @@ func TestPersistFailureWithStore(t *testing.T) { // TestPersistFailureWithStore 
 	}
 	defer store.Close()
 
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor.store = store
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 	supervisor.now = func() time.Time { return now }
@@ -2033,7 +1740,7 @@ func TestPersistCleanExitWithStore(t *testing.T) { // TestPersistCleanExitWithSt
 	}
 	defer store.Close()
 
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor.store = store
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 	supervisor.now = func() time.Time { return now }
@@ -2080,7 +1787,7 @@ func TestHandleProcessExitCleanExitPersistsRecord(t *testing.T) { // TestHandleP
 	}
 	defer store.Close()
 
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor.store = store
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 	supervisor.now = func() time.Time { return now }
@@ -2145,7 +1852,7 @@ func TestSummaryExcludesCleanExitRecords(t *testing.T) { // TestSummaryExcludesC
 		t.Fatalf("SaveRuntimeFailure() error = %v", err)
 	}
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(), store)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(), store, nil)
 	supervisor.now = func() time.Time { return now }
 
 	summary := supervisor.Summary()
@@ -2159,7 +1866,7 @@ func TestSummaryExcludesCleanExitRecords(t *testing.T) { // TestSummaryExcludesC
 func TestRestartAfterBackoffLaunchFails(t *testing.T) { // TestRestartAfterBackoffLaunchFails verifies that restartAfterBackoff marks the runtime as failed when the launch itself fails.
 	baseDir := t.TempDir()
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 	supervisor.now = func() time.Time { return now }
 
@@ -2179,12 +1886,9 @@ func TestRestartAfterBackoffLaunchFails(t *testing.T) { // TestRestartAfterBacko
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	supervisor.restartAfterBackoff(runtimeInfo, agent, nil)
@@ -2207,7 +1911,7 @@ func TestRestartAfterBackoffLaunchFails(t *testing.T) { // TestRestartAfterBacko
 func TestRestartAfterBackoffRuntimeRemoved(t *testing.T) { // TestRestartAfterBackoffRuntimeRemoved verifies that restartAfterBackoff does not recreate a runtime that was already removed from the map.
 	baseDir := t.TempDir()
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 	supervisor.now = func() time.Time { return now }
 
@@ -2225,12 +1929,9 @@ func TestRestartAfterBackoffRuntimeRemoved(t *testing.T) { // TestRestartAfterBa
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	supervisor.restartAfterBackoff(runtimeInfo, agent, nil)
@@ -2250,7 +1951,7 @@ func TestStopProcessWithContextNilCmd(t *testing.T) { // TestStopProcessWithCont
 }
 
 func TestStartRejectsRemoteStartDisabled(t *testing.T) { // TestStartRejectsRemoteStartDisabled verifies that Start returns ErrRemoteStartNotAllowed when AllowsRemoteStart is false.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 
 	_, err := supervisor.Start(catalog.Agent{
 		ID:          "no-remote",
@@ -2258,57 +1959,16 @@ func TestStartRejectsRemoteStartDisabled(t *testing.T) { // TestStartRejectsRemo
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: false},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode: "process",
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	})
 	if err != ErrRemoteStartNotAllowed {
 		t.Fatalf("Start() error = %v, want %v", err, ErrRemoteStartNotAllowed)
 	}
 }
 
-func TestConnectNonStdioTransport(t *testing.T) { // TestConnectNonStdioTransport verifies that Connect returns ErrRuntimeNotConnectable for non-stdio transports.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	supervisor.runtimes["run-http"] = Runtime{
-		ID:        "run-http",
-		AgentID:   "http-agent",
-		AgentName: "HTTP Agent",
-		Status:    StatusRunning,
-		Transport: "http",
-		CreatedAt: time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC),
-	}
-
-	_, err := supervisor.Connect("run-http")
-	if err != ErrRuntimeNotConnectable {
-		t.Fatalf("Connect(http) error = %v, want %v", err, ErrRuntimeNotConnectable)
-	}
-}
-
-func TestAcquireLeaseNonStdioTransport(t *testing.T) { // TestAcquireLeaseNonStdioTransport verifies that AcquireLease returns ErrRuntimeNotConnectable for non-stdio transports.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	supervisor.runtimes["run-http"] = Runtime{
-		ID:        "run-http",
-		AgentID:   "http-agent",
-		AgentName: "HTTP Agent",
-		Status:    StatusRunning,
-		Transport: "http",
-		CreatedAt: time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC),
-	}
-
-	_, err := supervisor.AcquireLease("run-http", "test")
-	if err != ErrRuntimeNotConnectable {
-		t.Fatalf("AcquireLease(http) error = %v, want %v", err, ErrRuntimeNotConnectable)
-	}
-}
-
 func TestAcquireLeaseMissingStdio(t *testing.T) { // TestAcquireLeaseMissingStdio verifies that AcquireLease returns ErrRuntimeNotConnectable when the runtime has no stdio pipes allocated.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	supervisor.runtimes["run-no-stdio"] = Runtime{
@@ -2316,7 +1976,6 @@ func TestAcquireLeaseMissingStdio(t *testing.T) { // TestAcquireLeaseMissingStdi
 		AgentID:   "test-agent",
 		AgentName: "Test Agent",
 		Status:    StatusRunning,
-		Transport: "stdio",
 		CreatedAt: time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC),
 	}
 
@@ -2327,57 +1986,15 @@ func TestAcquireLeaseMissingStdio(t *testing.T) { // TestAcquireLeaseMissingStdi
 }
 
 func TestReleaseLeaseMissingProcess(t *testing.T) { // TestReleaseLeaseMissingProcess verifies that ReleaseLease returns ErrRuntimeNotFound for a nonexistent runtime ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	err := supervisor.ReleaseLease("nonexistent", "test")
 	if err != ErrRuntimeNotFound {
 		t.Fatalf("ReleaseLease() error = %v, want %v", err, ErrRuntimeNotFound)
 	}
 }
 
-func TestWriteToAgentOnClosedPipe(t *testing.T) { // TestWriteToAgentOnClosedPipe verifies that WriteToAgent returns an error after a legacy lease Release has closed stdin.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
-		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
-	}
-
-	rt, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	pipes, err := supervisor.AcquireLease(rt.ID, "legacy")
-	if err != nil {
-		t.Fatalf("AcquireLease() error = %v", err)
-	}
-
-	if err := pipes.Release(); err != nil {
-		t.Fatalf("Release() error = %v", err)
-	}
-
-	if err := pipes.WriteToAgent([]byte("test")); err == nil {
-		t.Fatal("expected error writing to stdin after legacy Release()")
-	}
-
-	_, _ = supervisor.StopByAgentID(agent.ID)
-}
-
 func TestAppendLogOverflow(t *testing.T) { // TestAppendLogOverflow verifies that the internal log buffer caps at 200 entries, discarding the oldest.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 	supervisor.now = func() time.Time { return now }
 
@@ -2424,7 +2041,7 @@ func TestPersistRuntimeWithClosedStore(t *testing.T) { // TestPersistRuntimeWith
 	}
 	store.Close()
 
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor.store = store
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
@@ -2445,7 +2062,7 @@ func TestPersistFailureWithClosedStore(t *testing.T) { // TestPersistFailureWith
 	}
 	store.Close()
 
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor.store = store
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 
@@ -2473,7 +2090,7 @@ func TestPersistFailureWithClosedStore(t *testing.T) { // TestPersistFailureWith
 // --- handleProcessExit ---
 
 func TestHandleProcessExitNoRuntimeInMap(t *testing.T) { // TestHandleProcessExitNoRuntimeInMap verifies that handleProcessExit does nothing for a runtime not in the map.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor.handleProcessExit("nonexistent", "test", &processHandle{})
 
 	if got := len(supervisor.List()); got != 0 {
@@ -2482,7 +2099,7 @@ func TestHandleProcessExitNoRuntimeInMap(t *testing.T) { // TestHandleProcessExi
 }
 
 func TestHandleProcessExitCleanExit(t *testing.T) { // TestHandleProcessExitCleanExit verifies that handleProcessExit transitions a running runtime to StatusStopped on clean exit.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 	supervisor.now = func() time.Time { return now }
 
@@ -2521,7 +2138,7 @@ func TestHandleProcessExitRuntimeAlreadyRemoved(t *testing.T) { // TestHandlePro
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -2530,12 +2147,9 @@ func TestHandleProcessExitRuntimeAlreadyRemoved(t *testing.T) { // TestHandlePro
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	_, err := supervisor.Start(agent)
@@ -2554,7 +2168,7 @@ func TestHandleProcessExitRuntimeAlreadyRemoved(t *testing.T) { // TestHandlePro
 }
 
 func TestAcquireLeaseOnNonRunningRuntime(t *testing.T) { // TestAcquireLeaseOnNonRunningRuntime verifies that AcquireLease returns ErrRuntimeNotRunning for stopped runtimes.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	supervisor.runtimes["run-stopped"] = Runtime{
@@ -2571,20 +2185,8 @@ func TestAcquireLeaseOnNonRunningRuntime(t *testing.T) { // TestAcquireLeaseOnNo
 	}
 }
 
-func TestCleanupFailedLaunchNonexistent(t *testing.T) { // TestCleanupFailedLaunchNonexistent verifies that cleanupFailedLaunch does not create entries for nonexistent runtimes.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	supervisor.cleanupFailedLaunch("nonexistent", "test", fmt.Errorf("test error"))
-
-	runtimes := supervisor.List()
-	if len(runtimes) != 0 {
-		t.Fatalf("len(List()) = %d, want 0 (cleanupFailedLaunch should not create entries)", len(runtimes))
-	}
-}
-
 func TestLogsEmptyForExistingRuntime(t *testing.T) { // TestLogsEmptyForExistingRuntime verifies that Logs returns nil (not an error) for a runtime with no log entries.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	supervisor.runtimes["run-empty"] = Runtime{
@@ -2605,7 +2207,7 @@ func TestLogsEmptyForExistingRuntime(t *testing.T) { // TestLogsEmptyForExisting
 }
 
 func TestListSortsByCreatedAtThenID(t *testing.T) { // TestListSortsByCreatedAtThenID verifies that List returns runtimes sorted by CreatedAt then ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 
 	supervisor.runtimes["b"] = Runtime{ID: "b", AgentID: "b", AgentName: "B", Status: StatusRunning, CreatedAt: now}
@@ -2621,7 +2223,7 @@ func TestListSortsByCreatedAtThenID(t *testing.T) { // TestListSortsByCreatedAtT
 }
 
 func TestStopByRuntimeIDNotFound(t *testing.T) { // TestStopByRuntimeIDNotFound verifies that StopByRuntimeID returns ErrRuntimeNotFound for nonexistent IDs.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	_, err := supervisor.StopByRuntimeID("nonexistent")
 	if err != ErrRuntimeNotFound {
 		t.Fatalf("StopByRuntimeID() error = %v, want %v", err, ErrRuntimeNotFound)
@@ -2633,7 +2235,7 @@ type errorReader struct{ err error }
 func (r *errorReader) Read(p []byte) (int, error) { return 0, r.err }
 
 func TestCaptureLogsScannerError(t *testing.T) { // TestCaptureLogsScannerError verifies that captureLogs records scanner errors as log entries.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 	supervisor.now = func() time.Time { return now }
 
@@ -2664,7 +2266,7 @@ func TestResolveLaunchExternalNotFound(t *testing.T) { // TestResolveLaunchExter
 }
 
 func TestStopByAgentIDAlreadyStopped(t *testing.T) { // TestStopByAgentIDAlreadyStopped verifies that StopByAgentID is a no-op for already-stopped runtimes.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	supervisor.runtimes["test-id"] = Runtime{
@@ -2683,7 +2285,7 @@ func TestStopByAgentIDAlreadyStopped(t *testing.T) { // TestStopByAgentIDAlready
 }
 
 func TestStopByRuntimeIDAlreadyStopped(t *testing.T) { // TestStopByRuntimeIDAlreadyStopped verifies that StopByRuntimeID is a no-op for already-stopped runtimes.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	supervisor.runtimes["test-id"] = Runtime{
@@ -2701,7 +2303,7 @@ func TestStopByRuntimeIDAlreadyStopped(t *testing.T) { // TestStopByRuntimeIDAlr
 }
 
 func TestStopByAgentIDOrphanedMapping(t *testing.T) { // TestStopByAgentIDOrphanedMapping verifies that StopByAgentID returns ErrRuntimeNotFound when the agent-to-runtime mapping points to a nonexistent ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor.runtimeByAgent["orphaned"] = map[string]struct{}{"nonexistent-id": {}}
 
 	_, err := supervisor.StopByAgentID("orphaned")
@@ -2711,7 +2313,7 @@ func TestStopByAgentIDOrphanedMapping(t *testing.T) { // TestStopByAgentIDOrphan
 }
 
 func TestAcquireLeaseNotFound(t *testing.T) { // TestAcquireLeaseNotFound verifies that AcquireLease returns ErrRuntimeNotFound for a nonexistent runtime ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	_, err := supervisor.AcquireLease("nonexistent", "test")
 	if err != ErrRuntimeNotFound {
 		t.Fatalf("AcquireLease() error = %v, want %v", err, ErrRuntimeNotFound)
@@ -2725,7 +2327,7 @@ func TestSummaryWithClosedStore(t *testing.T) { // TestSummaryWithClosedStore ve
 	}
 	store.Close()
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(), store)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(), store, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	supervisor.runtimes["run-failed"] = Runtime{
@@ -2748,7 +2350,7 @@ func TestSummaryWithClosedStore(t *testing.T) { // TestSummaryWithClosedStore ve
 }
 
 func TestStopByAgentIDNotFound(t *testing.T) { // TestStopByAgentIDNotFound verifies that StopByAgentID returns ErrRuntimeNotFound for an unmapped agent ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	_, err := supervisor.StopByAgentID("nonexistent")
 	if err != ErrRuntimeNotFound {
 		t.Fatalf("StopByAgentID() error = %v, want %v", err, ErrRuntimeNotFound)
@@ -2759,7 +2361,7 @@ func TestReleaseLeaseAfterProcessRemoved(t *testing.T) { // TestReleaseLeaseAfte
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	agent := catalog.Agent{
@@ -2768,12 +2370,9 @@ func TestReleaseLeaseAfterProcessRemoved(t *testing.T) { // TestReleaseLeaseAfte
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 
 	rt, err := supervisor.Start(agent)
@@ -2818,7 +2417,7 @@ func main() { time.Sleep(50 * time.Millisecond); panic("boom") }`
 		t.Fatalf("go build circuit agent error = %v", err)
 	}
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
 	rt, err := supervisor.Start(catalog.Agent{
@@ -2827,17 +2426,14 @@ func main() { time.Sleep(50 * time.Millisecond); panic("boom") }`
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:      "process",
-			Command:   filepath.Join("bin", namedBinary("circuit-agent")),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
+			Mode:    "process",
+			Command: filepath.Join("bin", namedBinary("circuit-agent")),
 			Restart: catalog.RestartConfig{
 				Mode:           "on_failure",
 				MaxRetries:     1,
 				BackoffSeconds: 0,
 			},
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -2868,7 +2464,7 @@ func main() { time.Sleep(50 * time.Millisecond); panic("boom") }`
 // --- Lease edge cases (empty IDs) ---
 
 func TestAcquireLeaseEmptyRuntimeID(t *testing.T) { // TestAcquireLeaseEmptyRuntimeID verifies that AcquireLease returns ErrRuntimeNotFound for an empty runtime ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	_, err := supervisor.AcquireLease("", "test")
 	if err != ErrRuntimeNotFound {
 		t.Fatalf("AcquireLease(\"\") error = %v, want %v", err, ErrRuntimeNotFound)
@@ -2876,7 +2472,7 @@ func TestAcquireLeaseEmptyRuntimeID(t *testing.T) { // TestAcquireLeaseEmptyRunt
 }
 
 func TestReleaseLeaseEmptyRuntimeID(t *testing.T) { // TestReleaseLeaseEmptyRuntimeID verifies that ReleaseLease returns ErrRuntimeNotFound for an empty runtime ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	err := supervisor.ReleaseLease("", "test")
 	if err != ErrRuntimeNotFound {
 		t.Fatalf("ReleaseLease(\"\") error = %v, want %v", err, ErrRuntimeNotFound)
@@ -2884,7 +2480,7 @@ func TestReleaseLeaseEmptyRuntimeID(t *testing.T) { // TestReleaseLeaseEmptyRunt
 }
 
 func TestStartDoesNotPanicWithEmptyAgent(t *testing.T) { // TestStartDoesNotPanicWithEmptyAgent verifies that Start returns an error (not a panic) for a zero-value agent.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 
 	_, err := supervisor.Start(catalog.Agent{})
 	if err == nil {
@@ -2940,7 +2536,7 @@ func namedBinary(name string) string {
 // a runtime that has no process (e.g. waiting out a restart backoff): reusing it
 // would give the caller a runtime that cannot be leased.
 func TestStartIgnoresRuntimeWithoutProcessHandle(t *testing.T) {
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor.runtimes["rt-backoff"] = Runtime{
 		ID: "rt-backoff", AgentID: "agent-x", AgentName: "Agent X",
 		Status: StatusStarting, CreatedAt: time.Now(),

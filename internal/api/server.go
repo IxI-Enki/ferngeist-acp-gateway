@@ -27,7 +27,6 @@ import (
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/config"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/customagents"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/discovery"
-	"github.com/arafatamim/ferngeist-acp-gateway/internal/gateway"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/logging"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/pairing"
 	acpregistry "github.com/arafatamim/ferngeist-acp-gateway/internal/registry"
@@ -59,16 +58,13 @@ type Server struct {
 	sessionSvc *session.RuntimeSession
 	store      *storage.SQLiteStore
 	pairing    *pairing.Service
-	gateway    *gateway.Service
 	discovery  *discovery.Service
 	logs       *logging.Service
 	registry   registryStatusProvider
 
 	// customagentsSvc is the write policy behind /v1/agents/custom*, shared with
-	// the admin API. customagentsStore is the store it was bound to, so test
-	// servers that assign store after NewServer get it rebound.
-	customagentsSvc   *customagents.Service
-	customagentsStore *storage.SQLiteStore
+	// the admin API.
+	customagentsSvc *customagents.Service
 
 	// remoteSetup, when set, returns the daemon's live remote-access
 	// provisioning state (auth pending, setup blockers) for status snapshots.
@@ -140,13 +136,7 @@ type errorResponse struct {
 }
 
 // customAgents returns the custom-agent write policy shared with the admin API.
-// NewServer binds it to the store it was given; test servers assign store after
-// construction, so rebind when it has moved.
 func (s *Server) customAgents() *customagents.Service {
-	if s.customagentsSvc == nil || s.customagentsStore != s.store {
-		s.customagentsSvc = customagents.New(s.store, s.catalog, s.runtime.List, s.logger)
-		s.customagentsStore = s.store
-	}
 	return s.customagentsSvc
 }
 
@@ -225,7 +215,6 @@ func NewServer(
 	catalogSvc *catalog.Service,
 	runtimeSvc *runtime.Supervisor,
 	pairingSvc *pairing.Service,
-	gatewaySvc *gateway.Service,
 	discoverySvc *discovery.Service,
 	logSvc *logging.Service,
 	registrySvc registryStatusProvider,
@@ -242,7 +231,6 @@ func NewServer(
 		catalog:     catalogSvc,
 		runtime:     runtimeSvc,
 		pairing:     pairingSvc,
-		gateway:     gatewaySvc,
 		discovery:   discoverySvc,
 		logs:        logSvc,
 		registry:    registrySvc,
@@ -253,7 +241,6 @@ func NewServer(
 		sessionSvc:  sessionSvc,
 	}
 	server.customagentsSvc = customagents.New(store, catalogSvc, runtimeSvc.List, server.logger)
-	server.customagentsStore = store
 
 	mux := http.NewServeMux()
 	adminMux := http.NewServeMux()

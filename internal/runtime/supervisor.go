@@ -26,10 +26,6 @@ import (
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
 )
 
-// connectTokenTTL defines how long a generated bearer token remains valid
-// for establishing ACP connections to a runtime.
-const connectTokenTTL = 5 * time.Minute
-
 // stoppedRuntimeRetention keeps recently stopped runtimes visible long enough
 // for clients and diagnostics to confirm that a stop completed successfully.
 const stoppedRuntimeRetention = 10 * time.Minute
@@ -59,8 +55,8 @@ var (
 	// that is not in the "running" state.
 	ErrRuntimeNotRunning = errors.New("runtime is not running")
 
-	// ErrRuntimeNotConnectable is returned when the runtime's transport mechanism
-	// (e.g., stdio, websocket) is not available for connections.
+	// ErrRuntimeNotConnectable is returned when a runtime has no stdio pipes
+	// available for a connection (e.g. the process handle is already gone).
 	ErrRuntimeNotConnectable = errors.New("runtime is not connectable")
 
 	// ErrRuntimeAlreadyAttached is returned when attempting to attach stdio to
@@ -98,7 +94,7 @@ const (
 )
 
 // Runtime is the gateway-owned view of a launched agent process plus the
-// transport metadata needed to hand an ACP session back to Ferngeist.
+// metadata needed to hand an ACP session back to Ferngeist.
 type Runtime struct {
 	ID              string    `json:"id"`
 	AgentID         string    `json:"agentId"`
@@ -110,7 +106,6 @@ type Runtime struct {
 	LastError       string    `json:"lastError,omitempty"`
 	Detected        bool      `json:"detected"`
 	LaunchMode      string    `json:"launchMode"`
-	Transport       string    `json:"transport"`
 	RestartAttempts int       `json:"restartAttempts"`
 	FailureStreak   int       `json:"failureStreak"`
 	CircuitOpen     bool      `json:"circuitOpen"`
@@ -192,7 +187,7 @@ type FailureSummary struct {
 }
 
 // ConnectDescriptor contains the connection parameters needed to establish
-// an ACP session with a running runtime, including authentication details.
+// an ACP session with a running runtime.
 type ConnectDescriptor struct {
 	// RuntimeID is the runtime this descriptor connects to.
 	RuntimeID string `json:"runtimeId"`
@@ -205,12 +200,6 @@ type ConnectDescriptor struct {
 
 	// WebSocketPath is the URL path for WebSocket connections.
 	WebSocketPath string `json:"websocketPath"`
-
-	// BearerToken is the one-time authentication token for this connection.
-	BearerToken string `json:"bearerToken"`
-
-	// TokenExpiresAt is when the bearer token becomes invalid.
-	TokenExpiresAt time.Time `json:"tokenExpiresAt"`
 }
 
 // Supervisor owns the full runtime lifecycle for gateway-managed agents. It is
@@ -283,7 +272,7 @@ type processHandle struct {
 	stdout io.ReadCloser
 
 	// leaseholder identifies the current lease owner: empty = unleased,
-	// session ID or "legacy" = leased.
+	// session ID = leased by that session.
 	leaseholder string
 
 	// stopping indicates an intentional shutdown is in progress.
@@ -306,21 +295,9 @@ type shutdownTarget struct {
 	process *processHandle
 }
 
-// NewSupervisor creates a supervisor with default base directory and no persistence.
-func NewSupervisor(logger *slog.Logger) *Supervisor {
-	return NewSupervisorWithBaseDir(logger, ".", nil)
-}
-
-// NewSupervisorWithBaseDir creates a supervisor with custom base directory and
-// optional SQLite store for persisting runtime state across restarts.
-func NewSupervisorWithBaseDir(logger *slog.Logger, baseDir string, store *storage.SQLiteStore) *Supervisor {
-	return NewSupervisorWithBaseDirAndInstaller(logger, baseDir, store, nil)
-}
-
-// NewSupervisorWithBaseDirAndInstaller creates a fully configured supervisor with
-// custom base directory, optional persistence store, and optional installer for
-// automatic agent acquisition.
-func NewSupervisorWithBaseDirAndInstaller(logger *slog.Logger, baseDir string, store *storage.SQLiteStore, installer *acquire.Installer) *Supervisor {
+// NewSupervisor creates a supervisor rooted at baseDir with optional SQLite
+// persistence and an optional installer for automatic agent acquisition.
+func NewSupervisor(logger *slog.Logger, baseDir string, store *storage.SQLiteStore, installer *acquire.Installer) *Supervisor {
 	return &Supervisor{
 		logger:          logger.With("component", "runtime"),
 		now:             time.Now,
@@ -338,11 +315,12 @@ func NewSupervisorWithBaseDirAndInstaller(logger *slog.Logger, baseDir string, s
 
 // Start launches a new agent runtime process after validating prerequisites.
 // It checks that the agent is detected, allows remote start, and has a supported
-// launch mode and transport. If an installer is available and the agent is not
-// detected, it attempts automatic acquisition first.
+// launch mode. If an installer is available and the agent is not detected, it
+// attempts automatic acquisition first.
 //
-// If a runtime for this agent already exists and is leased, it will be stopped
-// and replaced. If an unleased runtime exists, it is returned as-is.
+// If a runtime for this agent already exists and is unleased, it is returned
+// as-is; a session-leased one is reused rather than replaced so the owning
+// session is never orphaned.
 //
 // Returns the Runtime descriptor on success, or an error if validation or
 // launch fails.
@@ -352,19 +330,16 @@ func (s *Supervisor) Start(agent catalog.Agent) (Runtime, error) {
 	s.pruneStoppedRuntimesLocked(s.now().UTC())
 
 	var (
-		reuse   *Runtime // unleased — preferred reuse target
-		staleID string   // legacy-leased — replaceable
-		leased  *Runtime // session-leased — last-resort reuse
+		reuse  *Runtime // unleased — preferred reuse target
+		leased *Runtime // session-leased — last-resort reuse
 	)
 	for _, runtimeID := range s.runtimeIDsForAgentLocked(agent.ID) {
 		existing, exists := s.runtimes[runtimeID]
 		if !exists {
 			continue
 		}
-		// If a processHandle exists and is leased ONLY by a legacy client
-		// (fate-bound), we can stop and replace it. Session-leased runtimes
-		// (leaseholder is a session ID, not "legacy") must be protected -
-		// killing them would orphan a resilient session.
+		// A session-leased runtime must be protected: killing it would orphan a
+		// resilient session, so it is reused rather than replaced.
 		handle := s.processes[runtimeID]
 		switch {
 		case handle == nil:
@@ -373,10 +348,6 @@ func (s *Supervisor) Start(agent catalog.Agent) (Runtime, error) {
 			if reuse == nil {
 				e := existing
 				reuse = &e
-			}
-		case handle.leaseholder == "legacy":
-			if staleID == "" {
-				staleID = runtimeID
 			}
 		default:
 			if leased == nil {
@@ -387,17 +358,8 @@ func (s *Supervisor) Start(agent catalog.Agent) (Runtime, error) {
 	}
 	s.mu.Unlock()
 
-	// Prefer a free runtime: replacing a legacy-leased one kills a healthy
-	// process, so only do it when nothing is reusable.
 	if reuse != nil {
 		return *reuse, nil
-	}
-
-	// Stop the stale runtime outside the lock to avoid holding it during I/O
-	if staleID != "" {
-		if _, err := s.StopByRuntimeID(staleID); err != nil && !errors.Is(err, ErrRuntimeNotFound) {
-			return Runtime{}, err
-		}
 	}
 
 	if leased != nil {
@@ -435,9 +397,6 @@ func (s *Supervisor) prepareAgent(agent catalog.Agent) (catalog.Agent, error) {
 	if agent.Launch.Mode != "process" && agent.Launch.Mode != "external" {
 		return catalog.Agent{}, ErrUnsupportedLaunch
 	}
-	if agent.Launch.Transport != "stdio" {
-		return catalog.Agent{}, ErrRuntimeNotConnectable
-	}
 	return agent, nil
 }
 
@@ -454,9 +413,8 @@ func (s *Supervisor) StartNew(agent catalog.Agent) (Runtime, error) {
 }
 
 // launchRuntime is the core transition from a validated catalog agent to a
-// tracked runtime. It resolves the launch target, starts the child process,
-// records it immediately for diagnostics, then performs readiness and health
-// checks before exposing it as running.
+// tracked runtime. It resolves the launch target, starts the child process, and
+// records it for diagnostics before exposing it as running.
 func (s *Supervisor) launchRuntime(agent catalog.Agent, previous *Runtime, envOverrides map[string]string) (Runtime, error) {
 	// Refuse to spawn once Shutdown has drained the supervisor; without this
 	// a restart racing Shutdown would leave an orphan process behind.
@@ -480,7 +438,6 @@ func (s *Supervisor) launchRuntime(agent catalog.Agent, previous *Runtime, envOv
 		Command:    commandPath,
 		Detected:   agent.Detected,
 		LaunchMode: agent.Launch.Mode,
-		Transport:  agent.Launch.Transport,
 		StoppedAt:  time.Time{},
 	}
 
@@ -491,7 +448,6 @@ func (s *Supervisor) launchRuntime(agent catalog.Agent, previous *Runtime, envOv
 		runtimeInfo.Command = commandPath
 		runtimeInfo.Detected = agent.Detected
 		runtimeInfo.LaunchMode = agent.Launch.Mode
-		runtimeInfo.Transport = agent.Launch.Transport
 		runtimeInfo.LastError = ""
 		runtimeInfo.PID = 0
 		runtimeInfo.CircuitOpen = false
@@ -557,36 +513,7 @@ func (s *Supervisor) launchRuntime(agent catalog.Agent, previous *Runtime, envOv
 	go s.captureLogs(runtimeInfo.ID, "stderr", stderrPipe, os.Stderr)
 	go s.watchProcess(runtimeInfo.ID, agent.ID, handle)
 
-	// Perform readiness check - kill process immediately if it fails.
-	// stopping is set under s.mu: the watcher goroutine reads it in
-	// handleProcessExit under the same lock, so an unlocked write here
-	// would race and could misclassify the kill as a crash (spurious
-	// restart + circuit trip).
-	if err := waitForLaunchReadiness(agent.Launch); err != nil {
-		s.mu.Lock()
-		handle.stopping = true
-		s.mu.Unlock()
-		_ = cmd.Process.Kill()
-		<-handle.done // Wait for process to fully exit
-		checkErr := fmt.Errorf("runtime readiness check failed: %w", err)
-		s.cleanupFailedLaunch(runtimeInfo.ID, agent.ID, checkErr)
-		return Runtime{}, checkErr
-	}
-
-	// Perform health check - kill process immediately if it fails (same
-	// locking discipline as above).
-	if err := runHealthCheck(agent.Launch, agent.HealthCheck); err != nil {
-		s.mu.Lock()
-		handle.stopping = true
-		s.mu.Unlock()
-		_ = cmd.Process.Kill()
-		<-handle.done // Wait for process to fully exit
-		checkErr := fmt.Errorf("runtime health check failed: %w", err)
-		s.cleanupFailedLaunch(runtimeInfo.ID, agent.ID, checkErr)
-		return Runtime{}, checkErr
-	}
-
-	// Transition to running state only after all checks pass
+	// Transition to running state only after the process is started
 	s.mu.Lock()
 	runtimeInfo = s.runtimes[runtimeInfo.ID]
 	runtimeInfo.Status = StatusRunning
@@ -846,13 +773,12 @@ func (s *Supervisor) List() []Runtime {
 	return out
 }
 
-// Connect generates a one-time connection descriptor for a running runtime.
-// It creates a short-lived bearer token that expires after connectTokenTTL.
-// The descriptor contains all information needed to establish an ACP session.
+// Connect builds a connection descriptor for a running runtime. The descriptor
+// contains everything needed to establish an ACP session; the WebSocket
+// endpoint authenticates with the client's attach token.
 //
-// Returns ErrRuntimeNotFound if the runtime doesn't exist, ErrRuntimeNotRunning
-// if it's not in running state, or ErrRuntimeNotConnectable if the transport
-// is not stdio.
+// Returns ErrRuntimeNotFound if the runtime doesn't exist or ErrRuntimeNotRunning
+// if it's not in running state.
 func (s *Supervisor) Connect(runtimeID string) (ConnectDescriptor, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -865,17 +791,12 @@ func (s *Supervisor) Connect(runtimeID string) (ConnectDescriptor, error) {
 	if runtime.Status != StatusRunning {
 		return ConnectDescriptor{}, ErrRuntimeNotRunning
 	}
-	if runtime.Transport != "stdio" {
-		return ConnectDescriptor{}, ErrRuntimeNotConnectable
-	}
 
 	return ConnectDescriptor{
-		RuntimeID:      runtime.ID,
-		AgentID:        runtime.AgentID,
-		Protocol:       "acp",
-		WebSocketPath:  fmt.Sprintf("/v1/acp/%s", runtime.ID),
-		BearerToken:    randomToken(24),
-		TokenExpiresAt: s.now().UTC().Add(connectTokenTTL),
+		RuntimeID:     runtime.ID,
+		AgentID:       runtime.AgentID,
+		Protocol:      "acp",
+		WebSocketPath: fmt.Sprintf("/v1/acp/%s", runtime.ID),
 	}, nil
 }
 
@@ -1115,16 +1036,15 @@ func (s *Supervisor) handleProcessExit(runtimeID, agentID string, handle *proces
 	// Check if we should attempt automatic restart:
 	// 1. Process exited with error
 	// 2. Restart policy allows it (on_failure mode)
-	// 3. Transport is stdio (only supported mode)
-	// 4. Haven't exceeded max retry count
-	// 5. Not an intentional stop (handle.stopping or runtime status)
-	// 6. Not held by a resilient session. A session-leased runtime has its own
+	// 3. Haven't exceeded max retry count
+	// 4. Not an intentional stop (handle.stopping or runtime status)
+	// 5. Not held by a resilient session. A session-leased runtime has its own
 	//    recovery path: the exitCallback below reclaims the crashed session and
 	//    notifies the client, which reconnects and gets a fresh session. Restarting
 	//    in place instead would orphan the session (its pump is cancelled and its
 	//    lease released by the callback) and leave the new process with no client
 	//    and no stdout drain — so the two recovery mechanisms are mutually exclusive.
-	if handle.waitErr != nil && s.shouldRestart(handle.agent.Launch.Restart, runtime.Transport, runtime.RestartAttempts) && !handle.stopping && runtime.Status != StatusStopping && !sessionLeased(handle) {
+	if handle.waitErr != nil && s.shouldRestart(handle.agent.Launch.Restart, runtime.RestartAttempts) && !handle.stopping && runtime.Status != StatusStopping && !sessionLeased(handle) {
 		// Transition to starting state for restart
 		runtime.Status = StatusStarting
 		runtime.LastError = handle.waitErr.Error()
@@ -1160,8 +1080,7 @@ func (s *Supervisor) handleProcessExit(runtimeID, agentID string, handle *proces
 	// non-nil waitErr is the expected result of that kill — not a failure. Treat
 	// it as a clean stop; otherwise this branch races the stop path's StatusStopped
 	// write (flaking status to "failed") and would spuriously trip the circuit
-	// breaker. Genuine launch failures set stopping too but persist their own
-	// failure record via cleanupFailedLaunch, so they remain accounted for.
+	// breaker.
 	if handle.waitErr != nil && !handle.stopping {
 		// Process failed - mark as failed and check circuit breaker
 		runtime.Status = StatusFailed
@@ -1318,46 +1237,6 @@ func (s *Supervisor) restartAfterBackoff(runtimeInfo Runtime, agent catalog.Agen
 		Stream:    "gateway",
 		Message:   fmt.Sprintf("runtime restart failed: %s", err.Error()),
 	})
-}
-
-// cleanupFailedLaunch removes a runtime that never reached running state and
-// persists it as a failure for post-mortem diagnostics. The failure line is
-// appended and snapshotted before the maps are dropped so no orphaned log ring
-// is left behind for a runtime that no longer exists.
-func (s *Supervisor) cleanupFailedLaunch(runtimeID, agentID string, err error) {
-	s.mu.Lock()
-	runtimeInfo, ok := s.runtimes[runtimeID]
-	if !ok {
-		s.mu.Unlock()
-		return
-	}
-	s.mu.Unlock()
-
-	failedAt := s.now().UTC()
-	s.appendLog(runtimeID, LogEntry{
-		Timestamp: failedAt,
-		Stream:    "gateway",
-		Message:   fmt.Sprintf("agent process launch failed: %s", err.Error()),
-	})
-	logPreview := s.recentLogs(runtimeID, 5)
-
-	s.mu.Lock()
-	delete(s.processes, runtimeID)
-	s.deleteRuntimeByAgentIfMatchesLocked(agentID, runtimeID)
-	delete(s.runtimes, runtimeID)
-	delete(s.logs, runtimeID)
-	delete(s.onExitCallbacks, runtimeID)
-	s.mu.Unlock()
-
-	runtimeInfo.Status = StatusFailed
-	runtimeInfo.LastError = err.Error()
-	runtimeInfo.PID = 0
-	runtimeInfo.LastFailureAt = failedAt
-	s.persistRuntime(runtimeInfo)
-	s.persistFailure(runtimeID, runtimeInfo, logPreview, failedAt)
-	s.logger.Error("agent process launch failed",
-		"runtime_id", runtimeID, "agent_id", agentID,
-		"error", err.Error())
 }
 
 // captureLogs copies process output into the in-memory ring buffer while also
@@ -1655,8 +1534,6 @@ func stopProcessWithContext(ctx context.Context, handle *processHandle) error {
 	}
 
 	// Stage 1: Close stdin to signal EOF to the process.
-	// A legacy lease release may already have closed it — double-close is safe
-	// as the error is discarded.
 	if handle.stdin != nil {
 		_ = handle.stdin.Close()
 	}
@@ -1700,53 +1577,22 @@ func randomToken(byteLen int) string {
 	return base64.RawURLEncoding.EncodeToString(buf)
 }
 
-// waitForLaunchReadiness is intentionally transport-specific. It answers only
-// "is the child ready enough for the next probe?" while the separate health
-// check answers "is it actually usable as ACP?"
-//
-// Currently supports "immediate" mode which assumes readiness as soon as the
-// process starts. Other modes may be added for more complex startup sequences.
-func waitForLaunchReadiness(launch catalog.LaunchConfig) error {
-	switch readinessMode(launch) {
-	case "immediate":
-		return nil
-	default:
-		return fmt.Errorf("unsupported readiness mode %q", launch.Readiness.Mode)
-	}
-}
-
-// readinessMode determines the readiness check strategy for a launch config.
-// It uses the explicit mode if set, otherwise defaults based on transport type.
-func readinessMode(launch catalog.LaunchConfig) string {
-	if launch.Readiness.Mode != "" {
-		return launch.Readiness.Mode
-	}
-	if launch.Transport == "stdio" {
-		return "immediate"
-	}
-	return ""
-}
-
 // sessionLeased reports whether the runtime's process handle is held by a
-// resilient session (leaseholder is a session ID) rather than being unleased
-// ("") or held by a legacy fate-bound WebSocket ("legacy"). Session-leased
-// runtimes are excluded from supervisor auto-restart so the session's own
-// crash-reclamation path is the sole recovery mechanism.
+// resilient session (leaseholder is a session ID) rather than being unleased.
+// Session-leased runtimes are excluded from supervisor auto-restart so the
+// session's own crash-reclamation path is the sole recovery mechanism.
 func sessionLeased(handle *processHandle) bool {
 	if handle == nil {
 		return false
 	}
-	return handle.leaseholder != "" && handle.leaseholder != "legacy"
+	return handle.leaseholder != ""
 }
 
 // shouldRestart determines whether a failed runtime should be automatically
-// restarted based on the restart mode, transport type, and retry count.
-func (s *Supervisor) shouldRestart(restart catalog.RestartConfig, transport string, attempts int) bool {
+// restarted based on the restart mode and retry count.
+func (s *Supervisor) shouldRestart(restart catalog.RestartConfig, attempts int) bool {
 	mode := restartMode(restart)
 	if mode != "on_failure" {
-		return false
-	}
-	if transport != "stdio" {
 		return false
 	}
 	if attempts >= restartMaxRetries(restart) {
@@ -1780,30 +1626,6 @@ func restartBackoff(restart catalog.RestartConfig) time.Duration {
 		return 0
 	}
 	return time.Duration(restart.BackoffSeconds) * time.Second
-}
-
-// runHealthCheck is the final gate before a runtime becomes connectable. The
-// current checks are intentionally small and manifest-driven so the runtime
-// package does not need agent-specific branching.
-//
-// Supported modes:
-//   - "none": Skip health checks entirely (default for stdio transport)
-func runHealthCheck(_ catalog.LaunchConfig, healthCheck catalog.HealthCheckConfig) error {
-	switch healthCheckMode(healthCheck) {
-	case "none":
-		return nil
-	default:
-		return fmt.Errorf("unsupported healthCheck mode %q", healthCheck.Mode)
-	}
-}
-
-// healthCheckMode returns the health check mode from config, defaulting to
-// "none" if not specified.
-func healthCheckMode(healthCheck catalog.HealthCheckConfig) string {
-	if healthCheck.Mode == "" {
-		return "none"
-	}
-	return healthCheck.Mode
 }
 
 // persistRuntime saves the current runtime state to the SQLite store if one

@@ -25,7 +25,6 @@ import (
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/catalog"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/config"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/discovery"
-	"github.com/arafatamim/ferngeist-acp-gateway/internal/gateway"
 	gatewaylogging "github.com/arafatamim/ferngeist-acp-gateway/internal/logging"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/pairing"
 	acpregistry "github.com/arafatamim/ferngeist-acp-gateway/internal/registry"
@@ -33,7 +32,6 @@ import (
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/runtime"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/session"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
-	"github.com/arafatamim/ferngeist-acp-gateway/internal/token"
 	"github.com/coder/websocket"
 )
 
@@ -117,10 +115,9 @@ func TestStatusUsesConfiguredGatewayName(t *testing.T) {
 		config.Config{ListenAddr: "127.0.0.1:0", GatewayName: "desk-alpha"},
 		BuildInfo{},
 		logger,
-		catalog.NewWithBaseDir("."),
-		runtime.NewSupervisor(logger),
+		catalog.New(".", nil),
+		runtime.NewSupervisor(logger, ".", nil, nil),
 		pairing.NewService(logger, nil),
-		gateway.New(logger, nil),
 		discovery.New(logger),
 		nil,
 		nil,
@@ -147,10 +144,9 @@ func TestStatusSurfacesPendingTailscaleAuth(t *testing.T) {
 		config.Config{ListenAddr: "127.0.0.1:0"},
 		BuildInfo{},
 		logger,
-		catalog.NewWithBaseDir("."),
-		runtime.NewSupervisor(logger),
+		catalog.New(".", nil),
+		runtime.NewSupervisor(logger, ".", nil, nil),
 		pairing.NewService(logger, nil),
-		gateway.New(logger, nil),
 		discovery.New(logger),
 		nil,
 		nil,
@@ -192,10 +188,9 @@ func TestStatusOmitsAuthFieldsWithoutRemoteSetup(t *testing.T) {
 		config.Config{ListenAddr: "127.0.0.1:0"},
 		BuildInfo{},
 		logger,
-		catalog.NewWithBaseDir("."),
-		runtime.NewSupervisor(logger),
+		catalog.New(".", nil),
+		runtime.NewSupervisor(logger, ".", nil, nil),
 		pairing.NewService(logger, nil),
-		gateway.New(logger, nil),
 		discovery.New(logger),
 		nil,
 		nil,
@@ -225,10 +220,9 @@ func TestStatusIncludesRegistryHealth(t *testing.T) {
 		config.Config{ListenAddr: "127.0.0.1:0"},
 		BuildInfo{},
 		logger,
-		catalog.NewWithBaseDir("."),
-		runtime.NewSupervisor(logger),
+		catalog.New(".", nil),
+		runtime.NewSupervisor(logger, ".", nil, nil),
 		pairing.NewService(logger, nil),
-		gateway.New(logger, nil),
 		discovery.New(logger),
 		nil,
 		fakeRegistryStatusProvider{
@@ -270,10 +264,9 @@ func TestStatusIncludesRemoteConfigurationState(t *testing.T) {
 		config.Config{ListenAddr: "127.0.0.1:0", PublicBaseURL: "https://helper.example.com"},
 		BuildInfo{},
 		logger,
-		catalog.NewWithBaseDir("."),
-		runtime.NewSupervisor(logger),
+		catalog.New(".", nil),
+		runtime.NewSupervisor(logger, ".", nil, nil),
 		pairing.NewService(logger, nil),
-		gateway.New(logger, nil),
 		discovery.New(logger),
 		nil,
 		nil,
@@ -316,10 +309,9 @@ func TestStatusIncludesLANRemoteVisibility(t *testing.T) {
 		config.Config{ListenAddr: "127.0.0.1:0", EnableLAN: true},
 		BuildInfo{},
 		logger,
-		catalog.NewWithBaseDir("."),
-		runtime.NewSupervisor(logger),
+		catalog.New(".", nil),
+		runtime.NewSupervisor(logger, ".", nil, nil),
 		pairing.NewService(logger, nil),
-		gateway.New(logger, nil),
 		discovery.New(logger),
 		nil,
 		nil,
@@ -359,10 +351,9 @@ func TestStatusClassifiesTailscaleRemoteVisibility(t *testing.T) {
 		config.Config{ListenAddr: "127.0.0.1:0", PublicBaseURL: "https://helper.tail123.ts.net"},
 		BuildInfo{},
 		logger,
-		catalog.NewWithBaseDir("."),
-		runtime.NewSupervisor(logger),
+		catalog.New(".", nil),
+		runtime.NewSupervisor(logger, ".", nil, nil),
 		pairing.NewService(logger, nil),
-		gateway.New(logger, nil),
 		discovery.New(logger),
 		nil,
 		nil,
@@ -392,10 +383,9 @@ func TestAdminPairingStartIncludesPayload(t *testing.T) {
 		config.Config{ListenAddr: "127.0.0.1:0", PublicBaseURL: "https://helper.example.com"},
 		BuildInfo{},
 		logger,
-		catalog.NewWithBaseDir("."),
-		runtime.NewSupervisor(logger),
+		catalog.New(".", nil),
+		runtime.NewSupervisor(logger, ".", nil, nil),
 		pairing.NewService(logger, nil),
-		gateway.New(logger, nil),
 		discovery.New(logger),
 		nil,
 		nil,
@@ -439,10 +429,9 @@ func TestAdminStatusIncludesPairingReachability(t *testing.T) {
 		},
 		BuildInfo{},
 		logger,
-		catalog.NewWithBaseDir("."),
-		runtime.NewSupervisor(logger),
+		catalog.New(".", nil),
+		runtime.NewSupervisor(logger, ".", nil, nil),
 		pairing.NewService(logger, nil),
-		gateway.New(logger, nil),
 		discovery.New(logger),
 		nil,
 		nil,
@@ -520,10 +509,9 @@ func TestStatusFlagsInvalidRemoteConfiguration(t *testing.T) {
 		config.Config{ListenAddr: "127.0.0.1:0", PublicBaseURL: "://bad-url"},
 		BuildInfo{},
 		logger,
-		catalog.NewWithBaseDir("."),
-		runtime.NewSupervisor(logger),
+		catalog.New(".", nil),
+		runtime.NewSupervisor(logger, ".", nil, nil),
 		pairing.NewService(logger, nil),
-		gateway.New(logger, nil),
 		discovery.New(logger),
 		nil,
 		nil,
@@ -1446,10 +1434,9 @@ func TestDiagnosticsExportIncludesGatewayLogsAndRuntimeLogs(t *testing.T) {
 		cfg,
 		BuildInfo{Version: "1.2.3", Commit: "abc123", BuiltAt: "2026-03-25T10:00:00Z", GoVersion: "go1.test"},
 		logger,
-		catalog.NewWithBaseDir(baseDir),
-		runtime.NewSupervisorWithBaseDir(logger, baseDir, nil),
+		catalog.New(baseDir, nil),
+		runtime.NewSupervisor(logger, baseDir, nil, nil),
 		pairing.NewServiceWithOptions(logger, nil, pairing.Options{AllowDiagnosticsExport: cfg.AllowDiagnosticsExport}),
-		gateway.New(logger, nil),
 		discovery.New(logger),
 		logSvc,
 		nil,
@@ -1643,17 +1630,11 @@ func TestRuntimeLifecycleEndpoints(t *testing.T) {
 	if connectResponse.WebSocketPath == "" {
 		t.Fatal("WebSocketPath should not be empty")
 	}
-	if connectResponse.BearerToken == "" {
-		t.Fatal("BearerToken should not be empty")
-	}
 	if connectResponse.Scheme != "ws" {
 		t.Fatalf("Scheme = %q, want %q", connectResponse.Scheme, "ws")
 	}
 	if !strings.Contains(connectResponse.WebSocketURL, connectResponse.WebSocketPath) {
 		t.Fatalf("WebSocketURL = %q does not contain path %q", connectResponse.WebSocketURL, connectResponse.WebSocketPath)
-	}
-	if strings.Contains(connectResponse.WebSocketURL, connectResponse.BearerToken) {
-		t.Fatalf("WebSocketURL = %q should not contain bearer token", connectResponse.WebSocketURL)
 	}
 
 	stopRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/stop", nil)
@@ -1751,15 +1732,14 @@ func TestRuntimeRestartWithEnvRequiresElevatedScopeByDefault(t *testing.T) {
 	buildMockAgent(t, baseDir)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	runtimeSvc := runtime.NewSupervisorWithBaseDir(logger, baseDir, nil)
+	runtimeSvc := runtime.NewSupervisor(logger, baseDir, nil, nil)
 	server := NewServer(
 		config.Config{ListenAddr: "127.0.0.1:0"},
 		BuildInfo{},
 		logger,
-		catalog.NewWithBaseDir(baseDir),
+		catalog.New(baseDir, nil),
 		runtimeSvc,
 		pairing.NewService(logger, nil),
-		gateway.New(logger, nil),
 		discovery.New(logger),
 		nil,
 		nil,
@@ -1848,8 +1828,8 @@ func TestExternalStdioRuntimeLifecycleEndpoints(t *testing.T) {
 	if err := json.Unmarshal(startRecorder.Body.Bytes(), &startResponse); err != nil {
 		t.Fatalf("Unmarshal(start) error = %v", err)
 	}
-	if startResponse.Runtime.Transport != "stdio" {
-		t.Fatalf("Transport = %q, want %q", startResponse.Runtime.Transport, "stdio")
+	if startResponse.Runtime.LaunchMode != "external" {
+		t.Fatalf("LaunchMode = %q, want %q", startResponse.Runtime.LaunchMode, "external")
 	}
 
 	connectRequest := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+startResponse.Runtime.ID+"/connect", nil)
@@ -1908,8 +1888,8 @@ func newConfiguredTestServer(cfg config.Config) *Server {
 		cfg,
 		BuildInfo{},
 		logger,
-		catalog.NewWithBaseDir("."),
-		runtime.NewSupervisor(logger),
+		catalog.New(".", nil),
+		runtime.NewSupervisor(logger, ".", nil, nil),
 		pairing.NewServiceWithOptions(logger, nil, pairing.Options{
 			ArmTTL:                 cfg.PairingArmTTL,
 			CredentialTTL:          cfg.CredentialTTL,
@@ -1917,7 +1897,6 @@ func newConfiguredTestServer(cfg config.Config) *Server {
 			AllowDiagnosticsExport: cfg.AllowDiagnosticsExport,
 			AllowRuntimeRestartEnv: cfg.AllowRuntimeRestartEnv,
 		}),
-		gateway.New(logger, nil),
 		discovery.New(logger),
 		nil,
 		nil,
@@ -1939,8 +1918,8 @@ func newConfiguredTestServerWithBaseDir(baseDir string, cfg config.Config) *Serv
 		cfg,
 		BuildInfo{},
 		logger,
-		catalog.NewWithBaseDir(baseDir),
-		runtime.NewSupervisorWithBaseDir(logger, baseDir, nil),
+		catalog.New(baseDir, nil),
+		runtime.NewSupervisor(logger, baseDir, nil, nil),
 		pairing.NewServiceWithOptions(logger, nil, pairing.Options{
 			ArmTTL:                 cfg.PairingArmTTL,
 			CredentialTTL:          cfg.CredentialTTL,
@@ -1948,7 +1927,6 @@ func newConfiguredTestServerWithBaseDir(baseDir string, cfg config.Config) *Serv
 			AllowDiagnosticsExport: cfg.AllowDiagnosticsExport,
 			AllowRuntimeRestartEnv: cfg.AllowRuntimeRestartEnv,
 		}),
-		gateway.New(logger, nil),
 		discovery.New(logger),
 		nil,
 		nil,
@@ -1963,10 +1941,9 @@ func newTestServerWithBaseDirAndRegistry(baseDir string, registrySource catalog.
 		config.Config{ListenAddr: "127.0.0.1:0"},
 		BuildInfo{},
 		logger,
-		catalog.NewWithBaseDirAndRegistry(baseDir, registrySource),
-		runtime.NewSupervisorWithBaseDir(logger, baseDir, nil),
+		catalog.New(baseDir, registrySource),
+		runtime.NewSupervisor(logger, baseDir, nil, nil),
 		pairing.NewService(logger, nil),
-		gateway.New(logger, nil),
 		discovery.New(logger),
 		nil,
 		nil,
@@ -1981,14 +1958,13 @@ func newTestServerWithStore(baseDir string, store *storage.SQLiteStore) *Server 
 		config.Config{ListenAddr: "127.0.0.1:0"},
 		BuildInfo{},
 		logger,
-		catalog.NewWithBaseDir(baseDir),
-		runtime.NewSupervisorWithBaseDir(logger, baseDir, store),
+		catalog.New(baseDir, nil),
+		runtime.NewSupervisor(logger, baseDir, store, nil),
 		pairing.NewService(logger, store),
-		gateway.New(logger, store),
 		discovery.New(logger),
 		nil,
 		nil,
-		nil,
+		store,
 		nil,
 	)
 }
@@ -2225,7 +2201,7 @@ type sessionTestHarness struct {
 	token     string
 	deviceID  string
 	runtimeID string
-	tokenSvc  *token.Service
+	tokenSvc  *session.TokenService
 }
 
 // newHarnessBaseDir creates a temp dir for test harnesses whose cleanup is
@@ -2271,7 +2247,7 @@ func newSessionTestHarness(t *testing.T) *sessionTestHarness {
 	server := newTestServerWithStore(baseDir, store)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tokenSvc := token.New(logger)
+	tokenSvc := session.NewTokenService(logger)
 	sessionSvc := session.NewRuntimeSession(logger, store, server.runtime, tokenSvc, session.Config{
 		MaxDisconnected: 5 * time.Minute,
 		MaxPerDevice:    3,
@@ -2656,7 +2632,7 @@ func TestRuntimeConnectResilientReturnsSessionIDAndAttachToken(t *testing.T) {
 	bearerToken := pairDevice(t, server)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tokenSvc := token.New(logger)
+	tokenSvc := session.NewTokenService(logger)
 	sessionSvc := session.NewRuntimeSession(logger, store, server.runtime, tokenSvc, session.Config{
 		MaxDisconnected: 5 * time.Minute,
 		MaxPerDevice:    3,
@@ -2721,7 +2697,7 @@ func TestRuntimeConnectResilientLeaseHeldReturnsConflict(t *testing.T) {
 	tokenB := pairDevice(t, server)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tokenSvc := token.New(logger)
+	tokenSvc := session.NewTokenService(logger)
 	sessionSvc := session.NewRuntimeSession(logger, store, server.runtime, tokenSvc, session.Config{
 		MaxDisconnected: 5 * time.Minute,
 		MaxPerDevice:    3,

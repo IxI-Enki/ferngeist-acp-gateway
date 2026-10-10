@@ -1,4 +1,4 @@
-package token
+package session
 
 import (
 	"crypto/rand"
@@ -25,8 +25,9 @@ const (
 	maxAttachTokens = 4096
 )
 
-// Service mints and validates single-use attach tokens for session reconnection.
-type Service struct {
+// TokenService mints and validates single-use attach tokens for session
+// reconnection.
+type TokenService struct {
 	logger       *slog.Logger
 	mu           sync.Mutex
 	now          func() time.Time
@@ -34,9 +35,9 @@ type Service struct {
 	lastSweep    time.Time
 }
 
-// New creates a new attach token service.
-func New(logger *slog.Logger) *Service {
-	return &Service{
+// NewTokenService creates a new attach token service.
+func NewTokenService(logger *slog.Logger) *TokenService {
+	return &TokenService{
 		logger:       logger.With("component", "token"),
 		now:          time.Now,
 		attachTokens: make(map[string]attachClaim),
@@ -45,7 +46,7 @@ func New(logger *slog.Logger) *Service {
 
 // Mint creates a single-use attach token bound to a session and device.
 // Returns an error if the random source fails (extremely unlikely).
-func (s *Service) Mint(sessionID, deviceID string, ttl time.Duration) (string, error) {
+func (s *TokenService) Mint(sessionID, deviceID string, ttl time.Duration) (string, error) {
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
 		return "", fmt.Errorf("generate attach token: %w", err)
@@ -72,17 +73,17 @@ func (s *Service) Mint(sessionID, deviceID string, ttl time.Duration) (string, e
 }
 
 // Validate verifies and consumes a single-use attach token.
-func (s *Service) Validate(token string) (sessionID, deviceID string, err error) {
+func (s *TokenService) Validate(token string) (sessionID, deviceID string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeSweepLocked(s.now().UTC())
 	claim, ok := s.attachTokens[token]
 	if !ok {
-		return "", "", ErrTokenInvalid
+		return "", "", ErrAttachTokenInvalid
 	}
 	if s.now().UTC().After(claim.ExpiresAt) {
 		delete(s.attachTokens, token)
-		return "", "", ErrTokenExpired
+		return "", "", ErrAttachTokenExpired
 	}
 	delete(s.attachTokens, token) // consume single-use
 	return claim.SessionID, claim.DeviceID, nil
@@ -91,7 +92,7 @@ func (s *Service) Validate(token string) (sessionID, deviceID string, err error)
 // maybeSweepLocked evicts expired tokens at most every attachTokenSweepEvery.
 // Amortized (no goroutine, no per-call O(n) scan): memory is bounded to live
 // tokens plus one sweep interval of dead ones. Caller holds s.mu.
-func (s *Service) maybeSweepLocked(now time.Time) {
+func (s *TokenService) maybeSweepLocked(now time.Time) {
 	if now.Sub(s.lastSweep) < attachTokenSweepEvery {
 		return
 	}
@@ -100,7 +101,7 @@ func (s *Service) maybeSweepLocked(now time.Time) {
 }
 
 // sweepLocked deletes every token past its TTL. Caller holds s.mu.
-func (s *Service) sweepLocked(now time.Time) {
+func (s *TokenService) sweepLocked(now time.Time) {
 	for token, claim := range s.attachTokens {
 		if now.After(claim.ExpiresAt) {
 			delete(s.attachTokens, token)
@@ -110,7 +111,7 @@ func (s *Service) sweepLocked(now time.Time) {
 
 // evictOldestLocked removes the soonest-expiring token to hold the cap under
 // a fresh-token flood. Caller holds s.mu.
-func (s *Service) evictOldestLocked() {
+func (s *TokenService) evictOldestLocked() {
 	oldest := ""
 	var oldestExp time.Time
 	first := true
@@ -125,7 +126,7 @@ func (s *Service) evictOldestLocked() {
 }
 
 // ClearAll removes all in-memory attach tokens.
-func (s *Service) ClearAll() {
+func (s *TokenService) ClearAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.attachTokens = make(map[string]attachClaim)

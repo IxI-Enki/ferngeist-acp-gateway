@@ -9,11 +9,9 @@ Its main job is to expose ACP agents through a unified WebSocket API. It discove
 - `cmd/ferngeist` — CLI entrypoint for daemon, pairing, and device management
 - `internal/api` — public and admin HTTP APIs, WebSocket bridge, session handlers
 - `internal/push` — platform-neutral push dispatcher with pluggable delivery providers (Web Push)
-- `internal/gateway` — runtime token issuance, attach token and validation
 - `internal/pairing` — pairing flow and device credentials
 - `internal/runtime` — process supervision, lease-based transport bridging
-- `internal/session` — resilient session domain: session lifecycle, stdio pump, inbound diagnostics
-- `internal/token` — attach token hashing and validation
+- `internal/session` — resilient session domain: session lifecycle, stdio pump, attach tokens, inbound diagnostics
 - `internal/catalog` — supported agent discovery and validation
 - `internal/registry` — ACP registry fetch and cache
 - `internal/storage` — SQLite persistence (sessions, pairings, runtimes, push tokens, gateway identity, inbound diagnostics)
@@ -48,7 +46,7 @@ There is no ring buffer or catchup replay. On WebSocket disconnect:
 
 ## Session lifecycle
 
-1. `POST /v1/runtimes/{id}/connect` → session created, connect descriptor with bearer token, sessionId, and attachToken returned
+1. `POST /v1/runtimes/{id}/connect` → session created, connect descriptor with sessionId and attachToken returned
 2. `GET /v1/acp/{runtimeId}?sessionId=<id>&attachToken=<token>` → initial WebSocket connect
 3. ACP messages flow bidirectionally via pump + proxy
 4. WebSocket disconnects → pump keeps running, session → `disconnected`
@@ -200,7 +198,7 @@ Client-to-agent messages are recorded for debugging/audit. Direction is always c
 
 ## Attach tokens
 
-Single-use, short-lived (5-minute TTL) nonces used to prove ownership of a session at WebSocket connect time. Minted on session creation and resume. Consumed on first WebSocket connect. 64 hex characters (32 random bytes). Stored in memory only (not persisted to SQLite). Hashed via SHA-256 for storage; token service in `internal/token/`.
+Single-use, short-lived (5-minute TTL) nonces used to prove ownership of a session at WebSocket connect time. Minted on session creation and resume. Consumed on first WebSocket connect. 64 hex characters (32 random bytes). Stored in memory only (not persisted to SQLite). The token service lives in `internal/session`.
 
 ## Startup reconciliation
 

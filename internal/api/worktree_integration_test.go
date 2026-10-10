@@ -33,7 +33,6 @@ func TestWorktrees_EndToEnd(t *testing.T) {
 	runGitCLI(t, repo, "commit", "-qm", "init")
 
 	h := newResilientTestHarness(t)
-	h.server.store = h.store
 	do := func(t *testing.T, method, path, body string) *httptest.ResponseRecorder {
 		t.Helper()
 		req := httptest.NewRequest(method, path, strings.NewReader(body))

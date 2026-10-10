@@ -1,5 +1,5 @@
 // Package storage provides a lightweight SQLite-backed persistence layer for the
-// gateway's durable state: pairings, runtime metadata, tokens, gateway settings,
+// gateway's durable state: pairings, runtime metadata, gateway settings,
 // acquired binaries, sessions, and inbound diagnostic logs. The store is
 // intentionally small and local — the gateway is a daemon, not a distributed
 // service.
@@ -50,12 +50,6 @@ type RuntimeRecord struct {
 	PID       int
 	LastError string
 	CreatedAt time.Time
-}
-
-type RuntimeTokenRecord struct {
-	RuntimeID string
-	Token     string
-	ExpiresAt time.Time
 }
 
 type RuntimeFailureRecord struct {
@@ -130,8 +124,7 @@ type SessionRecord struct {
 }
 
 // SQLiteStore is the gateway's only durable state store. It is intentionally
-// limited to pairings, gateway settings, runtime metadata, runtime tokens, and
-// recent failures.
+// limited to pairings, gateway settings, runtime metadata, and recent failures.
 type SQLiteStore struct {
 	db *sql.DB
 }
@@ -358,58 +351,6 @@ func (s *SQLiteStore) SaveRuntime(ctx context.Context, record RuntimeRecord) err
 		record.LastError,
 		record.CreatedAt.UTC().Format(time.RFC3339Nano),
 	)
-	return err
-}
-
-func (s *SQLiteStore) SaveRuntimeToken(ctx context.Context, record RuntimeTokenRecord) error {
-	_, err := s.db.ExecContext(
-		ctx,
-		`INSERT INTO runtime_tokens(runtime_id, token, expires_at)
-		 VALUES (?, ?, ?)
-		 ON CONFLICT(runtime_id) DO UPDATE SET
-		   token = excluded.token,
-		   expires_at = excluded.expires_at`,
-		record.RuntimeID,
-		record.Token,
-		record.ExpiresAt.UTC().Format(time.RFC3339Nano),
-	)
-	return err
-}
-
-func (s *SQLiteStore) GetRuntimeToken(ctx context.Context, runtimeID string) (RuntimeTokenRecord, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT runtime_id, token, expires_at FROM runtime_tokens WHERE runtime_id = ?`, runtimeID)
-
-	var (
-		record     RuntimeTokenRecord
-		expiresRaw string
-	)
-	if err := row.Scan(&record.RuntimeID, &record.Token, &expiresRaw); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return RuntimeTokenRecord{}, ErrNotFound
-		}
-		return RuntimeTokenRecord{}, err
-	}
-
-	expiresAt, err := time.Parse(time.RFC3339Nano, expiresRaw)
-	if err != nil {
-		return RuntimeTokenRecord{}, err
-	}
-	record.ExpiresAt = expiresAt
-	return record, nil
-}
-
-func (s *SQLiteStore) DeleteRuntimeToken(ctx context.Context, runtimeID string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM runtime_tokens WHERE runtime_id = ?`, runtimeID)
-	return err
-}
-
-func (s *SQLiteStore) DeleteExpiredRuntimeTokens(ctx context.Context, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM runtime_tokens WHERE expires_at <= ?`, now.UTC().Format(time.RFC3339Nano))
-	return err
-}
-
-func (s *SQLiteStore) DeleteAllRuntimeTokens(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM runtime_tokens`)
 	return err
 }
 
@@ -983,11 +924,6 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 			last_error TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL
 		)`,
-		`CREATE TABLE IF NOT EXISTS runtime_tokens (
-			runtime_id TEXT PRIMARY KEY,
-			token TEXT NOT NULL,
-			expires_at TEXT NOT NULL
-		)`,
 		`CREATE TABLE IF NOT EXISTS runtime_failures (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			runtime_id TEXT NOT NULL,
@@ -1076,6 +1012,12 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return err
 		}
+	}
+
+	// runtime_tokens held one-time ACP bearer tokens for a validation path that
+	// no longer exists; drop the table so upgraded databases stop carrying it.
+	if _, err := s.db.ExecContext(ctx, `DROP TABLE IF EXISTS runtime_tokens`); err != nil {
+		return err
 	}
 
 	// Upgrade pre-clean-column databases. modernc.org/sqlite's bundled SQLite

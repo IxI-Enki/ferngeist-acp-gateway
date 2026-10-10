@@ -12,9 +12,8 @@ type Pipes interface {
 
 // LeasedPipes wraps a runtime's stdio pipes with an explicit release mechanism.
 // It does NOT expose Stdin directly for inbound writes — use WriteToAgent.
-// On Release(), legacy leases ("legacy" leaseholder) close stdin (agent exits).
-// Session leases (session ID leaseholder) only clear the leaseholder string —
-// the pump keeps running.
+// Release only clears the leaseholder: the owning session's pump keeps running
+// and continues to own the pipe.
 type LeasedPipes struct {
 	Stdin       io.WriteCloser
 	Stdout      io.ReadCloser
@@ -32,9 +31,7 @@ func (lp *LeasedPipes) WriteToAgent(payload []byte) error {
 	return nil
 }
 
-// Release clears the lease. For legacy leaseholders, this also closes stdin
-// which kills the agent process. For session leaseholders, only the leaseholder
-// string is cleared — the pump continues to own the pipe.
+// Release clears the leaseholder string. The pump continues to own the pipe.
 //
 // Release is nil-safe: if the supervisor backing store is unavailable (nil
 // supervisor, e.g. from a test mock), the release is a no-op.
@@ -50,17 +47,12 @@ func (lp *LeasedPipes) Release() error {
 		}
 		lp.supervisor.mu.Unlock()
 	}
-	if lp.leaseholder == "legacy" {
-		lp.Stdin.Close()
-	}
 	return nil
 }
 
 // AcquireLease grants exclusive use of a runtime's stdio pipes to the given
-// leaseholder. The leaseholder is an opaque string (session ID for resilient
-// sessions, "legacy" for traditional WebSocket connections). The returned
-// LeasedPipes must be released explicitly via ReleaseLease or the Release()
-// method when the bridge is torn down.
+// leaseholder (a session ID). The returned LeasedPipes must be released
+// explicitly via ReleaseLease or the Release() method when the session closes.
 func (s *Supervisor) AcquireLease(runtimeID, leaseholder string) (Pipes, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -72,9 +64,6 @@ func (s *Supervisor) AcquireLease(runtimeID, leaseholder string) (Pipes, error) 
 	}
 	if r.Status != StatusRunning {
 		return nil, ErrRuntimeNotRunning
-	}
-	if r.Transport != "stdio" {
-		return nil, ErrRuntimeNotConnectable
 	}
 
 	handle, ok := s.processes[runtimeID]

@@ -51,6 +51,7 @@ var (
 	ErrSessionNotFound     = errors.New("session not found")
 	ErrSessionNotActive    = errors.New("session is not in an active state")
 	ErrAttachTokenInvalid  = errors.New("attach token is invalid or expired")
+	ErrAttachTokenExpired  = errors.New("attach token has expired")
 	ErrSessionLimitReached = errors.New("session limit for this device has been reached")
 	ErrDeviceMismatch      = errors.New("session does not belong to this device")
 	ErrRuntimeLeaseHeld    = errors.New("runtime is already leased by another session")
@@ -75,18 +76,6 @@ type ProcessManager interface {
 	OnProcessExit(runtimeID string, callback func(runtimeID string, intentional bool))
 	StopByRuntimeID(runtimeID string) (runtime.Runtime, error)
 	AppendLog(runtimeID, stream, message string)
-}
-
-// TokenService is the interface for attach token minting and validation.
-// Satisfied by *token.Service. Single-use attach tokens prove the bearer owned
-// the device credential at resume time, without storing secrets in the session.
-type TokenService interface {
-	// Mint creates a single-use, time-limited token bound to a session/device pair.
-	Mint(sessionID, deviceID string, ttl time.Duration) (string, error)
-	// Validate verifies and consumes the token, returning the session ID and
-	// device ID from the claim. The caller is responsible for verifying the device ID
-	// matches the session's device (so the session domain owns that check).
-	Validate(token string) (string, string, error)
 }
 
 type SessionSummary struct {
@@ -135,7 +124,7 @@ type RuntimeSession struct {
 	logger   *slog.Logger
 	store    *storage.SQLiteStore
 	pm       ProcessManager // runtime lifecycle (lease, stop, exit callback)
-	tokenSvc TokenService   // attach token mint/validate
+	tokenSvc *TokenService  // attach token mint/validate
 	cfg      Config
 
 	mu       sync.Mutex
@@ -170,7 +159,7 @@ type Session struct {
 }
 
 // NewRuntimeSession creates a new session service and starts the reaper goroutine.
-func NewRuntimeSession(logger *slog.Logger, store *storage.SQLiteStore, pm ProcessManager, tokenSvc TokenService, cfg Config) *RuntimeSession {
+func NewRuntimeSession(logger *slog.Logger, store *storage.SQLiteStore, pm ProcessManager, tokenSvc *TokenService, cfg Config) *RuntimeSession {
 	frameLog, err := newFrameLogManager(cfg.FrameLogEnabled, cfg.FrameLogDir, cfg.FrameLogMaxSize, cfg.FrameLogMaxBackups)
 	if err != nil {
 		// A misconfigured frame log must not take down the session service;

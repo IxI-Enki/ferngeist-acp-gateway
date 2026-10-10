@@ -33,7 +33,6 @@ func TestRegisterPushTokenStoresTokenAndPlatform(t *testing.T) {
 	}
 	defer store.Close()
 	server := newTestServerWithStore(t.TempDir(), store)
-	server.store = store
 
 	creds := pairDeviceResponse(t, server)
 
@@ -73,7 +72,6 @@ func TestRegisterPushTokenDefaultsPlatform(t *testing.T) {
 	}
 	defer store.Close()
 	server := newTestServerWithStore(t.TempDir(), store)
-	server.store = store
 
 	creds := pairDeviceResponse(t, server)
 
@@ -97,7 +95,6 @@ func TestRegisterPushTokenRejectsMissingToken(t *testing.T) {
 	}
 	defer store.Close()
 	server := newTestServerWithStore(t.TempDir(), store)
-	server.store = store
 
 	creds := pairDeviceResponse(t, server)
 
@@ -114,7 +111,6 @@ func TestRegisterPushTokenRequiresCredential(t *testing.T) {
 	}
 	defer store.Close()
 	server := newTestServerWithStore(t.TempDir(), store)
-	server.store = store
 
 	rec := registerPushToken(t, server, "", `{"token":"fcm-abc","platform":"android"}`)
 	if rec.Code != http.StatusUnauthorized {
@@ -129,7 +125,6 @@ func TestPairCompleteReturnsGatewayID(t *testing.T) {
 	}
 	defer store.Close()
 	server := newTestServerWithStore(t.TempDir(), store)
-	server.store = store
 	server.cfg.GatewayID = "gw-test-id"
 
 	creds := pairDeviceResponse(t, server)
@@ -151,7 +146,6 @@ func TestRegisterWebPushSubscription(t *testing.T) {
 	}
 	defer store.Close()
 	server := newTestServerWithStore(t.TempDir(), store)
-	server.store = store
 	creds := pairDeviceResponse(t, server)
 
 	for _, bad := range []string{
@@ -184,7 +178,6 @@ func TestPushConfigReturnsVAPIDPublicKey(t *testing.T) {
 	}
 	defer store.Close()
 	server := newTestServerWithStore(t.TempDir(), store)
-	server.store = store
 	server.cfg.VAPIDPublicKey = "BPUB"
 	creds := pairDeviceResponse(t, server)
 

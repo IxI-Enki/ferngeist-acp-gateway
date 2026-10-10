@@ -34,9 +34,8 @@ func TestEnsureDownloadsRawBinaryIntoManagedDir(t *testing.T) {
 	agent, changed, err := installer.Ensure(context.Background(), catalog.Agent{
 		ID: "codex-acp",
 		Launch: catalog.LaunchConfig{
-			Mode:      "external",
-			Command:   "codex-acp",
-			Transport: "stdio",
+			Mode:    "external",
+			Command: "codex-acp",
 		},
 		Registry: catalog.RegistryInfo{
 			CurrentBinaryPath:       namedBinary("mock-stdio-agent"),

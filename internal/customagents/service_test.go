@@ -25,7 +25,7 @@ func newTestService(t *testing.T) *Service {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
-	catalogSvc := catalog.NewWithBaseDirAndRegistry(t.TempDir(), nil)
+	catalogSvc := catalog.New(t.TempDir(), nil)
 	catalogSvc.SetCustomProvider(func() []catalog.CustomAgent {
 		records, err := store.ListCustomAgents(context.Background())
 		if err != nil {

@@ -33,21 +33,20 @@ var embeddedManifestFS embed.FS
 // custom agents (stored in SQLite, served through the daemon's provider hook —
 // a custom with the same ID shadows the other two).
 type Agent struct {
-	ID              string            `json:"id"`
-	Source          string            `json:"source"` // "embedded" | "registry" | "custom"
-	DisplayName     string            `json:"displayName"`
-	Protocol        string            `json:"protocol"`
-	PlatformSupport []string          `json:"platformSupport,omitempty"`
-	Detection       DetectionConfig   `json:"detection"`
-	Launch          LaunchConfig      `json:"launch"`
-	HealthCheck     HealthCheckConfig `json:"healthCheck"`
-	Capabilities    []string          `json:"capabilities,omitempty"`
-	Security        SecurityConfig    `json:"security"`
-	Registry        RegistryInfo      `json:"registry"`
-	Detected        bool              `json:"detected"`
-	ManifestValid   bool              `json:"manifestValid"`
-	ValidationError string            `json:"validationError,omitempty"`
-	Hint            string            `json:"hint,omitempty"`
+	ID              string          `json:"id"`
+	Source          string          `json:"source"` // "embedded" | "registry" | "custom"
+	DisplayName     string          `json:"displayName"`
+	Protocol        string          `json:"protocol"`
+	PlatformSupport []string        `json:"platformSupport,omitempty"`
+	Detection       DetectionConfig `json:"detection"`
+	Launch          LaunchConfig    `json:"launch"`
+	Capabilities    []string        `json:"capabilities,omitempty"`
+	Security        SecurityConfig  `json:"security"`
+	Registry        RegistryInfo    `json:"registry"`
+	Detected        bool            `json:"detected"`
+	ManifestValid   bool            `json:"manifestValid"`
+	ValidationError string          `json:"validationError,omitempty"`
+	Hint            string          `json:"hint,omitempty"`
 }
 
 type DetectionConfig struct {
@@ -57,28 +56,16 @@ type DetectionConfig struct {
 }
 
 type LaunchConfig struct {
-	Mode      string          `json:"mode"`
-	Command   string          `json:"command"`
-	Args      []string        `json:"args"`
-	Transport string          `json:"transport,omitempty"`
-	Readiness ReadinessConfig `json:"readiness"`
-	Restart   RestartConfig   `json:"restart"`
-}
-
-type ReadinessConfig struct {
-	Mode           string `json:"mode"`
-	TimeoutSeconds int    `json:"timeoutSeconds,omitempty"`
+	Mode    string        `json:"mode"`
+	Command string        `json:"command"`
+	Args    []string      `json:"args"`
+	Restart RestartConfig `json:"restart"`
 }
 
 type RestartConfig struct {
 	Mode           string `json:"mode"`
 	MaxRetries     int    `json:"maxRetries,omitempty"`
 	BackoffSeconds int    `json:"backoffSeconds,omitempty"`
-}
-
-type HealthCheckConfig struct {
-	Mode           string `json:"mode"`
-	TimeoutSeconds int    `json:"timeoutSeconds,omitempty"`
 }
 
 type SecurityConfig struct {
@@ -148,17 +135,9 @@ type Service struct {
 // forces a rescan.
 const catalogRefreshInterval = 30 * time.Second
 
-// New returns the default gateway catalog rooted at the current working
-// directory.
-func New() *Service {
-	return NewWithBaseDirAndRegistry(".", nil)
-}
-
-func NewWithBaseDir(baseDir string) *Service {
-	return NewWithBaseDirAndRegistry(baseDir, nil)
-}
-
-func NewWithBaseDirAndRegistry(baseDir string, registrySource RegistrySource) *Service {
+// New returns the gateway catalog rooted at baseDir, optionally enriched from
+// an ACP registry source (nil disables registry lookups).
+func New(baseDir string, registrySource RegistrySource) *Service {
 	agents, err := loadEmbeddedAgents()
 	if err != nil {
 		panic(fmt.Errorf("load embedded catalog manifests: %w", err))
@@ -218,14 +197,11 @@ func customToAgent(c CustomAgent) Agent {
 		Detection:       DetectionConfig{Mode: "path_lookup", Command: c.Command},
 		Launch: LaunchConfig{
 			Mode: "external", Command: c.Command, Args: append([]string(nil), c.Args...),
-			Transport: "stdio",
-			Readiness: ReadinessConfig{Mode: "immediate"},
-			Restart:   RestartConfig{Mode: "never"},
+			Restart: RestartConfig{Mode: "never"},
 		},
-		HealthCheck: HealthCheckConfig{Mode: "none"},
-		Security:    SecurityConfig{CuratedLaunch: true, AllowsRemoteStart: true},
-		Registry:    RegistryInfo{Required: false, ValidationStatus: "not_required"},
-		Hint:        c.Hint,
+		Security: SecurityConfig{CuratedLaunch: true, AllowsRemoteStart: true},
+		Registry: RegistryInfo{Required: false, ValidationStatus: "not_required"},
+		Hint:     c.Hint,
 	}
 }
 
@@ -548,9 +524,6 @@ func validateAgent(agent Agent) error {
 	if err := validateLaunch(agent.Launch); err != nil {
 		return err
 	}
-	if err := validateHealthCheck(agent.HealthCheck, agent.Launch.Transport); err != nil {
-		return err
-	}
 	if err := validateDetectionLaunchPair(agent.Detection, agent.Launch); err != nil {
 		return err
 	}
@@ -581,19 +554,13 @@ func validateDetection(detection DetectionConfig) error {
 }
 
 // validateLaunch keeps launch templates intentionally narrow. The gateway should
-// not accept shell fragments or transport-specific fields that do not match the
-// declared launch mode.
+// not accept shell fragments or launch fields that do not match the declared
+// launch mode.
 func validateLaunch(launch LaunchConfig) error {
 	switch launch.Mode {
 	case "process":
 		if strings.TrimSpace(launch.Command) == "" {
 			return errors.New("process launch requires command")
-		}
-		if launch.Transport != "stdio" {
-			return fmt.Errorf("unsupported process transport %q", launch.Transport)
-		}
-		if launch.Readiness.Mode == "" {
-			return errors.New("process launch requires readiness mode")
 		}
 	case "external":
 		if !isAbsoluteExecutable(launch.Command) {
@@ -602,12 +569,6 @@ func validateLaunch(launch LaunchConfig) error {
 			}
 		} else if containsControlChars(launch.Command) {
 			return errors.New("launch command cannot contain control characters")
-		}
-		if launch.Transport != "stdio" {
-			return fmt.Errorf("unsupported external transport %q", launch.Transport)
-		}
-		if launch.Readiness.Mode == "" {
-			return errors.New("external launch requires readiness mode")
 		}
 	default:
 		return fmt.Errorf("unsupported launch mode %q", launch.Mode)
@@ -625,10 +586,7 @@ func validateLaunch(launch LaunchConfig) error {
 	if containsControlChars(launch.Command) {
 		return errors.New("launch command cannot contain control characters")
 	}
-	if err := validateReadiness(launch.Readiness, launch.Transport); err != nil {
-		return err
-	}
-	if err := validateRestart(launch.Restart, launch.Transport); err != nil {
+	if err := validateRestart(launch.Restart); err != nil {
 		return err
 	}
 	return nil
@@ -671,22 +629,7 @@ func validateExecutableName(command string) error {
 	return nil
 }
 
-func validateReadiness(readiness ReadinessConfig, transport string) error {
-	switch transport {
-	case "stdio":
-		if readiness.Mode != "immediate" {
-			return fmt.Errorf("stdio transport requires readiness mode %q", "immediate")
-		}
-	default:
-		return fmt.Errorf("unsupported readiness transport %q", transport)
-	}
-	if readiness.TimeoutSeconds < 0 {
-		return errors.New("readiness timeout must not be negative")
-	}
-	return nil
-}
-
-func validateRestart(restart RestartConfig, transport string) error {
+func validateRestart(restart RestartConfig) error {
 	mode := restart.Mode
 	if mode == "" {
 		mode = "never"
@@ -695,9 +638,6 @@ func validateRestart(restart RestartConfig, transport string) error {
 	switch mode {
 	case "never":
 	case "on_failure":
-		if transport != "stdio" {
-			return errors.New("automatic restart is only supported for stdio runtimes")
-		}
 	default:
 		return fmt.Errorf("unsupported restart mode %q", restart.Mode)
 	}
@@ -707,27 +647,6 @@ func validateRestart(restart RestartConfig, transport string) error {
 	}
 	if restart.BackoffSeconds < 0 {
 		return errors.New("restart backoffSeconds must not be negative")
-	}
-	return nil
-}
-
-func validateHealthCheck(healthCheck HealthCheckConfig, transport string) error {
-	mode := healthCheck.Mode
-	if mode == "" {
-		return errors.New("healthCheck mode is required")
-	}
-
-	switch transport {
-	case "stdio":
-		if mode != "none" {
-			return fmt.Errorf("stdio transport requires healthCheck mode %q", "none")
-		}
-	default:
-		return fmt.Errorf("unsupported healthCheck transport %q", transport)
-	}
-
-	if healthCheck.TimeoutSeconds < 0 {
-		return errors.New("healthCheck timeout must not be negative")
 	}
 	return nil
 }
@@ -766,7 +685,6 @@ func mergeAdapter(base Agent, adapter Agent) Agent {
 	base.PlatformSupport = append([]string(nil), adapter.PlatformSupport...)
 	base.Detection = adapter.Detection
 	base.Launch = adapter.Launch
-	base.HealthCheck = adapter.HealthCheck
 	base.Capabilities = append([]string(nil), adapter.Capabilities...)
 	base.Security = adapter.Security
 	base.Hint = adapter.Hint
@@ -809,10 +727,7 @@ func registryEntryToAgent(entry acpregistry.AgentEntry, resolveBinaries func(str
 		DisplayName:     displayName,
 		Protocol:        "acp",
 		PlatformSupport: []string{"windows", "darwin", "linux", "android"},
-		HealthCheck: HealthCheckConfig{
-			Mode: "none",
-		},
-		Capabilities: []string{"acp"},
+		Capabilities:    []string{"acp"},
 		Security: SecurityConfig{
 			CuratedLaunch:          true,
 			AllowsRemoteStart:      false,
@@ -974,12 +889,10 @@ func buildRegistryLaunchPlan(entry acpregistry.AgentEntry, resolveBinaries func(
 
 func registryExternalLaunchPlan(command string, args []string) registryLaunchPlan {
 	launch := LaunchConfig{
-		Mode:      "external",
-		Command:   command,
-		Args:      args,
-		Transport: "stdio",
-		Readiness: ReadinessConfig{Mode: "immediate"},
-		Restart:   RestartConfig{Mode: "never"},
+		Mode:    "external",
+		Command: command,
+		Args:    args,
+		Restart: RestartConfig{Mode: "never"},
 	}
 	return registryLaunchPlan{
 		Launch: launch,

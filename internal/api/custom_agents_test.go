@@ -27,7 +27,6 @@ func newCustomTestServer(t *testing.T) (*Server, *storage.SQLiteStore) {
 	t.Cleanup(func() { _ = store.Close() })
 
 	server := newTestServerWithStore(baseDir, store)
-	server.store = store
 	server.catalog.SetCustomProvider(func() []catalog.CustomAgent {
 		records, err := store.ListCustomAgents(context.Background())
 		if err != nil {

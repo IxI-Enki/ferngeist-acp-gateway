@@ -9,6 +9,7 @@ package session
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -35,14 +36,14 @@ func TestIntegration_SessionLifecycle(t *testing.T) {
 
 	ctx := context.Background()
 	mockPM := newMockPM()
-	mockTokenSvc := newMockTokenSvc()
+	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	cfg := Config{
 		MaxDisconnected: 5 * time.Minute,
 		MaxPerDevice:    3,
 	}
 
-	rs := NewRuntimeSession(slog.Default(), store, mockPM, mockTokenSvc, cfg)
+	rs := NewRuntimeSession(slog.Default(), store, mockPM, tokenSvc, cfg)
 	defer rs.Shutdown()
 
 	runtimeID := "rt_integration_001"
@@ -145,14 +146,14 @@ func TestIntegration_DeviceLimit(t *testing.T) {
 
 	ctx := context.Background()
 	mockPM := newMockPM()
-	mockTokenSvc := newMockTokenSvc()
+	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	cfg := Config{
 		MaxDisconnected: 5 * time.Minute,
 		MaxPerDevice:    2,
 	}
 
-	rs := NewRuntimeSession(slog.Default(), store, mockPM, mockTokenSvc, cfg)
+	rs := NewRuntimeSession(slog.Default(), store, mockPM, tokenSvc, cfg)
 	defer rs.Shutdown()
 
 	deviceID := "dev_limit_test"
@@ -186,9 +187,9 @@ func TestIntegration_DeviceMismatch(t *testing.T) {
 
 	ctx := context.Background()
 	mockPM := newMockPM()
-	mockTokenSvc := newMockTokenSvc()
+	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	rs := NewRuntimeSession(slog.Default(), store, mockPM, mockTokenSvc, Config{})
+	rs := NewRuntimeSession(slog.Default(), store, mockPM, tokenSvc, Config{})
 	defer rs.Shutdown()
 
 	sess, _, err := rs.Create(ctx, "rt_mm", "dev_a", "agent_x")
@@ -221,9 +222,9 @@ func TestIntegration_ProcessExitCallback(t *testing.T) {
 
 	ctx := context.Background()
 	mockPM := newMockPM()
-	mockTokenSvc := newMockTokenSvc()
+	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	rs := NewRuntimeSession(slog.Default(), store, mockPM, mockTokenSvc, Config{})
+	rs := NewRuntimeSession(slog.Default(), store, mockPM, tokenSvc, Config{})
 	defer rs.Shutdown()
 
 	runtimeID := "rt_exit_cb"
@@ -264,14 +265,14 @@ func TestIntegration_ReaperExpiresDisconnectedSessions(t *testing.T) {
 
 	ctx := context.Background()
 	mockPM := newMockPM()
-	mockTokenSvc := newMockTokenSvc()
+	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	cfg := Config{
 		MaxDisconnected: 100 * time.Millisecond,
 		MaxPerDevice:    5,
 	}
 
-	rs := NewRuntimeSession(slog.Default(), store, mockPM, mockTokenSvc, cfg)
+	rs := NewRuntimeSession(slog.Default(), store, mockPM, tokenSvc, cfg)
 	defer rs.Shutdown()
 
 	sess, _, err := rs.Create(ctx, "rt_reaper", "dev_reaper", "agent_reaper")

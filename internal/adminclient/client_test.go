@@ -15,7 +15,6 @@ import (
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/catalog"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/config"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/discovery"
-	"github.com/arafatamim/ferngeist-acp-gateway/internal/gateway"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/pairing"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/runtime"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
@@ -81,7 +80,7 @@ func newTestCustomAgentClient(t *testing.T) *Client {
 	t.Cleanup(func() { _ = store.Close() })
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	catalogSvc := catalog.NewWithBaseDir(baseDir)
+	catalogSvc := catalog.New(baseDir, nil)
 	catalogSvc.SetCustomProvider(func() []catalog.CustomAgent {
 		records, err := store.ListCustomAgents(context.Background())
 		if err != nil {
@@ -105,9 +104,8 @@ func newTestCustomAgentClient(t *testing.T) *Client {
 		api.BuildInfo{},
 		logger,
 		catalogSvc,
-		runtime.NewSupervisorWithBaseDir(logger, baseDir, store),
+		runtime.NewSupervisor(logger, baseDir, store, nil),
 		pairing.NewService(logger, store),
-		gateway.New(logger, store),
 		discovery.New(logger),
 		nil,
 		nil,

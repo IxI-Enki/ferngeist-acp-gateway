@@ -39,7 +39,7 @@ func TestLoadEmbeddedAgents(t *testing.T) {
 
 func TestMockAgentDetectionDependsOnBinaryPresence(t *testing.T) {
 	baseDir := t.TempDir()
-	service := NewWithBaseDir(baseDir)
+	service := New(baseDir, nil)
 
 	agent, err := service.Get("mock-acp")
 	if err != nil {
@@ -151,13 +151,10 @@ func TestInvalidAdapterFallsBackToRegistryLaunch(t *testing.T) {
 					Command: "bad/command",
 				},
 				Launch: LaunchConfig{
-					Mode:      "external",
-					Command:   "bad/command",
-					Transport: "stdio",
-					Readiness: ReadinessConfig{Mode: "immediate"},
-					Restart:   RestartConfig{Mode: "never"},
+					Mode:    "external",
+					Command: "bad/command",
+					Restart: RestartConfig{Mode: "never"},
 				},
-				HealthCheck: HealthCheckConfig{Mode: "none"},
 				Security: SecurityConfig{
 					CuratedLaunch: true,
 				},
@@ -262,7 +259,7 @@ func TestRegistryAgentIsSurfacedAndEnriched(t *testing.T) {
 }
 
 func TestRegistryOnlyAgentMissingFromRegistryIsNotFound(t *testing.T) {
-	service := NewWithBaseDirAndRegistry(t.TempDir(), fakeRegistrySource{
+	service := New(t.TempDir(), fakeRegistrySource{
 		snapshot: acpregistry.Snapshot{
 			Version: "1.0.0",
 			Agents:  map[string]acpregistry.AgentEntry{},
@@ -294,7 +291,7 @@ func TestRegistryOnlyInstalledAgentIsSurfacedAndLaunchable(t *testing.T) {
 	originalPath := os.Getenv("PATH")
 	t.Setenv("PATH", pathDir+string(os.PathListSeparator)+originalPath)
 
-	service := NewWithBaseDirAndRegistry(baseDir, fakeRegistrySource{
+	service := New(baseDir, fakeRegistrySource{
 		snapshot: acpregistry.Snapshot{
 			Version: "1.0.0",
 			Agents: map[string]acpregistry.AgentEntry{
@@ -336,7 +333,7 @@ func TestRegistryOnlyInstalledAgentIsSurfacedAndLaunchable(t *testing.T) {
 }
 
 func TestRegistryOnlyAgentWithoutSupportedDistributionIsVisibleButNotLaunchable(t *testing.T) {
-	service := NewWithBaseDirAndRegistry(t.TempDir(), fakeRegistrySource{
+	service := New(t.TempDir(), fakeRegistrySource{
 		snapshot: acpregistry.Snapshot{
 			Version: "1.0.0",
 			Agents: map[string]acpregistry.AgentEntry{
@@ -363,7 +360,7 @@ func TestRegistryOnlyAgentWithoutSupportedDistributionIsVisibleButNotLaunchable(
 }
 
 func TestRegistrySynthesizesBinaryArgsForTrustedExternalAdapter(t *testing.T) {
-	service := NewWithBaseDirAndRegistry(t.TempDir(), fakeRegistrySource{
+	service := New(t.TempDir(), fakeRegistrySource{
 		snapshot: acpregistry.Snapshot{
 			Version: "1.0.0",
 			Agents: map[string]acpregistry.AgentEntry{
@@ -508,7 +505,7 @@ func TestRegistryPrefersBinaryOverNpmExecAndUvx(t *testing.T) {
 	}
 	t.Setenv("PATH", pathDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	service := NewWithBaseDirAndRegistry(baseDir, fakeRegistrySource{
+	service := New(baseDir, fakeRegistrySource{
 		snapshot: acpregistry.Snapshot{
 			Version: "1.0.0",
 			Agents: map[string]acpregistry.AgentEntry{
@@ -596,7 +593,7 @@ func TestRegistrySynthesizesUvxLaunchForRegistryAgent(t *testing.T) {
 	}
 	t.Setenv("PATH", pathDir+string(os.PathListSeparator)+originalPath)
 
-	service := NewWithBaseDirAndRegistry(t.TempDir(), fakeRegistrySource{
+	service := New(t.TempDir(), fakeRegistrySource{
 		snapshot: acpregistry.Snapshot{
 			Version: "1.0.0",
 			Agents: map[string]acpregistry.AgentEntry{
@@ -637,7 +634,7 @@ func TestRegistrySynthesizesUvxLaunchForRegistryAgent(t *testing.T) {
 }
 
 func TestRegistryBinaryAgentIsLaunchableWithoutPathWhenDownloadable(t *testing.T) {
-	service := NewWithBaseDirAndRegistry(t.TempDir(), fakeRegistrySource{
+	service := New(t.TempDir(), fakeRegistrySource{
 		snapshot: acpregistry.Snapshot{
 			Version: "1.0.0",
 			Agents: map[string]acpregistry.AgentEntry{
@@ -674,17 +671,10 @@ func TestRegistryBinaryAgentIsLaunchableWithoutPathWhenDownloadable(t *testing.T
 	}
 }
 
-func TestValidateRestartAllowsAutoRestartForStdio(t *testing.T) {
-	err := validateRestart(RestartConfig{Mode: "on_failure", MaxRetries: 1}, "stdio")
+func TestValidateRestartAllowsAutoRestart(t *testing.T) {
+	err := validateRestart(RestartConfig{Mode: "on_failure", MaxRetries: 1})
 	if err != nil {
 		t.Fatalf("validateRestart() error = %v", err)
-	}
-}
-
-func TestValidateHealthCheckRejectsWebSocketProbeForStdio(t *testing.T) {
-	err := validateHealthCheck(HealthCheckConfig{Mode: "websocket_connect", TimeoutSeconds: 1}, "stdio")
-	if err == nil {
-		t.Fatal("validateHealthCheck() should reject websocket_connect for stdio")
 	}
 }
 
@@ -717,7 +707,7 @@ func validCustomTestAgent(id, command string) Agent {
 }
 
 func TestMergedEmbeddedAdapterKeepsEmbeddedSource(t *testing.T) {
-	service := NewWithBaseDirAndRegistry(t.TempDir(), fakeRegistrySource{
+	service := New(t.TempDir(), fakeRegistrySource{
 		snapshot: acpregistry.Snapshot{
 			Version: "1.0.0",
 			Agents: map[string]acpregistry.AgentEntry{
@@ -741,8 +731,7 @@ func TestValidateAbsolutePathLaunch(t *testing.T) {
 		ID: "custom-foo", DisplayName: "Foo", Protocol: "acp",
 		PlatformSupport: []string{"windows", "darwin", "linux", "android"},
 		Detection:       DetectionConfig{Mode: "path_lookup", Command: abs},
-		Launch:          LaunchConfig{Mode: "external", Command: abs, Args: []string{"--acp"}, Transport: "stdio", Readiness: ReadinessConfig{Mode: "immediate"}, Restart: RestartConfig{Mode: "never"}},
-		HealthCheck:     HealthCheckConfig{Mode: "none"},
+		Launch:          LaunchConfig{Mode: "external", Command: abs, Args: []string{"--acp"}, Restart: RestartConfig{Mode: "never"}},
 		Security:        SecurityConfig{CuratedLaunch: true, AllowsRemoteStart: true},
 	}
 	if err := validateAgent(agent); err != nil {
@@ -767,7 +756,7 @@ func TestSlugCustomID(t *testing.T) {
 }
 
 func TestRefreshMergesCustomAgents(t *testing.T) {
-	svc := NewWithBaseDirAndRegistry(t.TempDir(), nil)
+	svc := New(t.TempDir(), nil)
 	if svc.IsCustomID("custom-foo") {
 		t.Fatal("IsCustomID without a custom provider = true, want false")
 	}

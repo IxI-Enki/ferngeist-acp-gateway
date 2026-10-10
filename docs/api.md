@@ -57,7 +57,7 @@ Base path: `/v1`
       compatibility).
     - `runtimes` — a list of every runtime currently tracked for the agent (each
       element is a full runtime object: `id`, `agentId`, `agentName`, `status`,
-      `createdAt`, `pid`, `command`, `launchMode`, `transport`, etc.). Empty when the
+      `createdAt`, `pid`, `command`, `launchMode`, etc.). Empty when the
       agent has no live or recently-stopped runtime.
     - `source` — `embedded` (gateway-owned manifest), `registry` (ACP registry),
       or `custom` (client-registered; see [Custom agents](#custom-agents)).
@@ -171,7 +171,7 @@ start/stop through the same `POST /v1/agents/{agentId}/start` /
   - `command` is either a bare executable name resolved on the daemon's `PATH`
     or an absolute path to an executable. Relative paths containing separators
     (`tools/my-agent`, `..\my-agent`) are rejected. Everything else about the
-    agent (protocol, transport, readiness, restart policy, allowed platforms) is
+    agent (protocol, restart policy, allowed platforms) is
     derived server-side.
   - `args` is optional (at most 20 entries, 1024 characters each). There is no
     per-agent environment variable support in v1.
@@ -221,7 +221,7 @@ through the CLI: `ferngeist-gateway agents add|list|update|rm`
   - Requires `read` scope.
 
 - `POST /v1/runtimes/{runtimeId}/connect`
-  - Creates a runtime token and starts a gateway session for ACP traffic.
+  - Creates a gateway session and returns the WebSocket connection details for ACP traffic.
   - Requires `control` scope.
   - Response:
     ```json
@@ -232,8 +232,6 @@ through the CLI: `ferngeist-gateway agents add|list|update|rm`
       "host": "string",
       "websocketUrl": "string",
       "websocketPath": "string",
-      "bearerToken": "string",
-      "tokenExpiresAt": "2026-05-22T10:00:00Z",
       "sessionId": "string",
       "attachToken": "string"
     }

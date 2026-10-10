@@ -11,16 +11,9 @@
     "mode": "process",
     "command": "bin/__MOCK_AGENT_EXECUTABLE__",
     "args": [],
-    "transport": "stdio",
-    "readiness": {
-      "mode": "immediate"
-    },
     "restart": {
       "mode": "never"
     }
-  },
-  "healthCheck": {
-    "mode": "none"
   },
   "capabilities": ["acp", "diagnostics"],
   "security": {

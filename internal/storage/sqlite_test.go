@@ -94,40 +94,6 @@ func TestPairingRoundtrip(t *testing.T) {
 // Runtime token roundtrip (split from TestSQLiteStorePersistsPairingsAndRuntimes)
 // ==================================================================================
 
-// TestRuntimeTokenRoundtrip verifies save, get, and delete of a runtime token.
-func TestRuntimeTokenRoundtrip(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "token_rt.db"))
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	defer store.Close()
-
-	ctx := context.Background()
-	tokenExpiry := time.Date(2026, 3, 25, 10, 5, 0, 0, time.UTC)
-	if err := store.SaveRuntimeToken(ctx, RuntimeTokenRecord{
-		RuntimeID: "run-1",
-		Token:     "token-1",
-		ExpiresAt: tokenExpiry,
-	}); err != nil {
-		t.Fatalf("SaveRuntimeToken() error = %v", err)
-	}
-
-	tokenRecord, err := store.GetRuntimeToken(ctx, "run-1")
-	if err != nil {
-		t.Fatalf("GetRuntimeToken() error = %v", err)
-	}
-	if tokenRecord.Token != "token-1" {
-		t.Fatalf("runtime token = %q, want %q", tokenRecord.Token, "token-1")
-	}
-
-	if err := store.DeleteRuntimeToken(ctx, "run-1"); err != nil {
-		t.Fatalf("DeleteRuntimeToken() error = %v", err)
-	}
-	if _, err := store.GetRuntimeToken(ctx, "run-1"); err != ErrNotFound {
-		t.Fatalf("GetRuntimeToken() after delete error = %v, want %v", err, ErrNotFound)
-	}
-}
-
 // ======================================================================================
 // Failure record roundtrip (split from TestSQLiteStorePersistsPairingsAndRuntimes)
 // ======================================================================================
@@ -567,79 +533,6 @@ func TestAppendInboundDiagnostic(t *testing.T) {
 // Existing focused tests — kept as-is or with minor fixes
 // =======================================================
 
-// TestMarkSessionsFailedByRuntime verifies marking all sessions for a given runtime as failed.
-// TestDeleteExpiredRuntimeTokens verifies deleting only runtime tokens whose expires_at is before the cutoff.
-func TestDeleteExpiredRuntimeTokens(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "expired_tokens.db"))
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	defer store.Close()
-	ctx := context.Background()
-
-	if err := store.SaveRuntimeToken(ctx, RuntimeTokenRecord{
-		RuntimeID: "run-expired",
-		Token:     "token-expired",
-		ExpiresAt: time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC),
-	}); err != nil {
-		t.Fatalf("SaveRuntimeToken(expired) error = %v", err)
-	}
-
-	if err := store.SaveRuntimeToken(ctx, RuntimeTokenRecord{
-		RuntimeID: "run-future",
-		Token:     "token-future",
-		ExpiresAt: time.Date(2026, 3, 25, 12, 0, 0, 0, time.UTC),
-	}); err != nil {
-		t.Fatalf("SaveRuntimeToken(future) error = %v", err)
-	}
-
-	now := time.Date(2026, 3, 25, 11, 0, 0, 0, time.UTC)
-	if err := store.DeleteExpiredRuntimeTokens(ctx, now); err != nil {
-		t.Fatalf("DeleteExpiredRuntimeTokens() error = %v", err)
-	}
-
-	if _, err := store.GetRuntimeToken(ctx, "run-expired"); err != ErrNotFound {
-		t.Fatalf("GetRuntimeToken(expired) error = %v, want %v", err, ErrNotFound)
-	}
-
-	record, err := store.GetRuntimeToken(ctx, "run-future")
-	if err != nil {
-		t.Fatalf("GetRuntimeToken(future) error = %v", err)
-	}
-	if record.Token != "token-future" {
-		t.Fatalf("token = %q, want %q", record.Token, "token-future")
-	}
-}
-
-// TestDeleteAllRuntimeTokens verifies deleting all runtime tokens regardless of expiry.
-func TestDeleteAllRuntimeTokens(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "delete_all_tokens.db"))
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	defer store.Close()
-	ctx := context.Background()
-
-	for _, rec := range []RuntimeTokenRecord{
-		{RuntimeID: "run-1", Token: "token-1", ExpiresAt: time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)},
-		{RuntimeID: "run-2", Token: "token-2", ExpiresAt: time.Date(2026, 3, 25, 12, 0, 0, 0, time.UTC)},
-	} {
-		if err := store.SaveRuntimeToken(ctx, rec); err != nil {
-			t.Fatalf("SaveRuntimeToken(%s) error = %v", rec.RuntimeID, err)
-		}
-	}
-
-	if err := store.DeleteAllRuntimeTokens(ctx); err != nil {
-		t.Fatalf("DeleteAllRuntimeTokens() error = %v", err)
-	}
-
-	for _, id := range []string{"run-1", "run-2"} {
-		if _, err := store.GetRuntimeToken(ctx, id); err != ErrNotFound {
-			t.Fatalf("GetRuntimeToken(%s) error = %v, want %v", id, err, ErrNotFound)
-		}
-	}
-}
-
 // TestGetGatewaySettingsNotFound verifies ErrNotFound when no gateway settings exist.
 func TestGetGatewaySettingsNotFound(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "settings_notfound.db"))
@@ -861,22 +754,6 @@ func TestGetGatewaySettingsReturnsErrorWhenDBIsClosed(t *testing.T) {
 	}
 }
 
-// TestGetRuntimeTokenReturnsErrorWhenDBIsClosed verifies GetRuntimeToken returns an error containing "closed" after store is closed.
-func TestGetRuntimeTokenReturnsErrorWhenDBIsClosed(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "token_closed.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	store.Close()
-	_, err = store.GetRuntimeToken(context.Background(), "any")
-	if err == nil {
-		t.Fatal("expected error from closed DB")
-	}
-	if !strings.Contains(err.Error(), "closed") {
-		t.Errorf("error = %v, want error containing 'closed'", err)
-	}
-}
-
 // TestGetAcquiredBinaryReturnsErrorWhenDBIsClosed verifies GetAcquiredBinary returns an error containing "closed" after store is closed.
 func TestGetAcquiredBinaryReturnsErrorWhenDBIsClosed(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "binary_closed.db"))
@@ -942,29 +819,36 @@ func TestMigrateReturnsErrorWhenDBIsClosed(t *testing.T) {
 	}
 }
 
-// ======================================================================
-// Bad-timestamp tests — verify error contains "parse" or similar
-// ======================================================================
-
-// TestGetRuntimeTokenBadTimestamp verifies that a stored bad timestamp returns a parse error from GetRuntimeToken.
-func TestGetRuntimeTokenBadTimestamp(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "token_bad_ts.db"))
+// TestMigrateDropsLegacyRuntimeTokensTable verifies an upgraded database stops
+// carrying the runtime_tokens table the gateway no longer uses.
+func TestMigrateDropsLegacyRuntimeTokensTable(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "legacy_tokens.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer store.Close()
 	ctx := context.Background()
-	if _, err := store.db.ExecContext(ctx, `INSERT INTO runtime_tokens(runtime_id, token, expires_at) VALUES(?,?,?)`, "bad", "tok", "NOT A TIMESTAMP"); err != nil {
-		t.Fatalf("insert: %v", err)
+
+	// Simulate a pre-upgrade database that still has the table.
+	if _, err := store.db.ExecContext(ctx, `CREATE TABLE runtime_tokens (
+		runtime_id TEXT PRIMARY KEY, token TEXT NOT NULL, expires_at TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
 	}
-	_, err = store.GetRuntimeToken(ctx, "bad")
-	if err == nil || err == ErrNotFound {
-		t.Errorf("expected parse error, got %v", err)
+	if err := store.migrate(ctx); err != nil {
+		t.Fatalf("migrate() error = %v", err)
 	}
-	if !strings.Contains(err.Error(), "cannot parse") && !strings.Contains(err.Error(), "parsing time") {
-		t.Errorf("error = %v, want error containing 'cannot parse' or 'parsing time'", err)
+
+	var name string
+	err = store.db.QueryRowContext(ctx,
+		`SELECT name FROM sqlite_master WHERE type='table' AND name='runtime_tokens'`).Scan(&name)
+	if err != sql.ErrNoRows {
+		t.Fatalf("runtime_tokens lookup error = %v (name=%q), want sql.ErrNoRows after migration", err, name)
 	}
 }
+
+// ======================================================================
+// Bad-timestamp tests — verify error contains "parse" or similar
+// ======================================================================
 
 // TestGetAcquiredBinaryBadTimestamp verifies that a stored bad timestamp returns a parse error from GetAcquiredBinary.
 func TestGetAcquiredBinaryBadTimestamp(t *testing.T) {
@@ -1527,12 +1411,12 @@ func TestOpenUpgradesPairedDevicesWithRetiredColumns(t *testing.T) {
 	ctx := context.Background()
 	retiredUntil := time.Date(2026, 4, 25, 10, 0, 0, 0, time.UTC)
 	if err := store.SavePairing(ctx, PairingRecord{
-		DeviceID:       "dev-1",
-		DeviceName:     "Pixel 9",
-		Token:          "sha256:current",
-		ExpiresAt:      retiredUntil.Add(24 * time.Hour),
-		RetiredToken:   "sha256:retired",
-		RetiredUntil:   retiredUntil,
+		DeviceID:     "dev-1",
+		DeviceName:   "Pixel 9",
+		Token:        "sha256:current",
+		ExpiresAt:    retiredUntil.Add(24 * time.Hour),
+		RetiredToken: "sha256:retired",
+		RetiredUntil: retiredUntil,
 	}); err != nil {
 		t.Fatalf("SavePairing() error = %v", err)
 	}

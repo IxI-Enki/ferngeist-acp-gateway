@@ -10,7 +10,7 @@ import (
 // synchronization on Service state, -race flags the Refresh write vs List/Get
 // reads (and write-vs-write). Must be -race-clean.
 func TestConcurrentListGetRefresh(t *testing.T) {
-	svc := NewWithBaseDir(t.TempDir())
+	svc := New(t.TempDir(), nil)
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)

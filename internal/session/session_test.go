@@ -148,7 +148,7 @@ func setupPushTest(t *testing.T) (*RuntimeSession, *mockProcessManager, *recordi
 	t.Cleanup(func() { store.Close() })
 	mockPM := newMockPM()
 	pushSvc := &recordingPushService{}
-	rs := NewRuntimeSession(slog.New(slog.NewTextHandler(io.Discard, nil)), store, mockPM, newMockTokenSvc(), Config{
+	rs := NewRuntimeSession(slog.New(slog.NewTextHandler(io.Discard, nil)), store, mockPM, NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil))), Config{
 		MaxDisconnected: 5 * time.Minute,
 		GatewayID:       "gw-1",
 		PushSvc:         pushSvc,
@@ -264,43 +264,7 @@ type nopWriteCloser struct{}
 func (n nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
 func (n nopWriteCloser) Close() error                { return nil }
 
-type mockTokenService struct {
-	mu     sync.Mutex
-	tokens map[string]tokenClaimTest
-}
-
-type tokenClaimTest struct {
-	sessionID string
-	deviceID  string
-	valid     bool
-}
-
-func newMockTokenSvc() *mockTokenService {
-	return &mockTokenService{
-		tokens: make(map[string]tokenClaimTest),
-	}
-}
-
-func (m *mockTokenService) Mint(sessionID, deviceID string, ttl time.Duration) (string, error) {
-	token := generateID()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.tokens[token] = tokenClaimTest{sessionID: sessionID, deviceID: deviceID, valid: true}
-	return token, nil
-}
-
-func (m *mockTokenService) Validate(token string) (string, string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	claim, ok := m.tokens[token]
-	if !ok || !claim.valid {
-		return "", "", ErrAttachTokenInvalid
-	}
-	delete(m.tokens, token)
-	return claim.sessionID, claim.deviceID, nil
-}
-
-func setupTest(t *testing.T, overrides Config) (*RuntimeSession, *storage.SQLiteStore, *mockProcessManager, *mockTokenService, context.Context) {
+func setupTest(t *testing.T, overrides Config) (*RuntimeSession, *storage.SQLiteStore, *mockProcessManager, *TokenService, context.Context) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	store, err := storage.Open(dbPath)
@@ -309,7 +273,7 @@ func setupTest(t *testing.T, overrides Config) (*RuntimeSession, *storage.SQLite
 	}
 	ctx := context.Background()
 	mockPM := newMockPM()
-	mockToken := newMockTokenSvc()
+	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	cfg := Config{
 		MaxDisconnected: 5 * time.Minute,
@@ -325,8 +289,8 @@ func setupTest(t *testing.T, overrides Config) (*RuntimeSession, *storage.SQLite
 		cfg.ReaperInterval = overrides.ReaperInterval
 	}
 
-	rs := NewRuntimeSession(slog.New(slog.NewTextHandler(io.Discard, nil)), store, mockPM, mockToken, cfg)
-	return rs, store, mockPM, mockToken, ctx
+	rs := NewRuntimeSession(slog.New(slog.NewTextHandler(io.Discard, nil)), store, mockPM, tokenSvc, cfg)
+	return rs, store, mockPM, tokenSvc, ctx
 }
 
 // --- Session lifecycle ---
@@ -556,7 +520,7 @@ func TestAttachClientInvalidToken(t *testing.T) {
 }
 
 func TestAttachClientSecondAttachTakesOver(t *testing.T) {
-	rs, store, _, mockTokenSvc, ctx := setupTest(t, Config{})
+	rs, store, _, tokenSvc, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
@@ -572,7 +536,7 @@ func TestAttachClientSecondAttachTakesOver(t *testing.T) {
 		t.Fatalf("first AttachClient: %v", err)
 	}
 
-	token2, _ := mockTokenSvc.Mint(sess.ID, "dev-cc", 5*time.Minute)
+	token2, _ := tokenSvc.Mint(sess.ID, "dev-cc", 5*time.Minute)
 	_, gen2, err := rs.AttachClient(ctx, sess.ID, token2)
 	if err != nil {
 		t.Fatalf("second AttachClient should take over, got: %v", err)
@@ -599,11 +563,11 @@ func TestAttachClientSecondAttachTakesOver(t *testing.T) {
 }
 
 func TestAttachClientSessionNotFound(t *testing.T) {
-	rs, store, _, mockTokenSvc, ctx := setupTest(t, Config{})
+	rs, store, _, tokenSvc, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	token, _ := mockTokenSvc.Mint("nonexistent-session", "dev-x", 5*time.Minute)
+	token, _ := tokenSvc.Mint("nonexistent-session", "dev-x", 5*time.Minute)
 	_, _, err := rs.AttachClient(ctx, "nonexistent-session", token)
 	if err != ErrSessionNotFound {
 		t.Errorf("expected ErrSessionNotFound, got %v", err)
@@ -1238,11 +1202,11 @@ func TestResumeStoreFallbackNotFound(t *testing.T) {
 }
 
 func TestAttachClientStoreFallbackNotFound(t *testing.T) {
-	rs, store, _, mockTokenSvc, ctx := setupTest(t, Config{})
+	rs, store, _, tokenSvc, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	token, _ := mockTokenSvc.Mint("ac-fallback-notfound", "dev-x", 5*time.Minute)
+	token, _ := tokenSvc.Mint("ac-fallback-notfound", "dev-x", 5*time.Minute)
 	_, _, err := rs.AttachClient(ctx, "ac-fallback-notfound", token)
 	if err != ErrSessionNotFound {
 		t.Errorf("expected ErrSessionNotFound, got %v", err)
@@ -1400,8 +1364,8 @@ func TestReaperLoopShutdown(t *testing.T) {
 	defer store.Close()
 
 	mockPM := newMockPM()
-	mockTokenSvc := newMockTokenSvc()
-	rs := NewRuntimeSession(slog.New(slog.NewTextHandler(io.Discard, nil)), store, mockPM, mockTokenSvc, Config{})
+	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rs := NewRuntimeSession(slog.New(slog.NewTextHandler(io.Discard, nil)), store, mockPM, tokenSvc, Config{})
 
 	if rs.cancelReaper == nil {
 		t.Fatal("expected cancelReaper to be non-nil after NewRuntimeSession")
@@ -1758,8 +1722,8 @@ func TestCreateStoreError(t *testing.T) {
 	store.Close()
 
 	mockPM := newMockPM()
-	mockTokenSvc := newMockTokenSvc()
-	rs := NewRuntimeSession(slog.New(slog.NewTextHandler(io.Discard, nil)), store, mockPM, mockTokenSvc, Config{})
+	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rs := NewRuntimeSession(slog.New(slog.NewTextHandler(io.Discard, nil)), store, mockPM, tokenSvc, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
@@ -1790,11 +1754,11 @@ func TestResumeInMemoryStatusClosing(t *testing.T) {
 }
 
 func TestAttachClientTokenSessionIDMismatch(t *testing.T) {
-	rs, store, _, mockTokenSvc, ctx := setupTest(t, Config{})
+	rs, store, _, tokenSvc, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	token, _ := mockTokenSvc.Mint("session-a", "dev-x", 5*time.Minute)
+	token, _ := tokenSvc.Mint("session-a", "dev-x", 5*time.Minute)
 	_, _, err := rs.AttachClient(ctx, "session-b", token)
 	if err != ErrAttachTokenInvalid {
 		t.Errorf("expected ErrAttachTokenInvalid, got %v", err)
@@ -1802,7 +1766,7 @@ func TestAttachClientTokenSessionIDMismatch(t *testing.T) {
 }
 
 func TestAttachClientInMemoryDeviceMismatch(t *testing.T) {
-	rs, store, _, mockTokenSvc, ctx := setupTest(t, Config{})
+	rs, store, _, tokenSvc, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
@@ -1811,7 +1775,7 @@ func TestAttachClientInMemoryDeviceMismatch(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	token, _ := mockTokenSvc.Mint(sess.ID, "dev-wrong", 5*time.Minute)
+	token, _ := tokenSvc.Mint(sess.ID, "dev-wrong", 5*time.Minute)
 	_, _, err = rs.AttachClient(ctx, sess.ID, token)
 	if err != ErrDeviceMismatch {
 		t.Errorf("expected ErrDeviceMismatch, got %v", err)
@@ -1819,7 +1783,7 @@ func TestAttachClientInMemoryDeviceMismatch(t *testing.T) {
 }
 
 func TestAttachClientInMemoryStatusFailed(t *testing.T) {
-	rs, store, _, mockTokenSvc, ctx := setupTest(t, Config{})
+	rs, store, _, tokenSvc, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
@@ -1832,7 +1796,7 @@ func TestAttachClientInMemoryStatusFailed(t *testing.T) {
 	sess.Status = StatusFailed
 	sess.mu.Unlock()
 
-	token, _ := mockTokenSvc.Mint(sess.ID, "dev-ac-fail", 5*time.Minute)
+	token, _ := tokenSvc.Mint(sess.ID, "dev-ac-fail", 5*time.Minute)
 	_, _, err = rs.AttachClient(ctx, sess.ID, token)
 	if err != ErrSessionNotActive {
 		t.Errorf("expected ErrSessionNotActive, got %v", err)
@@ -1851,7 +1815,7 @@ func TestReaperLoopDefensiveDefaults(t *testing.T) {
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:    store,
 		pm:       newMockPM(),
-		tokenSvc: newMockTokenSvc(),
+		tokenSvc: NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil))),
 		cfg:      Config{},
 		sessions: make(map[string]*Session),
 		inbound:  newInboundWriter(store),
@@ -2071,7 +2035,7 @@ func TestCreateEmptyDeviceID(t *testing.T) {
 }
 
 func TestAttachClientOnDisconnectedSession(t *testing.T) {
-	rs, store, _, mockTokenSvc, ctx := setupTest(t, Config{})
+	rs, store, _, tokenSvc, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
@@ -2089,7 +2053,7 @@ func TestAttachClientOnDisconnectedSession(t *testing.T) {
 		t.Fatalf("DetachClient: %v", err)
 	}
 
-	newToken, _ := mockTokenSvc.Mint(sess.ID, "dev-att-disc", 5*time.Minute)
+	newToken, _ := tokenSvc.Mint(sess.ID, "dev-att-disc", 5*time.Minute)
 	_, _, err = rs.AttachClient(ctx, sess.ID, newToken)
 	if err != nil {
 		t.Fatalf("AttachClient on disconnected session: %v", err)

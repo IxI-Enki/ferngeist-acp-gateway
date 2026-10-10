@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
@@ -19,7 +18,7 @@ import (
 // index, and exit callback) must leave memory after the retention window,
 // while a fresh failure is retained for diagnostics.
 func TestFailedRuntimesPrunedAfterRetention(t *testing.T) {
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	now := time.Now().UTC()
 	supervisor.now = func() time.Time { return now }
 
@@ -63,31 +62,10 @@ func TestFailedRuntimesPrunedAfterRetention(t *testing.T) {
 	}
 }
 
-// TestCleanupFailedLaunchLeavesNoOrphanLogs fails while cleanupFailedLaunch
-// deletes the runtime and then appends: the append re-creates s.logs[id] with
-// no runtime attached, and prune (which iterates runtimes) never collects it.
-func TestCleanupFailedLaunchLeavesNoOrphanLogs(t *testing.T) {
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	supervisor.runtimes["rt-bad-launch"] = Runtime{
-		ID: "rt-bad-launch", AgentID: "mock-acp", AgentName: "Mock",
-		Status: StatusStarting, CreatedAt: time.Now().UTC(),
-	}
-	supervisor.logs["rt-bad-launch"] = []LogEntry{{Timestamp: time.Now().UTC(), Stream: "gateway", Message: "starting"}}
-
-	supervisor.cleanupFailedLaunch("rt-bad-launch", "mock-acp", context.DeadlineExceeded)
-
-	if _, ok := supervisor.runtimes["rt-bad-launch"]; ok {
-		t.Fatal("runtimes[rt-bad-launch] survives cleanup, want removed")
-	}
-	if entries, ok := supervisor.logs["rt-bad-launch"]; ok {
-		t.Fatalf("logs[rt-bad-launch] = %d orphaned entries after cleanup, want none", len(entries))
-	}
-}
-
 // TestShutdownClearsLogRings fails while Shutdown drops runtimes/processes
 // but leaves every 200-entry log ring (and exit callback) behind.
 func TestShutdownClearsLogRings(t *testing.T) {
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	supervisor.runtimes["rt-1"] = Runtime{
 		ID: "rt-1", AgentID: "mock-acp", AgentName: "Mock",
 		Status: StatusRunning, CreatedAt: time.Now().UTC(),
@@ -106,78 +84,6 @@ func TestShutdownClearsLogRings(t *testing.T) {
 	}
 	if len(supervisor.onExitCallbacks) != 0 {
 		t.Fatalf("onExitCallbacks = %d entries after Shutdown, want 0", len(supervisor.onExitCallbacks))
-	}
-}
-
-// TestLaunchReadinessFailureConcurrentReaders hammers the readiness-failure
-// path (which sets handle.stopping) while readers traverse supervisor state.
-// The stopping write must hold s.mu like every other access: an unlocked
-// write races the watcher goroutine's read in handleProcessExit and can
-// misclassify the intentional kill as a crash (spurious restart + circuit
-// trip). Run with -race in CI; functionally it asserts every launch fails
-// cleanly with no live process left behind.
-func TestLaunchReadinessFailureConcurrentReaders(t *testing.T) {
-	baseDir := t.TempDir()
-	binDir := filepath.Join(baseDir, "bin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll() error = %v", err)
-	}
-	buildMockStdioAgent(t, filepath.Join(binDir, mockAgentBinaryName()))
-
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
-	t.Cleanup(func() { _ = supervisor.Shutdown(context.Background()) })
-
-	agent := catalog.Agent{
-		ID: "mock-acp", DisplayName: "Mock ACP", Detected: true,
-		Security: catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode: "process", Command: filepath.Join("bin", mockAgentBinaryName()),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "bogus-mode-always-fails"},
-			Restart:   catalog.RestartConfig{Mode: "on_failure", MaxRetries: 3},
-		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
-	}
-
-	var wg sync.WaitGroup
-	stop := make(chan struct{})
-	for i := 0; i < 4; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-					_ = supervisor.List()
-					_ = supervisor.Summary()
-				}
-			}
-		}()
-	}
-	for i := 0; i < 10; i++ {
-		if _, err := supervisor.Start(agent); err == nil {
-			close(stop)
-			wg.Wait()
-			t.Fatalf("launch %d succeeded with bogus readiness mode, want failure", i)
-		}
-	}
-	close(stop)
-	wg.Wait()
-
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		supervisor.mu.Lock()
-		n := len(supervisor.processes)
-		supervisor.mu.Unlock()
-		if n == 0 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("processes = %d after readiness failures settled, want 0", n)
-		}
-		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -216,7 +122,7 @@ func main() {
 		t.Fatalf("go build sleeper agent error = %v", err)
 	}
 
-	supervisor := NewSupervisorWithBaseDir(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil)
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	// Whatever the outcome, leave no process behind (covers the pre-fix
 	// failure mode where the restart resurrects a live runtime).
 	t.Cleanup(func() { _ = supervisor.Shutdown(context.Background()) })
@@ -226,11 +132,8 @@ func main() {
 		Security: catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
 			Mode: "process", Command: filepath.Join("bin", namedBinary("shutdown-sleeper-agent")),
-			Transport: "stdio",
-			Readiness: catalog.ReadinessConfig{Mode: "immediate"},
-			Restart:   catalog.RestartConfig{Mode: "on_failure", MaxRetries: 5, BackoffSeconds: 2},
+			Restart: catalog.RestartConfig{Mode: "on_failure", MaxRetries: 5, BackoffSeconds: 2},
 		},
-		HealthCheck: catalog.HealthCheckConfig{Mode: "none"},
 	}
 	pending := Runtime{
 		ID: "rt-pending-restart", AgentID: agent.ID, AgentName: agent.DisplayName,

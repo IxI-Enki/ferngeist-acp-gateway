@@ -76,7 +76,6 @@ This helps avoid exposing logs and runtime details unless you explicitly want th
 
 - Device credentials are hashed before being stored.
 - Pairing data and runtime state are stored in SQLite.
-- Runtime bearer tokens are short-lived.
 
 ## Operational notes
 
