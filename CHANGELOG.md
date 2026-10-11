@@ -1,3 +1,24 @@
+## [1.0.0] - 2026-10-11
+
+### 🚀 Features
+
+- *(session)* [**breaking**] Single-parse pump pipeline; signal resume with _ferngeist/resumed
+
+### 🐛 Bug Fixes
+
+- Address rearchitecture review findings
+
+### 💼 Other
+
+- Update ferngeist-gateway formula to v0.13.0
+
+### 🚜 Refactor
+
+- Delete dead code (runtime tokens, legacy lease, one-value settings)
+- *(remote)* Merge remoteaccess into remote, move retry loop into Access
+- *(api)* Move workspace/worktree logic to internal/workspace, share custom-agent handlers, add Deps
+- *(storage)* Split sqlite.go by area; numbered user_version migrations
+- *(runtime,session)* [**breaking**] Connecting starts the agent; drop lease, exit callbacks, ProcessManager
 ## [0.13.0] - 2026-10-10
 
 ### 🚀 Features
