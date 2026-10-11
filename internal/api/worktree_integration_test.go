@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/arafatamim/ferngeist-acp-gateway/internal/workspace"
 	"github.com/coder/acp-go-sdk"
 )
 
@@ -100,7 +101,7 @@ func TestWorktrees_EndToEnd(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
 		t.Fatal(err)
 	}
-	got := map[string]gitChangedFile{}
+	got := map[string]workspace.ChangedFile{}
 	for _, f := range st.Changed {
 		got[f.Path] = f
 	}

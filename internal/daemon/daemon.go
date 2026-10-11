@@ -193,19 +193,19 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 	}
 	defer discoverySvc.Stop()
 
-	server := api.NewServer(
-		cfg,
-		build,
-		logger,
-		catalogSvc,
-		runtimeSvc,
-		pairingSvc,
-		discoverySvc,
-		logSvc,
-		registryClient,
-		store,
-		sessionSvc,
-	)
+	server := api.NewServer(api.Deps{
+		Config:    cfg,
+		Build:     build,
+		Logger:    logger,
+		Catalog:   catalogSvc,
+		Runtime:   runtimeSvc,
+		Pairing:   pairingSvc,
+		Discovery: discoverySvc,
+		Logs:      logSvc,
+		Registry:  registryClient,
+		Store:     store,
+		Session:   sessionSvc,
+	})
 	if access != nil {
 		server.SetRemoteSetup(access.Snapshot)
 		if cfg.TailscaleAuthKey == "" {

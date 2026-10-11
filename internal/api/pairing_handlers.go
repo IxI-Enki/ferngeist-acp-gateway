@@ -208,20 +208,8 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 
 	status := s.statusSnapshot(true)
 	response := adminStatusResponse{
-		Name:              status.Name,
-		Version:           status.Version,
-		Build:             status.Build,
-		ProtocolVersion:   status.ProtocolVersion,
-		StartedAt:         status.StartedAt,
-		UptimeSeconds:     status.UptimeSeconds,
-		ListenAddr:        status.ListenAddr,
-		AdminListenAddr:   s.cfg.AdminListenAddr,
-		LANEnabled:        status.LANEnabled,
-		PairedDeviceCount: status.PairedDeviceCount,
-		Discovery:         status.Discovery,
-		Remote:            status.Remote,
-		Registry:          status.Registry,
-		RuntimeCounts:     status.RuntimeCounts,
+		statusResponse:  status,
+		AdminListenAddr: s.cfg.AdminListenAddr,
 	}
 	if target, err := s.pairingTarget(); err != nil {
 		response.PairingTarget = adminPairingTargetInfo{Reachable: false, Error: err.Error()}

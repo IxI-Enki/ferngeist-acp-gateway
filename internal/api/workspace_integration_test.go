@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/arafatamim/ferngeist-acp-gateway/internal/workspace"
 	"github.com/coder/acp-go-sdk"
 )
 
@@ -203,7 +204,7 @@ func TestWorkspaceEndpoints_EndToEnd(t *testing.T) {
 		t.Fatalf("branch = %q, want non-empty", gs.Branch)
 	}
 	paths := map[string]bool{}
-	byPath := map[string]gitChangedFile{}
+	byPath := map[string]workspace.ChangedFile{}
 	for _, f := range gs.Changed {
 		paths[f.Path] = true
 		byPath[f.Path] = f

@@ -1,20 +1,14 @@
 package api
 
 import (
-	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
-	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/pairing"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
+	"github.com/arafatamim/ferngeist-acp-gateway/internal/workspace"
 )
 
 // worktreeResponse is one gateway-managed git worktree. Path is what the
@@ -42,54 +36,6 @@ func toWorktreeResponse(r storage.WorktreeRecord) worktreeResponse {
 	return worktreeResponse{ID: r.ID, Repo: r.Repo, Path: r.Path, Branch: r.Branch, BaseCommit: r.BaseCommit, CreatedAt: r.CreatedAt}
 }
 
-// worktreeDirName turns a branch name into a single safe folder name
-// ("feat/x" -> "feat-x"), so worktrees are easy to find under <repo>/.worktrees.
-func worktreeDirName(branch string) string {
-	return strings.Map(func(r rune) rune {
-		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-' {
-			return r
-		}
-		return '-'
-	}, branch)
-}
-
-// excludeWorktreesDir adds /.worktrees/ to the repo's local .git/info/exclude
-// (never the committed .gitignore) so the main checkout's git status does not
-// list the worktrees as untracked.
-func excludeWorktreesDir(ctx context.Context, top string) error {
-	exclude, err := runGit(ctx, top, "rev-parse", "--git-path", "info/exclude")
-	if err != nil {
-		return err
-	}
-	exclude = strings.TrimSpace(exclude)
-	if !filepath.IsAbs(exclude) {
-		exclude = filepath.Join(top, exclude)
-	}
-	data, err := os.ReadFile(exclude)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.TrimSpace(line) == "/.worktrees/" {
-			return nil
-		}
-	}
-	if err := os.MkdirAll(filepath.Dir(exclude), 0o755); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(exclude, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	prefix := ""
-	if len(data) > 0 && !strings.HasSuffix(string(data), "\n") {
-		prefix = "\n"
-	}
-	_, err = f.WriteString(prefix + "/.worktrees/\n")
-	return err
-}
-
 // POST /v1/worktrees {repo, base?, branch?}
 // Creates a new branch at base (default: the repo's HEAD) checked out in a
 // fresh worktree at <repo>/.worktrees/<branch>, where it is easy to find
@@ -104,78 +50,9 @@ func (s *Server) handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	repo := strings.TrimSpace(req.Repo)
-	if !filepath.IsAbs(repo) {
-		writeError(w, http.StatusBadRequest, "repo must be an absolute path")
-		return
-	}
-	ctx := r.Context()
-	top, err := runGit(ctx, repo, "rev-parse", "--show-toplevel")
+	rec, err := s.workspaceSvc.Create(r.Context(), workspace.CreateRequest{Repo: req.Repo, Base: req.Base, Branch: req.Branch})
 	if err != nil {
-		writeError(w, http.StatusUnprocessableEntity, err.Error())
-		return
-	}
-	top = filepath.Clean(strings.TrimSpace(top))
-	base := strings.TrimSpace(req.Base)
-	if base == "" {
-		base = "HEAD"
-	}
-	// "--end-of-options" stops a base like "--foo" being read as a flag.
-	baseCommit, err := runGit(ctx, top, "rev-parse", "--verify", "--quiet", "--end-of-options", base+"^{commit}")
-	if err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "unknown base: "+base)
-		return
-	}
-	baseCommit = strings.TrimSpace(baseCommit)
-
-	idBytes := make([]byte, 4)
-	if _, err := rand.Read(idBytes); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to generate id")
-		return
-	}
-	id := hex.EncodeToString(idBytes)
-	branch := strings.TrimSpace(req.Branch)
-	if branch == "" {
-		branch = "ferngeist/" + id
-	}
-	if strings.HasPrefix(branch, "-") {
-		writeError(w, http.StatusBadRequest, "invalid branch name")
-		return
-	}
-	if _, err := runGit(ctx, top, "check-ref-format", "--branch", branch); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid branch name")
-		return
-	}
-	if _, err := runGit(ctx, top, "show-ref", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
-		writeError(w, http.StatusConflict, "branch already exists: "+branch)
-		return
-	}
-
-	root := filepath.Join(top, ".worktrees")
-	path := filepath.Join(root, worktreeDirName(branch))
-	if !subpathOf(path, root) || path == root {
-		writeError(w, http.StatusBadRequest, "invalid branch name")
-		return
-	}
-	if _, err := os.Stat(path); err == nil {
-		writeError(w, http.StatusConflict, "worktree folder already exists: "+path)
-		return
-	}
-	if err := excludeWorktreesDir(ctx, top); err != nil {
-		s.logger.Warn("exclude .worktrees", "repo", top, "error", err)
-	}
-	// ponytail: bounded by runGit's 15s timeout; a huge checkout needs an
-	// async create (202 + poll) if that ever bites.
-	if _, err := runGit(ctx, top, "worktree", "add", "-b", branch, path, baseCommit); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, err.Error())
-		return
-	}
-	rec := storage.WorktreeRecord{ID: id, Repo: top, Path: path, Branch: branch, BaseCommit: baseCommit, CreatedAt: s.now()}
-	if err := s.store.SaveWorktree(ctx, rec); err != nil {
-		s.logger.Error("save worktree", "path", path, "error", err)
-		_, _ = runGit(context.Background(), top, "worktree", "remove", "--force", path)
-		_, _ = runGit(context.Background(), top, "branch", "-D", branch)
-		writeError(w, http.StatusInternalServerError, "failed to save worktree")
+		writeWorkspaceError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toWorktreeResponse(rec))
@@ -189,30 +66,16 @@ func (s *Server) handleWorktreeList(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireGatewayScope(w, r, pairing.ScopeRead); !ok {
 		return
 	}
-	ctx := r.Context()
-	records, err := s.store.ListWorktrees(ctx)
+	statuses, err := s.workspaceSvc.List(r.Context())
 	if err != nil {
-		s.logger.Error("list worktrees", "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to list worktrees")
+		writeWorkspaceError(w, err)
 		return
 	}
-	out := make([]worktreeResponse, 0, len(records))
-	for _, rec := range records {
-		if _, err := os.Stat(rec.Path); errors.Is(err, os.ErrNotExist) {
-			_, _ = runGit(ctx, rec.Repo, "worktree", "prune")
-			_ = s.store.DeleteWorktree(ctx, rec.ID)
-			continue
-		}
-		resp := toWorktreeResponse(rec)
-		if n, err := runGit(ctx, rec.Path, "rev-list", "--count", rec.BaseCommit+"..HEAD"); err == nil {
-			if ahead, err := strconv.Atoi(strings.TrimSpace(n)); err == nil {
-				resp.Ahead = &ahead
-			}
-		}
-		if st, err := runGit(ctx, rec.Path, "status", "--porcelain"); err == nil {
-			dirty := strings.TrimSpace(st) != ""
-			resp.Dirty = &dirty
-		}
+	out := make([]worktreeResponse, 0, len(statuses))
+	for _, status := range statuses {
+		resp := toWorktreeResponse(status.WorktreeRecord)
+		resp.Ahead = status.Ahead
+		resp.Dirty = status.Dirty
 		out = append(out, resp)
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -226,81 +89,22 @@ func (s *Server) handleWorktreeDelete(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireGatewayScope(w, r, pairing.ScopeControl); !ok {
 		return
 	}
-	ctx := r.Context()
-	rec, ok := s.findWorktree(ctx, func(rec storage.WorktreeRecord) bool { return rec.ID == r.PathValue("worktreeId") })
-	if !ok {
-		writeError(w, http.StatusNotFound, "unknown worktree")
+	id := r.PathValue("worktreeId")
+	branchDeleted, err := s.workspaceSvc.Delete(r.Context(), id, r.URL.Query().Get("force") == "true")
+	if err != nil {
+		writeWorkspaceError(w, err)
 		return
 	}
-	if _, err := os.Stat(rec.Path); err == nil {
-		// The dirty check is ours rather than git's: git deregisters a worktree even
-		// when it fails to delete the folder (on Windows, a process still holding it
-		// as cwd), so a refused `git worktree remove` could not be told apart from a
-		// half-done one, and a retry would only report "is not a working tree".
-		// A leftover folder without its .git file has nothing git can check.
-		if r.URL.Query().Get("force") != "true" {
-			if _, err := os.Stat(filepath.Join(rec.Path, ".git")); err == nil {
-				if st, err := runGit(ctx, rec.Path, "status", "--porcelain"); err == nil && strings.TrimSpace(st) != "" {
-					writeError(w, http.StatusConflict, "worktree has uncommitted changes")
-					return
-				}
-			}
-		}
-		_, _ = runGit(ctx, rec.Repo, "worktree", "remove", "--force", rec.Path)
-		if err := removeAllRetrying(rec.Path); err != nil {
-			s.logger.Error("delete worktree folder", "path", rec.Path, "error", err)
-			writeError(w, http.StatusInternalServerError, "worktree folder is still in use; close its chat and try again")
-			return
-		}
-	}
-	_, _ = runGit(ctx, rec.Repo, "worktree", "prune")
-	_, branchErr := runGit(ctx, rec.Repo, "branch", "-d", rec.Branch)
-	if err := s.store.DeleteWorktree(ctx, rec.ID); err != nil && !errors.Is(err, storage.ErrNotFound) {
-		s.logger.Error("delete worktree record", "id", rec.ID, "error", err)
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"deleted": rec.ID, "branchDeleted": branchErr == nil})
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": id, "branchDeleted": branchDeleted})
 }
 
-// removeAllRetrying deletes dir, retrying briefly: on Windows a just-closed
-// agent process can hold the folder for a moment after it exits.
-// ponytail: fixed ~2s budget; make it configurable if slow agents need longer.
-func removeAllRetrying(dir string) error {
-	var err error
-	for range 10 {
-		if err = os.RemoveAll(dir); err == nil {
-			return nil
-		}
-		time.Sleep(200 * time.Millisecond)
+// writeWorkspaceError maps a workspace service error to the HTTP status it
+// carries, falling back to 500 for anything untyped.
+func writeWorkspaceError(w http.ResponseWriter, err error) {
+	var workspaceError workspace.Error
+	if errors.As(err, &workspaceError) {
+		writeError(w, workspaceError.StatusCode(), workspaceError.Error())
+		return
 	}
-	return err
-}
-
-// findWorktree returns the first managed worktree matching match.
-func (s *Server) findWorktree(ctx context.Context, match func(storage.WorktreeRecord) bool) (storage.WorktreeRecord, bool) {
-	if s.store == nil {
-		return storage.WorktreeRecord{}, false
-	}
-	records, err := s.store.ListWorktrees(ctx)
-	if err != nil {
-		return storage.WorktreeRecord{}, false
-	}
-	for _, rec := range records {
-		if match(rec) {
-			return rec, true
-		}
-	}
-	return storage.WorktreeRecord{}, false
-}
-
-// workspaceBaseRef is the commit the workspace git endpoints compare against:
-// a managed worktree's base commit (so the agent's commits stay visible in
-// the review), otherwise HEAD.
-// ponytail: fixed base commit; after rebasing the branch onto a newer base
-// the diff also shows the base's new commits. Use merge-base with the
-// original base ref if that matters.
-func (s *Server) workspaceBaseRef(ctx context.Context, cwd string) string {
-	if rec, ok := s.findWorktree(ctx, func(rec storage.WorktreeRecord) bool { return subpathOf(cwd, rec.Path) }); ok {
-		return rec.BaseCommit
-	}
-	return "HEAD"
+	writeError(w, http.StatusInternalServerError, "workspace operation failed")
 }

@@ -99,19 +99,15 @@ func newTestCustomAgentClient(t *testing.T) *Client {
 		return out
 	})
 
-	server := api.NewServer(
-		config.Config{ListenAddr: "127.0.0.1:0"},
-		api.BuildInfo{},
-		logger,
-		catalogSvc,
-		runtime.NewSupervisor(logger, baseDir, store, nil),
-		pairing.NewService(logger, store),
-		discovery.New(logger),
-		nil,
-		nil,
-		store,
-		nil,
-	)
+	server := api.NewServer(api.Deps{
+		Config:    config.Config{ListenAddr: "127.0.0.1:0"},
+		Logger:    logger,
+		Catalog:   catalogSvc,
+		Runtime:   runtime.NewSupervisor(logger, baseDir, store, nil),
+		Pairing:   pairing.NewService(logger, store),
+		Discovery: discovery.New(logger),
+		Store:     store,
+	})
 	adminServer := httptest.NewServer(server.AdminHandler())
 	t.Cleanup(adminServer.Close)
 

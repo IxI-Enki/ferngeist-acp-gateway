@@ -34,6 +34,7 @@ import (
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/runtime"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/session"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
+	"github.com/arafatamim/ferngeist-acp-gateway/internal/workspace"
 )
 
 // Server is the main HTTP server that wires together all gateway subsystems into
@@ -65,6 +66,11 @@ type Server struct {
 	// customagentsSvc is the write policy behind /v1/agents/custom*, shared with
 	// the admin API.
 	customagentsSvc *customagents.Service
+
+	// workspaceSvc owns the worktree and workspace git/filesystem operations.
+	// Its store and clock accessors read the Server fields live, so test
+	// servers that rebind store or now after NewServer keep working.
+	workspaceSvc *workspace.Service
 
 	// remoteSetup, when set, returns the daemon's live remote-access
 	// provisioning state (auth pending, setup blockers) for status snapshots.
@@ -171,25 +177,14 @@ type remoteStatus struct {
 	AuthURL      string `json:"authUrl,omitempty"`
 }
 
-// adminStatusResponse is the comprehensive status returned by the admin endpoint,
-// including pairing target info and active challenge state.
+// adminStatusResponse is the comprehensive status returned by the admin
+// endpoint: the public status plus the admin listener address, pairing target
+// info and active challenge state.
 type adminStatusResponse struct {
-	Name              string                 `json:"name"`
-	Version           string                 `json:"version"`
-	Build             BuildInfo              `json:"build"`
-	ProtocolVersion   string                 `json:"protocolVersion"`
-	StartedAt         time.Time              `json:"startedAt"`
-	UptimeSeconds     int64                  `json:"uptimeSeconds"`
-	ListenAddr        string                 `json:"listenAddr"`
-	AdminListenAddr   string                 `json:"adminListenAddr"`
-	LANEnabled        bool                   `json:"lanEnabled"`
-	PairedDeviceCount int                    `json:"pairedDeviceCount"`
-	Discovery         discovery.Snapshot     `json:"discovery"`
-	Remote            remoteStatus           `json:"remote"`
-	Registry          acpregistry.Status     `json:"registry"`
-	RuntimeCounts     runtimeCounts          `json:"runtimeCounts"`
-	PairingTarget     adminPairingTargetInfo `json:"pairingTarget"`
-	ActivePairing     *adminPairingResponse  `json:"activePairing,omitempty"`
+	statusResponse
+	AdminListenAddr string                 `json:"adminListenAddr"`
+	PairingTarget   adminPairingTargetInfo `json:"pairingTarget"`
+	ActivePairing   *adminPairingResponse  `json:"activePairing,omitempty"`
 }
 
 // adminPairingTargetInfo describes how a mobile client can reach this gateway
@@ -205,42 +200,50 @@ type registryStatusProvider interface {
 	Status() acpregistry.Status
 }
 
+// Deps is the set of configuration and subsystems NewServer wires together.
+type Deps struct {
+	Config    config.Config
+	Build     BuildInfo
+	Logger    *slog.Logger
+	Catalog   *catalog.Service
+	Runtime   *runtime.Supervisor
+	Pairing   *pairing.Service
+	Discovery *discovery.Service
+	Logs      *logging.Service
+	Registry  registryStatusProvider
+	Store     *storage.SQLiteStore
+	Session   *session.RuntimeSession
+}
+
 // NewServer wires the gateway's control plane and ACP bridge into one HTTP
 // server. The API stays intentionally small: a handful of control endpoints and
 // a single ACP WebSocket path.
-func NewServer(
-	cfg config.Config,
-	build BuildInfo,
-	logger *slog.Logger,
-	catalogSvc *catalog.Service,
-	runtimeSvc *runtime.Supervisor,
-	pairingSvc *pairing.Service,
-	discoverySvc *discovery.Service,
-	logSvc *logging.Service,
-	registrySvc registryStatusProvider,
-	store *storage.SQLiteStore,
-	sessionSvc *session.RuntimeSession,
-) *Server {
-	cfg = normalizeSecurityConfig(cfg)
+func NewServer(deps Deps) *Server {
+	cfg := normalizeSecurityConfig(deps.Config)
 	server := &Server{
-		logger:      logger.With("component", "api"),
+		logger:      deps.Logger.With("component", "api"),
 		cfg:         cfg,
-		build:       normalizeBuildInfo(build),
+		build:       normalizeBuildInfo(deps.Build),
 		startedAt:   time.Now().UTC(),
 		now:         func() time.Time { return time.Now().UTC() },
-		catalog:     catalogSvc,
-		runtime:     runtimeSvc,
-		pairing:     pairingSvc,
-		discovery:   discoverySvc,
-		logs:        logSvc,
-		registry:    registrySvc,
+		catalog:     deps.Catalog,
+		runtime:     deps.Runtime,
+		pairing:     deps.Pairing,
+		discovery:   deps.Discovery,
+		logs:        deps.Logs,
+		registry:    deps.Registry,
 		rateLimiter: newPairingRateLimiter(cfg),
 		attempts:    newPairingAttemptTracker(cfg),
 		proofNonces: newProofNonceTracker(),
-		store:       store,
-		sessionSvc:  sessionSvc,
+		store:       deps.Store,
+		sessionSvc:  deps.Session,
 	}
-	server.customagentsSvc = customagents.New(store, catalogSvc, runtimeSvc.List, server.logger)
+	server.customagentsSvc = customagents.New(deps.Store, deps.Catalog, deps.Runtime.List, server.logger)
+	server.workspaceSvc = workspace.New(
+		func() *storage.SQLiteStore { return server.store },
+		server.logger,
+		func() time.Time { return server.now() },
+	)
 
 	mux := http.NewServeMux()
 	adminMux := http.NewServeMux()
@@ -255,9 +258,9 @@ func NewServer(
 	mux.HandleFunc("GET /v1/pair/status/{challengeId}", server.handlePairStatus)
 	mux.HandleFunc("/v1/runtimes", server.handleRuntimes)
 	mux.HandleFunc("GET /v1/runtimes/{runtimeId}/logs", server.handleRuntimeLogs)
-	mux.HandleFunc("POST /v1/agents/custom", server.handleCustomAgentCreate)
-	mux.HandleFunc("PUT /v1/agents/custom/{id}", server.handleCustomAgentUpdate)
-	mux.HandleFunc("DELETE /v1/agents/custom/{id}", server.handleCustomAgentDelete)
+	mux.HandleFunc("POST /v1/agents/custom", server.requireScope(pairing.ScopeControl, server.handleCustomAgentCreate))
+	mux.HandleFunc("PUT /v1/agents/custom/{id}", server.requireScope(pairing.ScopeControl, server.handleCustomAgentUpdate))
+	mux.HandleFunc("DELETE /v1/agents/custom/{id}", server.requireScope(pairing.ScopeControl, server.handleCustomAgentDelete))
 	mux.HandleFunc("POST /v1/agents/{agentId}/start", server.handleAgentStart)
 	mux.HandleFunc("POST /v1/agents/{agentId}/stop", server.handleAgentStop)
 	mux.HandleFunc("POST /v1/runtimes/{runtimeId}/connect", server.handleRuntimeConnect)
@@ -278,9 +281,9 @@ func NewServer(
 	adminMux.HandleFunc("GET /admin/v1/devices", server.handleAdminDevices)
 	adminMux.HandleFunc("DELETE /admin/v1/devices/{deviceId}", server.handleAdminDeviceRevoke)
 	adminMux.HandleFunc("GET /admin/v1/agents", server.handleAdminCustomAgentList)
-	adminMux.HandleFunc("POST /admin/v1/agents/custom", server.handleAdminCustomAgentCreate)
-	adminMux.HandleFunc("PUT /admin/v1/agents/custom/{id}", server.handleAdminCustomAgentUpdate)
-	adminMux.HandleFunc("DELETE /admin/v1/agents/custom/{id}", server.handleAdminCustomAgentDelete)
+	adminMux.HandleFunc("POST /admin/v1/agents/custom", server.handleCustomAgentCreate)
+	adminMux.HandleFunc("PUT /admin/v1/agents/custom/{id}", server.handleCustomAgentUpdate)
+	adminMux.HandleFunc("DELETE /admin/v1/agents/custom/{id}", server.handleCustomAgentDelete)
 
 	adminAddr := strings.TrimSpace(cfg.AdminListenAddr)
 	if adminAddr == "" {

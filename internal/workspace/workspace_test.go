@@ -1,4 +1,4 @@
-package api
+package workspace
 
 import (
 	"context"
@@ -14,7 +14,7 @@ func TestResolveWithinRoot(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "sub"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	got, err := resolveWithinRoot(root, "sub/hello.txt")
+	got, err := ResolveWithinRoot(root, "sub/hello.txt")
 	if err != nil {
 		t.Fatalf("resolve valid: %v", err)
 	}
@@ -22,16 +22,16 @@ func TestResolveWithinRoot(t *testing.T) {
 		t.Fatalf("result %q not under root %q", got, root)
 	}
 
-	if _, err := resolveWithinRoot(root, filepath.Join(root, "..")); err == nil {
+	if _, err := ResolveWithinRoot(root, filepath.Join(root, "..")); err == nil {
 		t.Fatal("absolute path should be rejected")
 	}
-	if _, err := resolveWithinRoot(root, "../outside"); err == nil {
+	if _, err := ResolveWithinRoot(root, "../outside"); err == nil {
 		t.Fatal("traversal should be rejected")
 	}
-	if _, err := resolveWithinRoot(root, "sub/../../outside"); err == nil {
+	if _, err := ResolveWithinRoot(root, "sub/../../outside"); err == nil {
 		t.Fatal("deep traversal should be rejected")
 	}
-	if _, err := resolveWithinRoot(root, ""); err == nil {
+	if _, err := ResolveWithinRoot(root, ""); err == nil {
 		t.Fatal("empty path should be rejected")
 	}
 }
@@ -47,7 +47,7 @@ func TestResolveWithinRootRejectsSymlinkEscape(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := resolveWithinRoot(root, "escape/secret.txt"); err == nil {
+	if _, err := ResolveWithinRoot(root, "escape/secret.txt"); err == nil {
 		t.Fatal("symlink escape should be rejected")
 	}
 }
@@ -58,9 +58,9 @@ func TestParseGitStatus(t *testing.T) {
 		"1 M. N... 100644 100644 100644 f00 000 my file with spaces.go\n" +
 		"2 R. N... 100644 100644 100644 f00 000 R100 README.md\tdocs/x.md\n" +
 		"? my untracked file.txt\n"
-	files := parseGitStatus(out)
+	files := ParseGitStatus(out)
 	if len(files) != 4 {
-		t.Fatalf("parseGitStatus returned %d files, want 4: %+v", len(files), files)
+		t.Fatalf("ParseGitStatus returned %d files, want 4: %+v", len(files), files)
 	}
 	if files[0].Path != "file_a.go" || files[0].Status != "M" {
 		t.Fatalf("files[0] = %+v, want {file_a.go M}", files[0])
@@ -79,21 +79,21 @@ func TestParseGitStatus(t *testing.T) {
 	// worktree status M; the path is a directory-like gitlink and must be
 	// classified as such, not as an ordinary file.
 	out += "1 .M S..U 160000 160000 160000 abc 000 vendor/DiffuEraser\n"
-	files = parseGitStatus(out)
+	files = ParseGitStatus(out)
 	if len(files) != 5 {
-		t.Fatalf("parseGitStatus returned %d files, want 5: %+v", len(files), files)
+		t.Fatalf("ParseGitStatus returned %d files, want 5: %+v", len(files), files)
 	}
 	if f := files[4]; f.Path != "vendor/DiffuEraser" || f.Status != "M" || !f.IsDir {
 		t.Fatalf("files[4] = %+v, want {vendor/DiffuEraser M isDir:true}", f)
 	}
 	// A merge conflict is a `u` record with nine fixed fields before the path.
-	files = parseGitStatus("u UU N... 100644 100644 100644 100644 a b c conflicted file.go\n")
+	files = ParseGitStatus("u UU N... 100644 100644 100644 100644 a b c conflicted file.go\n")
 	if len(files) != 1 || files[0].Path != "conflicted file.go" || files[0].Status != "U" {
 		t.Fatalf("unmerged = %+v, want {conflicted file.go U}", files)
 	}
 	// An untracked directory collapses to a trailing-slash path by default; it
 	// is a directory, not a file.
-	files = parseGitStatus("? vendor/\n")
+	files = ParseGitStatus("? vendor/\n")
 	if len(files) != 1 || files[0].Path != "vendor/" || files[0].Status != "?" || !files[0].IsDir {
 		t.Fatalf("untracked dir = %+v, want {vendor/ ? isDir:true}", files)
 	}
@@ -104,7 +104,7 @@ func TestRunGit(t *testing.T) {
 		t.Skip("git not installed")
 	}
 	dir := t.TempDir()
-	if _, err := runGit(context.Background(), dir, "status", "--porcelain=v2", "--branch"); err == nil {
+	if _, err := RunGit(context.Background(), dir, "status", "--porcelain=v2", "--branch"); err == nil {
 		t.Fatal("git status in non-repo should error")
 	}
 	run := func(args ...string) {
@@ -122,9 +122,9 @@ func TestRunGit(t *testing.T) {
 	}
 	run("add", "a.txt")
 	run("commit", "-qm", "init")
-	out, err := runGit(context.Background(), dir, "status", "--porcelain=v2", "--branch")
+	out, err := RunGit(context.Background(), dir, "status", "--porcelain=v2", "--branch")
 	if err != nil {
-		t.Fatalf("runGit in repo: %v", err)
+		t.Fatalf("RunGit in repo: %v", err)
 	}
 	if !strings.Contains(out, "branch.head ") {
 		t.Fatalf("expected branch.head in output, got %q", out)
@@ -133,7 +133,7 @@ func TestRunGit(t *testing.T) {
 
 func TestParseGitNumstat(t *testing.T) {
 	out := "3\t1\tREADME.md\n-\t-\tlogo.png\n10\t2\tarch/{i386 => x86}/Makefile\n"
-	stats := parseGitNumstat(out)
+	stats := ParseGitNumstat(out)
 
 	if s := stats["README.md"]; s.Added != 3 || s.Removed != 1 || s.Binary {
 		t.Fatalf("README.md = %+v, want {added:3 removed:1}", s)
@@ -155,7 +155,7 @@ func TestCountFileLines(t *testing.T) {
 	if err := os.WriteFile(textPath, []byte("a\nb\nc\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	lines, binary := countFileLines(textPath)
+	lines, binary := CountFileLines(textPath)
 	if lines != 3 || binary {
 		t.Fatalf("text.txt = (%d, %v), want (3, false)", lines, binary)
 	}
@@ -165,7 +165,7 @@ func TestCountFileLines(t *testing.T) {
 	if err := os.WriteFile(noNL, []byte("solo"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	lines, binary = countFileLines(noNL)
+	lines, binary = CountFileLines(noNL)
 	if lines != 1 || binary {
 		t.Fatalf("nonl.txt = (%d, %v), want (1, false)", lines, binary)
 	}
@@ -174,53 +174,53 @@ func TestCountFileLines(t *testing.T) {
 	if err := os.WriteFile(binaryPath, []byte{0x00, 0x01, 0x02, 0x0a}, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	lines, binary = countFileLines(binaryPath)
+	lines, binary = CountFileLines(binaryPath)
 	if !binary {
 		t.Fatalf("bin.dat should be flagged binary, got lines=%d binary=%v", lines, binary)
 	}
 
-	if lines, binary := countFileLines(filepath.Join(dir, "missing.txt")); lines != 0 || binary {
+	if lines, binary := CountFileLines(filepath.Join(dir, "missing.txt")); lines != 0 || binary {
 		t.Fatalf("missing file = (%d, %v), want (0, false)", lines, binary)
 	}
 }
 
 func TestFileHelpers(t *testing.T) {
-	// fileURI produces a file:// URI with forward slashes.
-	uri := fileURI(`C:\proj\a b.txt`)
+	// FileURI produces a file:// URI with forward slashes.
+	uri := FileURI(`C:\proj\a b.txt`)
 	if !strings.HasPrefix(uri, "file://") || !strings.Contains(uri, "a%20b.txt") {
-		t.Fatalf("fileURI(%q) = %q, want file:// with encoded space", `C:\proj\a b.txt`, uri)
+		t.Fatalf("FileURI(%q) = %q, want file:// with encoded space", `C:\proj\a b.txt`, uri)
 	}
 
-	// mimeTypeFor maps common extensions; unknown returns "".
-	if got := mimeTypeFor("x.json"); got != "application/json" {
-		t.Fatalf("mimeTypeFor(x.json) = %q, want application/json", got)
+	// MimeTypeFor maps common extensions; unknown returns "".
+	if got := MimeTypeFor("x.json"); got != "application/json" {
+		t.Fatalf("MimeTypeFor(x.json) = %q, want application/json", got)
 	}
-	if got := mimeTypeFor("x.unknown_ext"); got != "" {
-		t.Fatalf("mimeTypeFor(x.unknown_ext) = %q, want empty", got)
+	if got := MimeTypeFor("x.unknown_ext"); got != "" {
+		t.Fatalf("MimeTypeFor(x.unknown_ext) = %q, want empty", got)
 	}
 
-	// isBinary detects a NUL byte.
-	if !isBinary([]byte{0x00, 0x01}) {
-		t.Fatal("isBinary should flag NUL byte")
+	// IsBinary detects a NUL byte.
+	if !IsBinary([]byte{0x00, 0x01}) {
+		t.Fatal("IsBinary should flag NUL byte")
 	}
-	if isBinary([]byte("hello\n")) {
-		t.Fatal("isBinary should not flag plain text")
+	if IsBinary([]byte("hello\n")) {
+		t.Fatal("IsBinary should not flag plain text")
 	}
 }
 
 func TestTruncateStringPtr(t *testing.T) {
-	if p := truncateStringPtr("", 10); p != nil {
+	if p := TruncateStringPtr("", 10); p != nil {
 		t.Fatalf("empty string: got %v, want nil", *p)
 	}
-	if p := truncateStringPtr("abc", 10); p == nil || *p != "abc" {
+	if p := TruncateStringPtr("abc", 10); p == nil || *p != "abc" {
 		t.Fatalf("short string: got %v, want abc", p)
 	}
-	if p := truncateStringPtr("abcdef", 3); p == nil || *p != "abc" {
+	if p := TruncateStringPtr("abcdef", 3); p == nil || *p != "abc" {
 		t.Fatalf("long string: got %v, want abc", p)
 	}
 }
 
-func TestGitDiffEntry(t *testing.T) {
+func TestDiffEntry(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
@@ -246,10 +246,9 @@ func TestGitDiffEntry(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "new.txt"), []byte("fresh\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{}
-	entry, err := s.gitDiffEntry(context.Background(), dir, "HEAD", "new.txt", filepath.Join(dir, "new.txt"))
+	entry, err := DiffEntry(context.Background(), dir, "HEAD", "new.txt", filepath.Join(dir, "new.txt"))
 	if err != nil {
-		t.Fatalf("gitDiffEntry(untracked): %v", err)
+		t.Fatalf("DiffEntry(untracked): %v", err)
 	}
 	if entry.Type != "diff" || entry.NewText != "fresh\n" || entry.OldText != nil {
 		t.Fatalf("untracked entry = %+v, want {type:diff newText:fresh oldText:nil}", entry)
@@ -259,9 +258,9 @@ func TestGitDiffEntry(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("new\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	entry, err = s.gitDiffEntry(context.Background(), dir, "HEAD", "a.txt", filepath.Join(dir, "a.txt"))
+	entry, err = DiffEntry(context.Background(), dir, "HEAD", "a.txt", filepath.Join(dir, "a.txt"))
 	if err != nil {
-		t.Fatalf("gitDiffEntry(modified): %v", err)
+		t.Fatalf("DiffEntry(modified): %v", err)
 	}
 	if entry.Type != "diff" || entry.NewText != "new\n" {
 		t.Fatalf("modified entry = %+v, want type:diff newText:new", entry)
@@ -275,9 +274,9 @@ func TestGitDiffEntry(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "a.txt")); err != nil {
 		t.Fatal(err)
 	}
-	entry, err = s.gitDiffEntry(context.Background(), dir, "HEAD", "a.txt", filepath.Join(dir, "a.txt"))
+	entry, err = DiffEntry(context.Background(), dir, "HEAD", "a.txt", filepath.Join(dir, "a.txt"))
 	if err != nil {
-		t.Fatalf("gitDiffEntry(deleted): %v", err)
+		t.Fatalf("DiffEntry(deleted): %v", err)
 	}
 	if entry.Type != "diff" || entry.NewText != "" {
 		t.Fatalf("deleted entry = %+v, want type:diff newText:empty", entry)
@@ -289,7 +288,7 @@ func TestGitDiffEntry(t *testing.T) {
 
 // An agent working in a subdirectory of a repo must see only its own changes,
 // with paths relative to its cwd, and diffs against the committed version.
-func TestGitStatusScopedToSubdirectory(t *testing.T) {
+func TestStatusScopedToSubdirectory(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
@@ -325,27 +324,26 @@ func TestGitStatusScopedToSubdirectory(t *testing.T) {
 	write("lib/outside.txt", "x\n")
 
 	cwd := filepath.Join(root, "app")
-	out, err := gitStatus(context.Background(), cwd)
+	out, err := Status(context.Background(), cwd)
 	if err != nil {
-		t.Fatalf("gitStatus: %v", err)
+		t.Fatalf("Status: %v", err)
 	}
-	files := parseGitStatus(out)
+	files := ParseGitStatus(out)
 	if len(files) != 1 || files[0].Path != "a.txt" || files[0].Status != "M" {
 		t.Fatalf("status from app/ = %+v, want only {a.txt M}", files)
 	}
 
-	numstat, err := runGit(context.Background(), cwd, "diff", "HEAD", "--numstat", "--relative")
+	numstat, err := RunGit(context.Background(), cwd, "diff", "HEAD", "--numstat", "--relative")
 	if err != nil {
 		t.Fatalf("numstat: %v", err)
 	}
-	if stat, ok := parseGitNumstat(numstat)["a.txt"]; !ok || stat.Added != 1 {
+	if stat, ok := ParseGitNumstat(numstat)["a.txt"]; !ok || stat.Added != 1 {
 		t.Fatalf("numstat from app/ = %q, want a.txt with 1 added", numstat)
 	}
 
-	s := &Server{}
-	entry, err := s.gitDiffEntry(context.Background(), cwd, "HEAD", "a.txt", filepath.Join(cwd, "a.txt"))
+	entry, err := DiffEntry(context.Background(), cwd, "HEAD", "a.txt", filepath.Join(cwd, "a.txt"))
 	if err != nil {
-		t.Fatalf("gitDiffEntry: %v", err)
+		t.Fatalf("DiffEntry: %v", err)
 	}
 	if entry.OldText == nil || *entry.OldText != "old\n" {
 		t.Fatalf("OldText from app/ = %v, want the committed content", entry.OldText)

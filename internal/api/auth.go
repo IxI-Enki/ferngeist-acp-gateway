@@ -84,6 +84,18 @@ func (s *Server) requireGatewayScope(w http.ResponseWriter, r *http.Request, sco
 	return credential, true
 }
 
+// requireScope wraps a handler with the credential + scope gate, so the same
+// handler can be registered on both the public mux (wrapped, device-authed) and
+// the localhost admin mux (bare, trusted).
+func (s *Server) requireScope(scope string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := s.requireGatewayScope(w, r, scope); !ok {
+			return
+		}
+		next(w, r)
+	}
+}
+
 func bearerToken(r *http.Request) string {
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
 	if auth == "" {

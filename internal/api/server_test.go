@@ -111,19 +111,14 @@ func TestStatusRejectsNonGetMethods(t *testing.T) {
 
 func TestStatusUsesConfiguredGatewayName(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := NewServer(
-		config.Config{ListenAddr: "127.0.0.1:0", GatewayName: "desk-alpha"},
-		BuildInfo{},
-		logger,
-		catalog.New(".", nil),
-		runtime.NewSupervisor(logger, ".", nil, nil),
-		pairing.NewService(logger, nil),
-		discovery.New(logger),
-		nil,
-		nil,
-		nil,
-		nil,
-	)
+	server := NewServer(Deps{
+		Config:    config.Config{ListenAddr: "127.0.0.1:0", GatewayName: "desk-alpha"},
+		Logger:    logger,
+		Catalog:   catalog.New(".", nil),
+		Runtime:   runtime.NewSupervisor(logger, ".", nil, nil),
+		Pairing:   pairing.NewService(logger, nil),
+		Discovery: discovery.New(logger),
+	})
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
 	recorder := httptest.NewRecorder()
@@ -140,19 +135,14 @@ func TestStatusUsesConfiguredGatewayName(t *testing.T) {
 
 func TestStatusSurfacesPendingTailscaleAuth(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := NewServer(
-		config.Config{ListenAddr: "127.0.0.1:0"},
-		BuildInfo{},
-		logger,
-		catalog.New(".", nil),
-		runtime.NewSupervisor(logger, ".", nil, nil),
-		pairing.NewService(logger, nil),
-		discovery.New(logger),
-		nil,
-		nil,
-		nil,
-		nil,
-	)
+	server := NewServer(Deps{
+		Config:    config.Config{ListenAddr: "127.0.0.1:0"},
+		Logger:    logger,
+		Catalog:   catalog.New(".", nil),
+		Runtime:   runtime.NewSupervisor(logger, ".", nil, nil),
+		Pairing:   pairing.NewService(logger, nil),
+		Discovery: discovery.New(logger),
+	})
 	server.SetRemoteSetup(func() *remote.RemoteSetupSnapshot {
 		return &remote.RemoteSetupSnapshot{
 			AuthRequired: true,
@@ -184,19 +174,14 @@ func TestStatusSurfacesPendingTailscaleAuth(t *testing.T) {
 
 func TestStatusOmitsAuthFieldsWithoutRemoteSetup(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := NewServer(
-		config.Config{ListenAddr: "127.0.0.1:0"},
-		BuildInfo{},
-		logger,
-		catalog.New(".", nil),
-		runtime.NewSupervisor(logger, ".", nil, nil),
-		pairing.NewService(logger, nil),
-		discovery.New(logger),
-		nil,
-		nil,
-		nil,
-		nil,
-	)
+	server := NewServer(Deps{
+		Config:    config.Config{ListenAddr: "127.0.0.1:0"},
+		Logger:    logger,
+		Catalog:   catalog.New(".", nil),
+		Runtime:   runtime.NewSupervisor(logger, ".", nil, nil),
+		Pairing:   pairing.NewService(logger, nil),
+		Discovery: discovery.New(logger),
+	})
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
 	recorder := httptest.NewRecorder()
@@ -216,16 +201,14 @@ func TestStatusOmitsAuthFieldsWithoutRemoteSetup(t *testing.T) {
 
 func TestStatusIncludesRegistryHealth(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := NewServer(
-		config.Config{ListenAddr: "127.0.0.1:0"},
-		BuildInfo{},
-		logger,
-		catalog.New(".", nil),
-		runtime.NewSupervisor(logger, ".", nil, nil),
-		pairing.NewService(logger, nil),
-		discovery.New(logger),
-		nil,
-		fakeRegistryStatusProvider{
+	server := NewServer(Deps{
+		Config:    config.Config{ListenAddr: "127.0.0.1:0"},
+		Logger:    logger,
+		Catalog:   catalog.New(".", nil),
+		Runtime:   runtime.NewSupervisor(logger, ".", nil, nil),
+		Pairing:   pairing.NewService(logger, nil),
+		Discovery: discovery.New(logger),
+		Registry: fakeRegistryStatusProvider{
 			status: acpregistry.Status{
 				URL:           "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json",
 				State:         "ready",
@@ -234,9 +217,7 @@ func TestStatusIncludesRegistryHealth(t *testing.T) {
 				LastFetchedAt: time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC),
 			},
 		},
-		nil,
-		nil,
-	)
+	})
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
 	recorder := httptest.NewRecorder()
@@ -260,19 +241,14 @@ func TestStatusIncludesRegistryHealth(t *testing.T) {
 
 func TestStatusIncludesRemoteConfigurationState(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := NewServer(
-		config.Config{ListenAddr: "127.0.0.1:0", PublicBaseURL: "https://helper.example.com"},
-		BuildInfo{},
-		logger,
-		catalog.New(".", nil),
-		runtime.NewSupervisor(logger, ".", nil, nil),
-		pairing.NewService(logger, nil),
-		discovery.New(logger),
-		nil,
-		nil,
-		nil,
-		nil,
-	)
+	server := NewServer(Deps{
+		Config:    config.Config{ListenAddr: "127.0.0.1:0", PublicBaseURL: "https://helper.example.com"},
+		Logger:    logger,
+		Catalog:   catalog.New(".", nil),
+		Runtime:   runtime.NewSupervisor(logger, ".", nil, nil),
+		Pairing:   pairing.NewService(logger, nil),
+		Discovery: discovery.New(logger),
+	})
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
 	recorder := httptest.NewRecorder()
@@ -305,19 +281,14 @@ func TestStatusIncludesRemoteConfigurationState(t *testing.T) {
 
 func TestStatusIncludesLANRemoteVisibility(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := NewServer(
-		config.Config{ListenAddr: "127.0.0.1:0", EnableLAN: true},
-		BuildInfo{},
-		logger,
-		catalog.New(".", nil),
-		runtime.NewSupervisor(logger, ".", nil, nil),
-		pairing.NewService(logger, nil),
-		discovery.New(logger),
-		nil,
-		nil,
-		nil,
-		nil,
-	)
+	server := NewServer(Deps{
+		Config:    config.Config{ListenAddr: "127.0.0.1:0", EnableLAN: true},
+		Logger:    logger,
+		Catalog:   catalog.New(".", nil),
+		Runtime:   runtime.NewSupervisor(logger, ".", nil, nil),
+		Pairing:   pairing.NewService(logger, nil),
+		Discovery: discovery.New(logger),
+	})
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
 	recorder := httptest.NewRecorder()
@@ -347,19 +318,14 @@ func TestStatusIncludesLANRemoteVisibility(t *testing.T) {
 
 func TestStatusClassifiesTailscaleRemoteVisibility(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := NewServer(
-		config.Config{ListenAddr: "127.0.0.1:0", PublicBaseURL: "https://helper.tail123.ts.net"},
-		BuildInfo{},
-		logger,
-		catalog.New(".", nil),
-		runtime.NewSupervisor(logger, ".", nil, nil),
-		pairing.NewService(logger, nil),
-		discovery.New(logger),
-		nil,
-		nil,
-		nil,
-		nil,
-	)
+	server := NewServer(Deps{
+		Config:    config.Config{ListenAddr: "127.0.0.1:0", PublicBaseURL: "https://helper.tail123.ts.net"},
+		Logger:    logger,
+		Catalog:   catalog.New(".", nil),
+		Runtime:   runtime.NewSupervisor(logger, ".", nil, nil),
+		Pairing:   pairing.NewService(logger, nil),
+		Discovery: discovery.New(logger),
+	})
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
 	recorder := httptest.NewRecorder()
@@ -379,19 +345,14 @@ func TestStatusClassifiesTailscaleRemoteVisibility(t *testing.T) {
 
 func TestAdminPairingStartIncludesPayload(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := NewServer(
-		config.Config{ListenAddr: "127.0.0.1:0", PublicBaseURL: "https://helper.example.com"},
-		BuildInfo{},
-		logger,
-		catalog.New(".", nil),
-		runtime.NewSupervisor(logger, ".", nil, nil),
-		pairing.NewService(logger, nil),
-		discovery.New(logger),
-		nil,
-		nil,
-		nil,
-		nil,
-	)
+	server := NewServer(Deps{
+		Config:    config.Config{ListenAddr: "127.0.0.1:0", PublicBaseURL: "https://helper.example.com"},
+		Logger:    logger,
+		Catalog:   catalog.New(".", nil),
+		Runtime:   runtime.NewSupervisor(logger, ".", nil, nil),
+		Pairing:   pairing.NewService(logger, nil),
+		Discovery: discovery.New(logger),
+	})
 
 	request := httptest.NewRequest(http.MethodPost, "/admin/v1/pairings/start", nil)
 	recorder := httptest.NewRecorder()
@@ -421,23 +382,18 @@ func TestAdminPairingStartIncludesPayload(t *testing.T) {
 
 func TestAdminStatusIncludesPairingReachability(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := NewServer(
-		config.Config{
+	server := NewServer(Deps{
+		Config: config.Config{
 			ListenAddr:      "127.0.0.1:0",
 			AdminListenAddr: "127.0.0.1:5789",
 			PublicBaseURL:   "https://helper.example.com",
 		},
-		BuildInfo{},
-		logger,
-		catalog.New(".", nil),
-		runtime.NewSupervisor(logger, ".", nil, nil),
-		pairing.NewService(logger, nil),
-		discovery.New(logger),
-		nil,
-		nil,
-		nil,
-		nil,
-	)
+		Logger:    logger,
+		Catalog:   catalog.New(".", nil),
+		Runtime:   runtime.NewSupervisor(logger, ".", nil, nil),
+		Pairing:   pairing.NewService(logger, nil),
+		Discovery: discovery.New(logger),
+	})
 
 	request := httptest.NewRequest(http.MethodGet, "/admin/v1/status", nil)
 	recorder := httptest.NewRecorder()
@@ -505,19 +461,14 @@ func TestAdminDevicesListAndRevoke(t *testing.T) {
 
 func TestStatusFlagsInvalidRemoteConfiguration(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := NewServer(
-		config.Config{ListenAddr: "127.0.0.1:0", PublicBaseURL: "://bad-url"},
-		BuildInfo{},
-		logger,
-		catalog.New(".", nil),
-		runtime.NewSupervisor(logger, ".", nil, nil),
-		pairing.NewService(logger, nil),
-		discovery.New(logger),
-		nil,
-		nil,
-		nil,
-		nil,
-	)
+	server := NewServer(Deps{
+		Config:    config.Config{ListenAddr: "127.0.0.1:0", PublicBaseURL: "://bad-url"},
+		Logger:    logger,
+		Catalog:   catalog.New(".", nil),
+		Runtime:   runtime.NewSupervisor(logger, ".", nil, nil),
+		Pairing:   pairing.NewService(logger, nil),
+		Discovery: discovery.New(logger),
+	})
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
 	recorder := httptest.NewRecorder()
@@ -1430,19 +1381,16 @@ func TestDiagnosticsExportIncludesGatewayLogsAndRuntimeLogs(t *testing.T) {
 	logger.Info("diagnostic export ready", slog.String("component", "test"))
 
 	cfg := config.Config{ListenAddr: "127.0.0.1:0", LogDir: filepath.Join(baseDir, "logs"), StateDBPath: filepath.Join(baseDir, "state.db"), GatewayName: "test-gateway", AllowDiagnosticsExport: true}
-	server := NewServer(
-		cfg,
-		BuildInfo{Version: "1.2.3", Commit: "abc123", BuiltAt: "2026-03-25T10:00:00Z", GoVersion: "go1.test"},
-		logger,
-		catalog.New(baseDir, nil),
-		runtime.NewSupervisor(logger, baseDir, nil, nil),
-		pairing.NewServiceWithOptions(logger, nil, pairing.Options{AllowDiagnosticsExport: cfg.AllowDiagnosticsExport}),
-		discovery.New(logger),
-		logSvc,
-		nil,
-		nil,
-		nil,
-	)
+	server := NewServer(Deps{
+		Config:    cfg,
+		Build:     BuildInfo{Version: "1.2.3", Commit: "abc123", BuiltAt: "2026-03-25T10:00:00Z", GoVersion: "go1.test"},
+		Logger:    logger,
+		Catalog:   catalog.New(baseDir, nil),
+		Runtime:   runtime.NewSupervisor(logger, baseDir, nil, nil),
+		Pairing:   pairing.NewServiceWithOptions(logger, nil, pairing.Options{AllowDiagnosticsExport: cfg.AllowDiagnosticsExport}),
+		Discovery: discovery.New(logger),
+		Logs:      logSvc,
+	})
 	token := pairDevice(t, server)
 
 	startRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
@@ -1733,19 +1681,14 @@ func TestRuntimeRestartWithEnvRequiresElevatedScopeByDefault(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	runtimeSvc := runtime.NewSupervisor(logger, baseDir, nil, nil)
-	server := NewServer(
-		config.Config{ListenAddr: "127.0.0.1:0"},
-		BuildInfo{},
-		logger,
-		catalog.New(baseDir, nil),
-		runtimeSvc,
-		pairing.NewService(logger, nil),
-		discovery.New(logger),
-		nil,
-		nil,
-		nil,
-		nil,
-	)
+	server := NewServer(Deps{
+		Config:    config.Config{ListenAddr: "127.0.0.1:0"},
+		Logger:    logger,
+		Catalog:   catalog.New(baseDir, nil),
+		Runtime:   runtimeSvc,
+		Pairing:   pairing.NewService(logger, nil),
+		Discovery: discovery.New(logger),
+	})
 	var token string
 	t.Cleanup(func() {
 		stopRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/stop", nil)
@@ -1884,25 +1827,20 @@ func newConfiguredTestServer(cfg config.Config) *Server {
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = "127.0.0.1:0"
 	}
-	return NewServer(
-		cfg,
-		BuildInfo{},
-		logger,
-		catalog.New(".", nil),
-		runtime.NewSupervisor(logger, ".", nil, nil),
-		pairing.NewServiceWithOptions(logger, nil, pairing.Options{
+	return NewServer(Deps{
+		Config:  cfg,
+		Logger:  logger,
+		Catalog: catalog.New(".", nil),
+		Runtime: runtime.NewSupervisor(logger, ".", nil, nil),
+		Pairing: pairing.NewServiceWithOptions(logger, nil, pairing.Options{
 			ArmTTL:                 cfg.PairingArmTTL,
 			CredentialTTL:          cfg.CredentialTTL,
 			GracePeriod:            cfg.CredentialGracePeriod,
 			AllowDiagnosticsExport: cfg.AllowDiagnosticsExport,
 			AllowRuntimeRestartEnv: cfg.AllowRuntimeRestartEnv,
 		}),
-		discovery.New(logger),
-		nil,
-		nil,
-		nil,
-		nil,
-	)
+		Discovery: discovery.New(logger),
+	})
 }
 
 func newTestServerWithBaseDir(baseDir string) *Server {
@@ -1914,59 +1852,45 @@ func newConfiguredTestServerWithBaseDir(baseDir string, cfg config.Config) *Serv
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = "127.0.0.1:0"
 	}
-	return NewServer(
-		cfg,
-		BuildInfo{},
-		logger,
-		catalog.New(baseDir, nil),
-		runtime.NewSupervisor(logger, baseDir, nil, nil),
-		pairing.NewServiceWithOptions(logger, nil, pairing.Options{
+	return NewServer(Deps{
+		Config:  cfg,
+		Logger:  logger,
+		Catalog: catalog.New(baseDir, nil),
+		Runtime: runtime.NewSupervisor(logger, baseDir, nil, nil),
+		Pairing: pairing.NewServiceWithOptions(logger, nil, pairing.Options{
 			ArmTTL:                 cfg.PairingArmTTL,
 			CredentialTTL:          cfg.CredentialTTL,
 			GracePeriod:            cfg.CredentialGracePeriod,
 			AllowDiagnosticsExport: cfg.AllowDiagnosticsExport,
 			AllowRuntimeRestartEnv: cfg.AllowRuntimeRestartEnv,
 		}),
-		discovery.New(logger),
-		nil,
-		nil,
-		nil,
-		nil,
-	)
+		Discovery: discovery.New(logger),
+	})
 }
 
 func newTestServerWithBaseDirAndRegistry(baseDir string, registrySource catalog.RegistrySource) *Server {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewServer(
-		config.Config{ListenAddr: "127.0.0.1:0"},
-		BuildInfo{},
-		logger,
-		catalog.New(baseDir, registrySource),
-		runtime.NewSupervisor(logger, baseDir, nil, nil),
-		pairing.NewService(logger, nil),
-		discovery.New(logger),
-		nil,
-		nil,
-		nil,
-		nil,
-	)
+	return NewServer(Deps{
+		Config:    config.Config{ListenAddr: "127.0.0.1:0"},
+		Logger:    logger,
+		Catalog:   catalog.New(baseDir, registrySource),
+		Runtime:   runtime.NewSupervisor(logger, baseDir, nil, nil),
+		Pairing:   pairing.NewService(logger, nil),
+		Discovery: discovery.New(logger),
+	})
 }
 
 func newTestServerWithStore(baseDir string, store *storage.SQLiteStore) *Server {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewServer(
-		config.Config{ListenAddr: "127.0.0.1:0"},
-		BuildInfo{},
-		logger,
-		catalog.New(baseDir, nil),
-		runtime.NewSupervisor(logger, baseDir, store, nil),
-		pairing.NewService(logger, store),
-		discovery.New(logger),
-		nil,
-		nil,
-		store,
-		nil,
-	)
+	return NewServer(Deps{
+		Config:    config.Config{ListenAddr: "127.0.0.1:0"},
+		Logger:    logger,
+		Catalog:   catalog.New(baseDir, nil),
+		Runtime:   runtime.NewSupervisor(logger, baseDir, store, nil),
+		Pairing:   pairing.NewService(logger, store),
+		Discovery: discovery.New(logger),
+		Store:     store,
+	})
 }
 
 type fakeRegistryStatusProvider struct {

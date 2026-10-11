@@ -8,7 +8,6 @@ import (
 
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/catalog"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/customagents"
-	"github.com/arafatamim/ferngeist-acp-gateway/internal/pairing"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
 )
 
@@ -33,9 +32,6 @@ type customAgentDeleteResponse struct {
 }
 
 func (s *Server) handleCustomAgentCreate(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireGatewayScope(w, r, pairing.ScopeControl); !ok {
-		return
-	}
 	request, ok := decodeCustomAgentRequest(w, r)
 	if !ok {
 		return
@@ -57,9 +53,6 @@ func (s *Server) handleCustomAgentCreate(w http.ResponseWriter, r *http.Request)
 // immutable: it was derived from the original display name and clients key
 // stored sessions/runtimes by it.
 func (s *Server) handleCustomAgentUpdate(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireGatewayScope(w, r, pairing.ScopeControl); !ok {
-		return
-	}
 	request, ok := decodeCustomAgentRequest(w, r)
 	if !ok {
 		return
@@ -89,9 +82,6 @@ func (s *Server) handleCustomAgentUpdate(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleCustomAgentDelete(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireGatewayScope(w, r, pairing.ScopeControl); !ok {
-		return
-	}
 	id := r.PathValue("id")
 	if err := s.customAgents().Delete(r.Context(), id); err != nil {
 		writeCustomAgentError(w, err)
