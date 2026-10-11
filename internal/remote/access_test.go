@@ -1,4 +1,4 @@
-package remoteaccess
+package remote
 
 import (
 	"context"
@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/config"
-	"github.com/arafatamim/ferngeist-acp-gateway/internal/remote"
 )
 
 func TestProvisionSuccessClearsSnapshot(t *testing.T) {
@@ -16,9 +15,9 @@ func TestProvisionSuccessClearsSnapshot(t *testing.T) {
 	provisioned := false
 
 	a := New(
-		func(ctx context.Context, cfg config.Config, localAddr string, port int, _ func(string)) (*remote.Result, error) {
+		func(ctx context.Context, cfg config.Config, localAddr string, port int, _ func(string)) (*Result, error) {
 			provisioned = true
-			return &remote.Result{Mode: "tsnet", URL: "https://gw.tail.ts.net"}, nil
+			return &Result{Mode: "tsnet", URL: "https://gw.tail.ts.net"}, nil
 		},
 		nil, nil, logger, config.Config{}, 5788,
 	)
@@ -41,8 +40,8 @@ func TestProvisionSuccessClearsSnapshot(t *testing.T) {
 func TestProvisionAuthRequiredStoresSnapshot(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	a := New(
-		func(ctx context.Context, cfg config.Config, localAddr string, port int, _ func(string)) (*remote.Result, error) {
-			return nil, &remote.ErrAuthRequired{AuthURL: "https://login.tailscale.com/a/test"}
+		func(ctx context.Context, cfg config.Config, localAddr string, port int, _ func(string)) (*Result, error) {
+			return nil, &ErrAuthRequired{AuthURL: "https://login.tailscale.com/a/test"}
 		},
 		nil, nil, logger, config.Config{}, 5788,
 	)
@@ -66,7 +65,7 @@ func TestProvisionAuthRequiredStoresSnapshot(t *testing.T) {
 func TestProvisionHintStoresSnapshot(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	a := New(
-		func(ctx context.Context, cfg config.Config, localAddr string, port int, _ func(string)) (*remote.Result, error) {
+		func(ctx context.Context, cfg config.Config, localAddr string, port int, _ func(string)) (*Result, error) {
 			return nil, errors.New("tsnet funnel: Funnel not available; HTTPS must be enabled. See https://tailscale.com/s/https.")
 		},
 		nil, nil, logger, config.Config{}, 5788,
@@ -91,7 +90,7 @@ func TestProvisionHintStoresSnapshot(t *testing.T) {
 func TestProvisionNilResultNoSideEffects(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	a := New(
-		func(ctx context.Context, cfg config.Config, localAddr string, port int, _ func(string)) (*remote.Result, error) {
+		func(ctx context.Context, cfg config.Config, localAddr string, port int, _ func(string)) (*Result, error) {
 			return nil, nil // disabled
 		},
 		nil, nil, logger, config.Config{}, 5788,
@@ -113,12 +112,12 @@ func TestProvisionClearsPriorSnapshot(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	call := 0
 	a := New(
-		func(ctx context.Context, cfg config.Config, localAddr string, port int, _ func(string)) (*remote.Result, error) {
+		func(ctx context.Context, cfg config.Config, localAddr string, port int, _ func(string)) (*Result, error) {
 			call++
 			if call == 1 {
-				return nil, &remote.ErrAuthRequired{AuthURL: "https://login.tailscale.com/a/pending"}
+				return nil, &ErrAuthRequired{AuthURL: "https://login.tailscale.com/a/pending"}
 			}
-			return &remote.Result{Mode: "tsnet", URL: "https://gw.tail.ts.net"}, nil
+			return &Result{Mode: "tsnet", URL: "https://gw.tail.ts.net"}, nil
 		},
 		nil, nil, logger, config.Config{}, 5788,
 	)

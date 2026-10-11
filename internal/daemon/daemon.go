@@ -19,7 +19,6 @@ import (
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/push"
 	acpregistry "github.com/arafatamim/ferngeist-acp-gateway/internal/registry"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/remote"
-	"github.com/arafatamim/ferngeist-acp-gateway/internal/remoteaccess"
 	gatewayruntime "github.com/arafatamim/ferngeist-acp-gateway/internal/runtime"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/session"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
@@ -47,19 +46,6 @@ var remoteProvision = func(ctx context.Context, cfg config.Config, localAddr str
 	p.SetLoginHook(loginHook)
 	return p.Provision(ctx, cfg, localAddr, port)
 }
-
-// remoteResultCh delivers the provisioned result from the asynchronous path to
-// the shutdown sequence without racing on the shared variable.
-var remoteResultCh = make(chan *remote.Result, 1)
-
-// remoteURLCh delivers the provisioned public URL from the asynchronous path
-// to the status path, so remoteStatus reports the live URL without a restart.
-var remoteURLCh = make(chan string, 1)
-
-// remoteRetryInterval is the pause between background provisioning attempts
-// while the operator fixes tailnet settings (HTTPS/Funnel). Overridden in
-// tests to keep them fast.
-var remoteRetryInterval = 15 * time.Second
 
 // Run boots the full gateway daemon and blocks until the context is cancelled or
 // one of the HTTP surfaces exits unexpectedly.
@@ -149,65 +135,24 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 
 	// Remote access provisioning: Tailscale CLI when available, embedded tsnet
 	// node otherwise. Best-effort — a provisioning failure never prevents the
-	// daemon from booting. Synchronous when an auth key makes login
-	// non-interactive (the URL is then known before the API server starts);
-	// otherwise asynchronous so first boot with a human login isn't blocked.
-	var remoteResult *remote.Result
-	var access *remoteaccess.Access
+	// daemon from booting. With an auth key login is non-interactive, so the URL
+	// is known before the API server starts; otherwise Start runs the background
+	// retry loop so fixing a tailnet setting is enough — no restart.
+	var access *remote.Access
 	if cfg.TailscaleMode != "off" {
 		port, parseErr := portOf(cfg.ListenAddr)
 		if parseErr != nil {
 			logger.Warn("remote access disabled: invalid listen address", slog.String("error", parseErr.Error()))
 		} else {
-			access = remoteaccess.New(remoteProvision, store, pushSvc, logger, cfg, port)
+			access = remote.New(remoteProvision, store, pushSvc, logger, cfg, port)
 			if cfg.TailscaleAuthKey != "" {
-				// Synchronous: an auth key makes login non-interactive, so the
-				// URL is known before the API server starts. Failures here are
-				// configuration errors — log once, don't retry.
+				// Synchronous: the URL is known before the API server starts.
+				// Failures here are configuration errors — log once, don't retry.
 				if res, err := access.Provision(ctx); err != nil {
-					remoteaccess.LogSetupIssue(logger, err)
+					remote.LogSetupIssue(logger, err)
 				} else if res != nil {
-					remoteResult = res
-					// Known before the server starts: report locally this boot too.
 					cfg.PublicBaseURL = res.URL
 				}
-			} else {
-				// Asynchronous: first boot with a human login, or a tailnet
-				// that still needs HTTPS/Funnel enabled. Retry on a slow timer
-				// so fixing the setting in the browser is enough — the gateway
-				// picks up on its own, no restart. The actionable hint is
-				// logged once; later attempts stay quiet until one succeeds.
-				// Capture the interval on the main goroutine: tests swap the
-				// package var while Run is live, and reading it from the
-				// retry loop would race the write.
-				retryInterval := remoteRetryInterval
-				go func() {
-					attempt := 0
-					for {
-						res, err := access.Provision(ctx)
-						if err == nil && res != nil {
-							remoteResultCh <- res
-							// Also hand the URL to the status path: remoteStatus
-							// must report the provisioned URL without a restart.
-							select {
-							case remoteURLCh <- res.URL:
-							default:
-							}
-							return
-						}
-						attempt++
-						if attempt == 1 {
-							remoteaccess.LogSetupIssue(logger, err)
-						} else if err != nil {
-							logger.Debug("remote access retry pending", slog.String("error", err.Error()))
-						}
-						select {
-						case <-ctx.Done():
-							return
-						case <-time.After(retryInterval):
-						}
-					}
-				}()
 			}
 		}
 	}
@@ -262,23 +207,15 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 		sessionSvc,
 	)
 	if access != nil {
-		server.SetRemoteSetup(func() *remote.RemoteSetupSnapshot { return access.Snapshot() })
-	}
-
-	// Apply the asynchronously provisioned public URL to the server once it
-	// arrives: status must report the live remote URL without a restart.
-	// Scoped to Run's lifetime (not the caller's ctx): a caller may pass a
-	// never-cancelled context, and the watcher must still exit when Run
-	// returns instead of parking on ctx.Done() forever.
-	watchCtx, stopWatch := context.WithCancel(ctx)
-	defer stopWatch()
-	go func() {
-		select {
-		case publicURL := <-remoteURLCh:
-			server.SetPublicURL(publicURL)
-		case <-watchCtx.Done():
+		server.SetRemoteSetup(access.Snapshot)
+		if cfg.TailscaleAuthKey == "" {
+			// Asynchronous: first boot with a human login, or a tailnet that
+			// still needs HTTPS/Funnel enabled. Start owns the retry loop and
+			// hands the live public URL to the status path on success, so
+			// status reports it without a restart.
+			access.Start(ctx, server.SetPublicURL)
 		}
-	}()
+	}
 
 	logger.Info("starting gateway daemon",
 		slog.String("listen_addr", cfg.ListenAddr),
@@ -315,17 +252,9 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 		shutdownErr = fmt.Errorf("graceful shutdown failed: %w", err)
 	}
 	// Stop remote access first so no new inbound traffic arrives while the API
-	// server drains. An in-flight successful provisioning gets a short grace
-	// window to hand off its result; a provision still waiting on interactive
-	// login cannot be cancelled (tsnet's Up is not ctx-cancellable) and is
-	// simply abandoned — the process exit cleans it up.
-	select {
-	case res := <-remoteResultCh:
-		remoteResult = res
-	case <-time.After(500 * time.Millisecond):
-	}
-	if remoteResult != nil && remoteResult.Close != nil {
-		if err := remoteResult.Close(); err != nil {
+	// server drains.
+	if access != nil {
+		if err := access.Close(); err != nil {
 			logger.Warn("remote access shutdown", slog.String("error", err.Error()))
 		}
 	}

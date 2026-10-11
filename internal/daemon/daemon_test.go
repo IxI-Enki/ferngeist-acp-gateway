@@ -358,12 +358,12 @@ func TestRun_surfaces_pending_tailscale_auth_in_status(t *testing.T) {
 	}
 
 	oldProvision := remoteProvision
-	oldInterval := remoteRetryInterval
+	oldInterval := remote.RetryInterval
 	defer func() {
 		remoteProvision = oldProvision
-		remoteRetryInterval = oldInterval
+		remote.RetryInterval = oldInterval
 	}()
-	remoteRetryInterval = 10 * time.Millisecond
+	remote.RetryInterval = 10 * time.Millisecond
 
 	remoteProvision = func(ctx context.Context, cfg config.Config, localAddr string, port int, _ func(string)) (*remote.Result, error) {
 		return nil, &remote.ErrAuthRequired{AuthURL: "https://login.tailscale.com/a/daemontest"}
@@ -420,12 +420,12 @@ func TestRun_retries_remote_provisioning_until_success(t *testing.T) {
 	}
 
 	oldProvision := remoteProvision
-	oldInterval := remoteRetryInterval
+	oldInterval := remote.RetryInterval
 	defer func() {
 		remoteProvision = oldProvision
-		remoteRetryInterval = oldInterval
+		remote.RetryInterval = oldInterval
 	}()
-	remoteRetryInterval = 10 * time.Millisecond
+	remote.RetryInterval = 10 * time.Millisecond
 
 	var mu sync.Mutex
 	calls := 0

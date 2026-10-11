@@ -1,28 +1,34 @@
-// Package remoteaccess provisions outbound-only remote access for the gateway
-// and manages its lifecycle: detect adapter (Tailscale CLI or embedded tsnet),
-// provision funnel, persist the public URL, and notify paired devices.
-package remoteaccess
+package remote
 
 import (
 	"context"
 	"errors"
 	"log/slog"
 	"sync/atomic"
+	"time"
 
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/config"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/push"
-	"github.com/arafatamim/ferngeist-acp-gateway/internal/remote"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
 )
 
 // ProvisionFunc establishes remote access. loginHook fires once per pending
 // interactive Tailscale login with the URL the operator must open — the
 // module owns the hook so the caller never touches snapshot state directly.
-type ProvisionFunc func(ctx context.Context, cfg config.Config, localAddr string, port int, loginHook func(string)) (*remote.Result, error)
+type ProvisionFunc func(ctx context.Context, cfg config.Config, localAddr string, port int, loginHook func(string)) (*Result, error)
 
-// Access provisions remote access and manages its side effects: persisting
-// the public URL, notifying paired devices, and surfacing provisioning state
-// (auth pending, setup blockers) to the status API.
+// RetryInterval is the pause between background provisioning attempts while
+// the operator fixes tailnet settings (HTTPS/Funnel). Overridden in tests to
+// keep them fast.
+var RetryInterval = 15 * time.Second
+
+// closeGrace bounds how long Close waits for an in-flight provisioning to hand
+// off its result.
+const closeGrace = 500 * time.Millisecond
+
+// Access provisions remote access and manages its lifecycle: it owns the
+// retry loop, persists the public URL, notifies paired devices, and surfaces
+// provisioning state (auth pending, setup blockers) to the status API.
 type Access struct {
 	provision ProvisionFunc
 	store     *storage.SQLiteStore
@@ -30,18 +36,15 @@ type Access struct {
 	logger    *slog.Logger
 	cfg       config.Config
 	port      int
-	snapshot  atomic.Pointer[remote.RemoteSetupSnapshot]
-}
 
-// loginHook stores the auth-required snapshot so the status API can surface
-// the login link while the node stays alive for the human to finish logging in.
-func (a *Access) loginHook(authURL string) {
-	a.logger.Info("remote access waiting on one-time Tailscale login", slog.String("url", authURL))
-	a.snapshot.Store(&remote.RemoteSetupSnapshot{AuthRequired: true, AuthURL: authURL})
+	snapshot atomic.Pointer[RemoteSetupSnapshot]
+	result   atomic.Pointer[Result]
+	cancel   context.CancelFunc
+	done     chan struct{}
 }
 
 // New creates an Access module. provision is the seam for tests; in production
-// it wraps remote.Provisioner with logging hooks.
+// it wraps Provisioner with logging hooks.
 func New(provision ProvisionFunc, store *storage.SQLiteStore, pushSvc push.PushService, logger *slog.Logger, cfg config.Config, port int) *Access {
 	return &Access{
 		provision: provision,
@@ -53,10 +56,17 @@ func New(provision ProvisionFunc, store *storage.SQLiteStore, pushSvc push.PushS
 	}
 }
 
+// loginHook stores the auth-required snapshot so the status API can surface
+// the login link while the node stays alive for the human to finish logging in.
+func (a *Access) loginHook(authURL string) {
+	a.logger.Info("remote access waiting on one-time Tailscale login", slog.String("url", authURL))
+	a.snapshot.Store(&RemoteSetupSnapshot{AuthRequired: true, AuthURL: authURL})
+}
+
 // Provision calls the underlying provisioner, then persists the public URL
 // and notifies paired devices on success. On any error (including pending
 // interactive login), the provisioning snapshot is stored for the status API.
-func (a *Access) Provision(ctx context.Context) (*remote.Result, error) {
+func (a *Access) Provision(ctx context.Context) (*Result, error) {
 	res, err := a.provision(ctx, a.cfg, a.cfg.ListenAddr, a.port, a.loginHook)
 	if err != nil {
 		a.snapshot.Store(snapshotFor(err))
@@ -65,6 +75,7 @@ func (a *Access) Provision(ctx context.Context) (*remote.Result, error) {
 	if res == nil {
 		return nil, nil
 	}
+	a.result.Store(res)
 
 	// Persist the public URL so the daemon reports it on restart without
 	// re-provisioning.
@@ -100,21 +111,82 @@ func (a *Access) Provision(ctx context.Context) (*remote.Result, error) {
 	return res, nil
 }
 
+// Start launches the background retry loop that provisions remote access until
+// it succeeds, so fixing a tailnet setting in the browser is enough — the
+// gateway picks up on its own, no restart. The first failure is logged with
+// its actionable hint; later attempts stay quiet until one succeeds. onURL is
+// invoked with the public URL as soon as provisioning succeeds.
+func (a *Access) Start(ctx context.Context, onURL func(string)) {
+	// Capture the interval on the calling goroutine: tests swap the package
+	// var while Start is live, and reading it from the loop would race.
+	retryInterval := RetryInterval
+	ctx, a.cancel = context.WithCancel(ctx)
+	a.done = make(chan struct{})
+	go func() {
+		defer close(a.done)
+		for attempt := 1; ; attempt++ {
+			res, err := a.Provision(ctx)
+			if err == nil && res != nil {
+				if onURL != nil {
+					onURL(res.URL)
+				}
+				return
+			}
+			if attempt == 1 {
+				LogSetupIssue(a.logger, err)
+			} else if err != nil {
+				a.logger.Debug("remote access retry pending", slog.String("error", err.Error()))
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retryInterval):
+			}
+		}
+	}()
+}
+
+// URL returns the live public URL, or "" before provisioning succeeds.
+func (a *Access) URL() string {
+	if res := a.result.Load(); res != nil {
+		return res.URL
+	}
+	return ""
+}
+
+// Close stops the retry loop and closes a provisioned result. An in-flight
+// successful provisioning gets a short grace window to hand off its result; a
+// provision still waiting on interactive login cannot be cancelled (tsnet's Up
+// is not ctx-cancellable) and is abandoned — process exit cleans it up.
+func (a *Access) Close() error {
+	if a.cancel != nil {
+		a.cancel()
+		select {
+		case <-a.done:
+		case <-time.After(closeGrace):
+		}
+	}
+	if res := a.result.Load(); res != nil && res.Close != nil {
+		return res.Close()
+	}
+	return nil
+}
+
 // Snapshot returns the current provisioning state for the status API. Nil
 // means no pending issue — provisioning either succeeded or hasn't started.
-func (a *Access) Snapshot() *remote.RemoteSetupSnapshot {
+func (a *Access) Snapshot() *RemoteSetupSnapshot {
 	return a.snapshot.Load()
 }
 
 // snapshotFor converts a provisioning error into a status-API snapshot.
-func snapshotFor(err error) *remote.RemoteSetupSnapshot {
-	snap := &remote.RemoteSetupSnapshot{}
-	var authErr *remote.ErrAuthRequired
+func snapshotFor(err error) *RemoteSetupSnapshot {
+	snap := &RemoteSetupSnapshot{}
+	var authErr *ErrAuthRequired
 	if errors.As(err, &authErr) {
 		snap.AuthRequired = true
 		snap.AuthURL = authErr.AuthURL
 	} else if err != nil {
-		snap.Hint = remote.FunnelSetupHint(err)
+		snap.Hint = FunnelSetupHint(err)
 		snap.LastErr = err.Error()
 	}
 	return snap
@@ -126,7 +198,7 @@ func LogSetupIssue(logger *slog.Logger, err error) {
 	if err == nil {
 		return
 	}
-	if hint := remote.FunnelSetupHint(err); hint != "" {
+	if hint := FunnelSetupHint(err); hint != "" {
 		logger.Warn("remote access waiting on a tailnet setting",
 			slog.String("hint", hint),
 			slog.String("error", err.Error()))

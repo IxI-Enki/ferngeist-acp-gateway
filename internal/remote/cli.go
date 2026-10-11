@@ -1,6 +1,9 @@
 // Package remote provisions outbound-only remote access for the gateway over
 // Tailscale: it either drives an installed tailscale CLI or embeds a tsnet
-// node, and reports the stable public HTTPS URL back to the daemon.
+// node, and reports the stable public HTTPS URL back to the daemon. It also
+// owns the provisioning lifecycle (Access): the background retry loop, the
+// persisted public URL, paired-device notifications, and the auth-pending
+// snapshot the status API reads.
 package remote
 
 import (
