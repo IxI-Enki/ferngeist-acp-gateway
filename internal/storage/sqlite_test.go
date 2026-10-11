@@ -820,26 +820,32 @@ func TestMigrateReturnsErrorWhenDBIsClosed(t *testing.T) {
 }
 
 // TestMigrateDropsLegacyRuntimeTokensTable verifies an upgraded database stops
-// carrying the runtime_tokens table the gateway no longer uses.
+// carrying the runtime_tokens table the gateway no longer uses. The legacy table
+// is written before Open so the versioned baseline migration performs the drop
+// (a migrate() re-run on an already-versioned database is a deliberate no-op).
 func TestMigrateDropsLegacyRuntimeTokensTable(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "legacy_tokens.db"))
+	path := filepath.Join(t.TempDir(), "legacy_tokens.db")
+
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE runtime_tokens (
+		runtime_id TEXT PRIMARY KEY, token TEXT NOT NULL, expires_at TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	store, err := Open(path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer store.Close()
-	ctx := context.Background()
-
-	// Simulate a pre-upgrade database that still has the table.
-	if _, err := store.db.ExecContext(ctx, `CREATE TABLE runtime_tokens (
-		runtime_id TEXT PRIMARY KEY, token TEXT NOT NULL, expires_at TEXT NOT NULL)`); err != nil {
-		t.Fatalf("create legacy table: %v", err)
-	}
-	if err := store.migrate(ctx); err != nil {
-		t.Fatalf("migrate() error = %v", err)
-	}
 
 	var name string
-	err = store.db.QueryRowContext(ctx,
+	err = store.db.QueryRowContext(context.Background(),
 		`SELECT name FROM sqlite_master WHERE type='table' AND name='runtime_tokens'`).Scan(&name)
 	if err != sql.ErrNoRows {
 		t.Fatalf("runtime_tokens lookup error = %v (name=%q), want sql.ErrNoRows after migration", err, name)
