@@ -56,16 +56,9 @@ type DetectionConfig struct {
 }
 
 type LaunchConfig struct {
-	Mode    string        `json:"mode"`
-	Command string        `json:"command"`
-	Args    []string      `json:"args"`
-	Restart RestartConfig `json:"restart"`
-}
-
-type RestartConfig struct {
-	Mode           string `json:"mode"`
-	MaxRetries     int    `json:"maxRetries,omitempty"`
-	BackoffSeconds int    `json:"backoffSeconds,omitempty"`
+	Mode    string   `json:"mode"`
+	Command string   `json:"command"`
+	Args    []string `json:"args"`
 }
 
 type SecurityConfig struct {
@@ -195,13 +188,10 @@ func customToAgent(c CustomAgent) Agent {
 		Source:          "custom",
 		PlatformSupport: []string{"windows", "darwin", "linux", "android"},
 		Detection:       DetectionConfig{Mode: "path_lookup", Command: c.Command},
-		Launch: LaunchConfig{
-			Mode: "external", Command: c.Command, Args: append([]string(nil), c.Args...),
-			Restart: RestartConfig{Mode: "never"},
-		},
-		Security: SecurityConfig{CuratedLaunch: true, AllowsRemoteStart: true},
-		Registry: RegistryInfo{Required: false, ValidationStatus: "not_required"},
-		Hint:     c.Hint,
+		Launch:          LaunchConfig{Mode: "external", Command: c.Command, Args: append([]string(nil), c.Args...)},
+		Security:        SecurityConfig{CuratedLaunch: true, AllowsRemoteStart: true},
+		Registry:        RegistryInfo{Required: false, ValidationStatus: "not_required"},
+		Hint:            c.Hint,
 	}
 }
 
@@ -586,9 +576,6 @@ func validateLaunch(launch LaunchConfig) error {
 	if containsControlChars(launch.Command) {
 		return errors.New("launch command cannot contain control characters")
 	}
-	if err := validateRestart(launch.Restart); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -625,28 +612,6 @@ func validateExecutableName(command string) error {
 	}
 	if containsControlChars(command) || strings.ContainsAny(command, " \t") {
 		return errors.New("command must be a single executable name")
-	}
-	return nil
-}
-
-func validateRestart(restart RestartConfig) error {
-	mode := restart.Mode
-	if mode == "" {
-		mode = "never"
-	}
-
-	switch mode {
-	case "never":
-	case "on_failure":
-	default:
-		return fmt.Errorf("unsupported restart mode %q", restart.Mode)
-	}
-
-	if restart.MaxRetries < 0 {
-		return errors.New("restart maxRetries must not be negative")
-	}
-	if restart.BackoffSeconds < 0 {
-		return errors.New("restart backoffSeconds must not be negative")
 	}
 	return nil
 }
@@ -892,7 +857,6 @@ func registryExternalLaunchPlan(command string, args []string) registryLaunchPla
 		Mode:    "external",
 		Command: command,
 		Args:    args,
-		Restart: RestartConfig{Mode: "never"},
 	}
 	return registryLaunchPlan{
 		Launch: launch,

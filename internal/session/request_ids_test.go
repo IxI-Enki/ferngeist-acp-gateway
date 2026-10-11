@@ -31,8 +31,8 @@ func replyProbe(t *testing.T, line string) frameProbe {
 // client as the answer to its request, and must instead end the old turn.
 func TestRequestIDsKeepConnectionsApart(t *testing.T) {
 	var ids requestIDs
-	oldPrompt := ids.outbound(1, []byte(`{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"ses_a","prompt":[]}}`))
-	newLoad := ids.outbound(2, []byte(`{"jsonrpc":"2.0","id":3,"method":"session/load","params":{"sessionId":"ses_a"}}`))
+	oldPrompt := ids.outbound(1, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"ses_a","prompt":[]}}`)))
+	newLoad := ids.outbound(2, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":3,"method":"session/load","params":{"sessionId":"ses_a"}}`)))
 
 	oldID, newID := agentIDOf(t, oldPrompt), agentIDOf(t, newLoad)
 	if oldID == newID {
@@ -54,7 +54,7 @@ func TestRequestIDsKeepConnectionsApart(t *testing.T) {
 
 func TestRequestIDsDropOtherRepliesForAnEarlierConnection(t *testing.T) {
 	var ids requestIDs
-	out := ids.outbound(1, []byte(`{"jsonrpc":"2.0","id":1,"method":"session/set_mode","params":{"sessionId":"s"}}`))
+	out := ids.outbound(1, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/set_mode","params":{"sessionId":"s"}}`)))
 	reply := `{"jsonrpc":"2.0","id":` + agentIDOf(t, out) + `,"result":{}}`
 	if frames := ids.reply(2, replyProbe(t, reply), []string{reply}); len(frames) != 0 {
 		t.Fatalf("a stale non-prompt reply must be withheld, got %v", frames)
@@ -63,8 +63,8 @@ func TestRequestIDsDropOtherRepliesForAnEarlierConnection(t *testing.T) {
 
 func TestRequestIDsRetargetCancelRequest(t *testing.T) {
 	var ids requestIDs
-	agentID := agentIDOf(t, ids.outbound(4, []byte(`{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"s"}}`)))
-	cancel := ids.outbound(4, []byte(`{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":7}}`))
+	agentID := agentIDOf(t, ids.outbound(4, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"s"}}`))))
+	cancel := ids.outbound(4, parseClientFrame([]byte(`{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":7}}`)))
 	if !strings.Contains(string(cancel), `"requestId":`+agentID) {
 		t.Fatalf("cancel should target agent id %s, got %s", agentID, cancel)
 	}
@@ -73,7 +73,7 @@ func TestRequestIDsRetargetCancelRequest(t *testing.T) {
 func TestRequestIDsPassAgentRequestRepliesThrough(t *testing.T) {
 	var ids requestIDs
 	reply := []byte(`{"jsonrpc":"2.0","id":0,"result":{"outcome":{"outcome":"cancelled"}}}`)
-	if out := ids.outbound(1, reply); string(out) != string(reply) {
+	if out := ids.outbound(1, parseClientFrame(reply)); string(out) != string(reply) {
 		t.Fatalf("a reply to the agent's own request must pass unchanged, got %s", out)
 	}
 }

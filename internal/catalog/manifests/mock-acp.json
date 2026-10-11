@@ -10,10 +10,7 @@
   "launch": {
     "mode": "process",
     "command": "bin/__MOCK_AGENT_EXECUTABLE__",
-    "args": [],
-    "restart": {
-      "mode": "never"
-    }
+    "args": []
   },
   "capabilities": ["acp", "diagnostics"],
   "security": {

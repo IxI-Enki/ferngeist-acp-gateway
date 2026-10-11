@@ -11,8 +11,9 @@ import (
 )
 
 // legacySchemaStatements returns the baseline schema as it looked before the
-// retired-credential and clean columns existed. It is derived from
-// baselineSchema so the test tracks the v1 shape instead of a frozen copy.
+// retired-credential and clean columns existed and while gateway_sessions still
+// had leaseholder. It is derived from baselineSchema so the test tracks the v1
+// shape instead of a frozen copy.
 func legacySchemaStatements() []string {
 	out := make([]string, 0, len(baselineSchema))
 	for _, s := range baselineSchema {
@@ -34,6 +35,20 @@ func legacySchemaStatements() []string {
 				created_at TEXT NOT NULL,
 				failed_at TEXT NOT NULL,
 				log_preview TEXT NOT NULL DEFAULT ''
+			)`
+		case strings.HasPrefix(strings.TrimSpace(s), "CREATE TABLE IF NOT EXISTS gateway_sessions"):
+			s = `CREATE TABLE IF NOT EXISTS gateway_sessions (
+				session_id TEXT PRIMARY KEY,
+				runtime_id TEXT NOT NULL,
+				device_id TEXT NOT NULL,
+				agent_id TEXT NOT NULL,
+				status TEXT NOT NULL DEFAULT 'active',
+				leaseholder TEXT NOT NULL DEFAULT '',
+				created_at TEXT NOT NULL,
+				last_client_connect_at TEXT,
+				last_client_disconnect_at TEXT,
+				disconnected_since TEXT,
+				metadata TEXT NOT NULL DEFAULT '{}'
 			)`
 		}
 		out = append(out, s)
@@ -70,6 +85,13 @@ func writeLegacyDatabase(t *testing.T, path string) {
 		"dev-legacy", "Old Phone", "sha256:legacy", time.Now().UTC().Format(time.RFC3339Nano),
 	); err != nil {
 		t.Fatalf("insert legacy pairing: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO gateway_sessions(session_id, runtime_id, device_id, agent_id, status, leaseholder, created_at, last_client_connect_at, last_client_disconnect_at, disconnected_since)
+		 VALUES ('sess-legacy', 'rt-legacy', 'dev-legacy', 'agent-1', 'failed', 'sess-legacy', ?, '', '', '')`,
+		time.Now().UTC().Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatalf("insert legacy session: %v", err)
 	}
 }
 
@@ -155,6 +177,19 @@ func TestMigrateUpgradesLegacyDatabase(t *testing.T) {
 	}
 	if len(all) != 1 || !all[0].CleanExit {
 		t.Fatalf("ListRuntimeFailureRecords() = %+v, want one clean-exit record", all)
+	}
+
+	// leaseholder is dropped; the session row survives it.
+	var leaseholderCols int
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM pragma_table_info('gateway_sessions') WHERE name = 'leaseholder'`).Scan(&leaseholderCols); err != nil {
+		t.Fatalf("table_info lookup: %v", err)
+	}
+	if leaseholderCols != 0 {
+		t.Fatal("gateway_sessions.leaseholder survived the migration")
+	}
+	if sess, err := store.GetSession(ctx, "sess-legacy"); err != nil || sess.RuntimeID != "rt-legacy" {
+		t.Fatalf("GetSession(sess-legacy) = (%+v, %v), want the legacy row", sess, err)
 	}
 }
 

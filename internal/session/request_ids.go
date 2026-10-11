@@ -62,40 +62,35 @@ func ownerKey(gen int64, clientID json.RawMessage) string {
 	return strconv.FormatInt(gen, 10) + ":" + string(clientID)
 }
 
-// outbound rewrites a client->agent frame for connection gen: a request gets a
-// fresh id, and a $/cancel_request is pointed at the id its target was given.
-// Replies to the agent's own requests carry the agent's ids and pass unchanged,
-// as does anything that does not parse.
-func (r *requestIDs) outbound(gen int64, payload []byte) []byte {
-	var msg map[string]json.RawMessage
-	if json.Unmarshal(payload, &msg) != nil {
-		return payload
+// outbound rewrites a client->agent frame for connection gen and returns the
+// frame to forward: a request gets a fresh id (also set on f, for the stages
+// after this one), and a $/cancel_request is pointed at the id its target was
+// given. Replies to the agent's own requests carry the agent's ids and pass
+// unchanged, as does anything that does not parse.
+func (r *requestIDs) outbound(gen int64, f *clientFrame) []byte {
+	if f.fields == nil {
+		return f.raw
 	}
-	var method string
-	if json.Unmarshal(msg["method"], &method) != nil || method == "" {
-		if id, answers := msg["id"]; answers {
-			r.answerAgentRequest(id)
+	if f.Method == "" {
+		if f.ID != nil {
+			r.answerAgentRequest(f.ID)
 		}
-		return payload
+		return f.raw
 	}
-	clientID, isRequest := msg["id"]
-	if !isRequest {
-		if method == "$/cancel_request" && r.retargetCancel(gen, msg) {
-			return marshalOr(msg, payload)
+	if f.ID == nil {
+		if f.Method == "$/cancel_request" && r.retargetCancel(gen, f) {
+			f.raw = marshalOr(f.fields, f.raw)
 		}
-		return payload
+		return f.raw
 	}
 
-	var params struct {
-		SessionID string `json:"sessionId"`
-	}
-	_ = json.Unmarshal(msg["params"], &params)
-	origin := pendingRequest{gen: gen, clientID: clientID, owner: ownerKey(gen, clientID), method: method}
-	switch method {
+	clientID := f.ID
+	origin := pendingRequest{gen: gen, clientID: clientID, owner: ownerKey(gen, clientID), method: f.Method}
+	switch f.Method {
 	case "session/prompt":
-		origin.promptSession = params.SessionID
+		origin.promptSession = f.Params.SessionID
 	case "session/load":
-		origin.loadSession = params.SessionID
+		origin.loadSession = f.Params.SessionID
 	}
 
 	r.mu.Lock()
@@ -109,19 +104,27 @@ func (r *requestIDs) outbound(gen int64, payload []byte) []byte {
 	r.byOwner[origin.owner] = agentID
 	r.mu.Unlock()
 
-	msg["id"] = json.RawMessage(agentID)
-	return marshalOr(msg, payload)
+	f.ID = json.RawMessage(agentID)
+	f.fields["id"] = f.ID
+	f.raw = marshalOr(f.fields, f.raw)
+	return f.raw
 }
 
-func (r *requestIDs) retargetCancel(gen int64, msg map[string]json.RawMessage) bool {
-	var params map[string]json.RawMessage
-	if json.Unmarshal(msg["params"], &params) != nil || params["requestId"] == nil {
+// retargetCancel points a $/cancel_request at the agent-side id of the request
+// it cancels. Only a cancel that matches parses its params again, to rewrite
+// them.
+func (r *requestIDs) retargetCancel(gen int64, f *clientFrame) bool {
+	if f.Params.RequestID == nil {
 		return false
 	}
 	r.mu.Lock()
-	agentID, ok := r.byOwner[ownerKey(gen, params["requestId"])]
+	agentID, ok := r.byOwner[ownerKey(gen, f.Params.RequestID)]
 	r.mu.Unlock()
 	if !ok {
+		return false
+	}
+	var params map[string]json.RawMessage
+	if json.Unmarshal(f.fields["params"], &params) != nil {
 		return false
 	}
 	params["requestId"] = json.RawMessage(agentID)
@@ -129,7 +132,7 @@ func (r *requestIDs) retargetCancel(gen int64, msg map[string]json.RawMessage) b
 	if err != nil {
 		return false
 	}
-	msg["params"] = raw
+	f.fields["params"] = raw
 	return true
 }
 

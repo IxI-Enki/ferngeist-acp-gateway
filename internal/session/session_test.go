@@ -110,7 +110,7 @@ func TestProcessExitCrashSendsPush(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	// Simulate the agent's session/new response having been snooped, so the push
+	// Simulate the agent's session/new response having been observed, so the push
 	// carries the ACP session id the client navigates by — not the gateway's own
 	// resilient session id (sess.ID), which lives in a different namespace.
 	const acpID = "ses_crash_test"
@@ -283,12 +283,12 @@ func TestCreateSessionLimitIgnoresDeadSessions(t *testing.T) {
 
 	// Pre-seed a dead (failed) record for the device, as a prior crash would leave.
 	if err := store.SaveSession(ctx, storage.SessionRecord{
-		SessionID:   "dead-1",
-		RuntimeID:   "rt-dead",
-		DeviceID:    "dev-quota",
-		AgentID:     "agent-dead",
-		Status:      StatusFailed,
-		CreatedAt:   time.Now().UTC(),
+		SessionID: "dead-1",
+		RuntimeID: "rt-dead",
+		DeviceID:  "dev-quota",
+		AgentID:   "agent-dead",
+		Status:    StatusFailed,
+		CreatedAt: time.Now().UTC(),
 	}); err != nil {
 		t.Fatalf("seed failed session: %v", err)
 	}
@@ -301,6 +301,60 @@ func TestCreateSessionLimitIgnoresDeadSessions(t *testing.T) {
 	// A second live session does hit the limit.
 	if _, _, err := rs.Create(ctx, agent, "dev-quota", nil); err != ErrSessionLimitReached {
 		t.Errorf("expected ErrSessionLimitReached for second live session, got %v", err)
+	}
+}
+
+// TestCreateSessionLimitHoldsUnderConcurrency verifies concurrent connects from
+// one device cannot exceed the quota: the launch runs outside the lock, so each
+// in-flight Create must hold its slot.
+func TestCreateSessionLimitHoldsUnderConcurrency(t *testing.T) {
+	rs, store, agent, _, ctx := setupTest(t, Config{MaxPerDevice: 2})
+	defer rs.Shutdown()
+	defer store.Close()
+
+	var wg sync.WaitGroup
+	var created atomic.Int32
+	for range 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, err := rs.Create(ctx, agent, "dev-race", nil)
+			switch err {
+			case nil:
+				created.Add(1)
+			case ErrSessionLimitReached:
+			default:
+				t.Errorf("Create: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := created.Load(); got != 2 {
+		t.Fatalf("created %d sessions, want 2", got)
+	}
+}
+
+// TestShutdownStopsAgentsAndKeepsRecords verifies Shutdown stops each agent as
+// an intentional stop but keeps the session record for startup reconciliation.
+func TestShutdownStopsAgentsAndKeepsRecords(t *testing.T) {
+	rs, store, agent, _, ctx := setupTest(t, Config{})
+	defer store.Close()
+
+	sess, _, err := rs.Create(ctx, agent, "dev-shutdown", nil)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	rs.Shutdown()
+
+	rt, err := rs.runtimeSvc.Get(sess.RuntimeID)
+	if err != nil {
+		t.Fatalf("Get runtime: %v", err)
+	}
+	if rt.Status != runtime.StatusStopped {
+		t.Errorf("runtime status = %q, want %q", rt.Status, runtime.StatusStopped)
+	}
+	if _, err := store.GetSession(ctx, sess.ID); err != nil {
+		t.Errorf("session record should survive shutdown: %v", err)
 	}
 }
 
@@ -1036,7 +1090,7 @@ func TestPumpSupportsClose(t *testing.T) {
 	feedInitialize(pump, `{"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"close":{}}}}}`)
 
 	if !pump.SupportsClose() {
-		t.Error("expected SupportsClose to be true after snooping initialize")
+		t.Error("expected SupportsClose to be true after observing initialize")
 	}
 }
 
@@ -1126,7 +1180,7 @@ func TestCloseWithSupportsCloseRoutesThroughPump(t *testing.T) {
 		loadRecovery: newLoadRecovery(rs.logger),
 	}
 	markCloseCapable(pump)
-	// The pump snooped the agent-side ACP session id from session/new; the
+	// The pump recorded the agent-side ACP session id from session/new; the
 	// gateway's session/close must address the agent with it, not the
 	// gateway's own resilient id.
 	pump.acp.mu.Lock()
@@ -1184,11 +1238,11 @@ func (w recordingWriteCloser) Write(p []byte) (int, error) {
 
 func (w recordingWriteCloser) Close() error { return nil }
 
-// TestWriteSessionCloseSkipsClientSnoop verifies that WriteSessionClose does
+// TestWriteSessionCloseSkipsClientObservation verifies that WriteSessionClose does
 // not contaminate the pump's client-derived caches: the gateway's own
 // session/close frame carries a params.sessionId that must never be captured as
 // the ACP session id (it is the resilient, non-ACP id).
-func TestWriteSessionCloseSkipsClientSnoop(t *testing.T) {
+func TestWriteSessionCloseSkipsClientObservation(t *testing.T) {
 	pump := &StdioPump{
 		proc: &runtime.Process{
 			Stdin:  nopWriteCloser{},
@@ -1341,7 +1395,7 @@ func TestPumpStdoutDrainLoopWithFramesAndAppendLog(t *testing.T) {
 	}
 }
 
-func TestPumpSnoopInitializeAlreadySet(t *testing.T) {
+func TestPumpInitializeCacheAlreadySet(t *testing.T) {
 	pump := &StdioPump{}
 	markCloseCapable(pump)
 	feedInitialize(pump, `{"result":{"agentCapabilities":{"sessionCapabilities":{"close":false}}}}`)
@@ -1350,9 +1404,9 @@ func TestPumpSnoopInitializeAlreadySet(t *testing.T) {
 	}
 }
 
-// TestPumpSnoopSessionID verifies the ACP session id is captured from a
+// TestPumpObservesSessionID verifies the ACP session id is captured from a
 // session/new response, ignored on unrelated frames, and not overwritten once set.
-func TestPumpSnoopSessionID(t *testing.T) {
+func TestPumpObservesSessionID(t *testing.T) {
 	pump := &StdioPump{}
 
 	// Unrelated frames don't set it.
@@ -1375,32 +1429,32 @@ func TestPumpSnoopSessionID(t *testing.T) {
 	}
 }
 
-// TestPumpSnoopInboundSessionID verifies the ACP session id is captured from a
+// TestPumpObservesInboundSessionID verifies the ACP session id is captured from a
 // client→agent frame's params.sessionId — the path that covers resilient
 // reconnects, where the agent never re-emits a session/new response.
-func TestPumpSnoopInboundSessionID(t *testing.T) {
+func TestPumpObservesInboundSessionID(t *testing.T) {
 	pump := &StdioPump{}
 
 	// Frames without params.sessionId don't set it (e.g. initialize).
-	pump.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}`))
+	pump.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}`)))
 	if got := pump.AcpSessionID(); got != "" {
 		t.Fatalf("AcpSessionID = %q, want empty before a frame carries sessionId", got)
 	}
 
 	// A session/prompt (or session/load) carries params.sessionId — captured here.
-	pump.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"ses_inbound","prompt":[]}}`))
+	pump.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"ses_inbound","prompt":[]}}`)))
 	if got := pump.AcpSessionID(); got != "ses_inbound" {
 		t.Fatalf("AcpSessionID = %q, want %q", got, "ses_inbound")
 	}
 
 	// A later inbound frame does not clobber the captured id.
-	pump.acp.observeInbound([]byte(`{"method":"session/cancel","params":{"sessionId":"ses_other"}}`))
+	pump.acp.observeInbound(parseClientFrame([]byte(`{"method":"session/cancel","params":{"sessionId":"ses_other"}}`)))
 	if got := pump.AcpSessionID(); got != "ses_inbound" {
 		t.Fatalf("AcpSessionID = %q, want it to stay %q", got, "ses_inbound")
 	}
 }
 
-// TestPumpTurnCompletePushUsesACPSessionID verifies the drain loop snoops the
+// TestPumpTurnCompletePushUsesACPSessionID verifies the drain loop records the
 // ACP session id from session/new and then stamps it onto a turn-complete push.
 func TestPumpTurnCompletePushUsesACPSessionID(t *testing.T) {
 	r, w := io.Pipe()
@@ -1434,7 +1488,7 @@ func TestPumpTurnCompletePushUsesACPSessionID(t *testing.T) {
 			t.Fatalf("category = %q, want %q", n.Category, push.CategoryTurnComplete)
 		}
 		if n.SessionID != "ses_live" {
-			t.Fatalf("push SessionID = %q, want the snooped ACP id %q", n.SessionID, "ses_live")
+			t.Fatalf("push SessionID = %q, want the observed ACP id %q", n.SessionID, "ses_live")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected a turn-complete push")
@@ -1457,7 +1511,7 @@ func TestPumpSwallowedFailureDetection(t *testing.T) {
 			events <- e
 		},
 	}
-	pump.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":9,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}`))
+	pump.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":9,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}`)))
 
 	// Swallowed failure: end_turn, zero usage, no content → error frame.
 	out, handled := turnReplacement(t, pump, `{"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}`)
@@ -1482,26 +1536,26 @@ func TestPumpSwallowedFailureDetection(t *testing.T) {
 	}
 
 	// Healthy turn: content streamed → passthrough.
-	pump.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":10,"method":"session/prompt","params":{}}`))
+	pump.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":10,"method":"session/prompt","params":{}}`)))
 	turnReplacement(t, pump, `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"}}}`)
 	if _, handled := turnReplacement(t, pump, `{"jsonrpc":"2.0","id":10,"result":{"stopReason":"end_turn"}}`); handled {
 		t.Fatal("healthy turn with content must not be rewritten")
 	}
 
 	// Non-zero usage → passthrough.
-	pump.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":11,"method":"session/prompt","params":{}}`))
+	pump.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":11,"method":"session/prompt","params":{}}`)))
 	if _, handled := turnReplacement(t, pump, `{"jsonrpc":"2.0","id":11,"result":{"stopReason":"end_turn","usage":{"inputTokens":30,"outputTokens":12}}}`); handled {
 		t.Fatal("turn with usage must not be rewritten")
 	}
 
 	// Non-end_turn stop reason (e.g. refusal) → passthrough.
-	pump.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":12,"method":"session/prompt","params":{}}`))
+	pump.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":12,"method":"session/prompt","params":{}}`)))
 	if _, handled := turnReplacement(t, pump, `{"jsonrpc":"2.0","id":12,"result":{"stopReason":"refusal"}}`); handled {
 		t.Fatal("refusal turn must not be rewritten")
 	}
 
 	// Result without a tracked prompt (e.g. initialize) → passthrough.
-	pump.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
+	pump.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)))
 	if _, handled := turnReplacement(t, pump, `{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}`); handled {
 		t.Fatal("initialize result must not be rewritten")
 	}
@@ -1838,11 +1892,11 @@ func TestAttachClientOnDisconnectedSession(t *testing.T) {
 func TestPumpReplaysInitializeAfterCaching(t *testing.T) {
 	p := &StdioPump{logger: slog.Default()}
 
-	initReq := []byte(`{"jsonrpc":"2.0","id":"1","method":"initialize","params":{}}`)
+	initReq := parseClientFrame([]byte(`{"jsonrpc":"2.0","id":"1","method":"initialize","params":{}}`))
 
 	// Before the agent responds there is nothing to replay: the first
 	// initialize must reach the agent.
-	if p.MaybeReplayInitialize(initReq) {
+	if p.replayInitialize(initReq) {
 		t.Fatal("first initialize must not be replayed (no cached response yet)")
 	}
 
@@ -1856,18 +1910,18 @@ func TestPumpReplaysInitializeAfterCaching(t *testing.T) {
 	}
 
 	// Non-initialize frames are never intercepted.
-	if p.MaybeReplayInitialize([]byte(`{"jsonrpc":"2.0","id":"7","method":"session/load","params":{}}`)) {
+	if p.replayInitialize(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":"7","method":"session/load","params":{}}`))) {
 		t.Error("non-initialize frame must not be replayed")
 	}
 
 	// A reconnecting client's duplicate initialize is intercepted (handled even
 	// with no attached client conn).
-	if !p.MaybeReplayInitialize([]byte(`{"jsonrpc":"2.0","id":"42","method":"initialize","params":{}}`)) {
+	if !p.replayInitialize(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":"42","method":"initialize","params":{}}`))) {
 		t.Error("duplicate initialize must be replayed from cache")
 	}
 }
 
-func TestPumpSnoopIgnoresNonInitializeResults(t *testing.T) {
+func TestPumpInitializeIgnoresNonInitializeResults(t *testing.T) {
 	p := &StdioPump{logger: slog.Default()}
 	// A prompt response has a result object but no protocolVersion; it must not
 	// be mistaken for the initialize response.
@@ -1931,7 +1985,7 @@ func TestWorkingDirByRuntime(t *testing.T) {
 	}
 
 	// After the pump captures a cwd, WorkingDir returns it.
-	pump1.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/proj"}}`))
+	pump1.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/proj"}}`)))
 	got, err := rs.WorkingDir("rt-1", "")
 	if err != nil {
 		t.Fatalf("WorkingDir(with cwd) error = %v", err)
@@ -1942,8 +1996,8 @@ func TestWorkingDirByRuntime(t *testing.T) {
 
 	// Two ACP sessions on one agent: each resolves to its own project, while
 	// the unscoped lookup still follows the most recently opened one.
-	pump1.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"acp-x","cwd":"/x"}}`))
-	pump1.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":3,"method":"session/load","params":{"sessionId":"acp-y","cwd":"/y"}}`))
+	pump1.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"acp-x","cwd":"/x"}}`)))
+	pump1.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":3,"method":"session/load","params":{"sessionId":"acp-y","cwd":"/y"}}`)))
 	if got, err := rs.WorkingDir("rt-1", "acp-x"); err != nil || got != "/x" {
 		t.Fatalf("WorkingDir(acp-x) = (%q, %v), want /x", got, err)
 	}
@@ -2016,7 +2070,7 @@ func TestPumpAttachBindRaceFencesEvictedConn(t *testing.T) {
 
 // TestCreateNeverAttachedIsReaped verifies a session whose client never attaches
 // (the app died before opening the WebSocket) is born disconnected, so the
-// reaper reclaims its process, lease and quota slot after MaxDisconnected.
+// reaper reclaims its process and quota slot after MaxDisconnected.
 func TestCreateNeverAttachedIsReaped(t *testing.T) {
 	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
@@ -2067,8 +2121,8 @@ func TestProcessExitIntentionalReclaimsWithoutPush(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	if _, err := rs.StopByRuntimeID(ctx, sess.RuntimeID); err != nil {
-		t.Fatalf("StopByRuntimeID: %v", err)
+	if err := rs.Close(ctx, sess.ID, "dev-stop"); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 	waitProcessStopped(t, sess)
 
@@ -2184,7 +2238,7 @@ func TestReapSparesSessionAwaitingClient(t *testing.T) {
 		t.Fatalf("session awaiting the client was reaped: %v", err)
 	}
 
-	sess.pump.reqIDs.outbound(1, []byte(`{"jsonrpc":"2.0","id":7,"result":{"outcome":{"outcome":"cancelled"}}}`))
+	sess.pump.reqIDs.outbound(1, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":7,"result":{"outcome":{"outcome":"cancelled"}}}`)))
 	rs.reapExpired(time.Hour)
 	if _, err := rs.GetSessionStatus(sess.ID); err != ErrSessionNotFound {
 		t.Fatalf("answered session not reaped: %v", err)

@@ -147,6 +147,8 @@ Base path: `/v1`
     - `409` — agent detected but launch mode unsupported, remote start not
       allowed, or the device's session limit is reached
     - `424` — agent executable not found (auto-install failed/unavailable)
+    - `502` — the agent exited during startup; the message carries its exit
+      error when there was one
     - `503` — session service not available
 
 - `POST /v1/agents/{agentId}/stop`
@@ -185,8 +187,7 @@ connect/stop through the same `POST /v1/agents/{agentId}/connect` /
   - `command` is either a bare executable name resolved on the daemon's `PATH`
     or an absolute path to an executable. Relative paths containing separators
     (`tools/my-agent`, `..\my-agent`) are rejected. Everything else about the
-    agent (protocol, restart policy, allowed platforms) is
-    derived server-side.
+    agent (protocol, allowed platforms) is derived server-side.
   - `args` is optional (at most 20 entries, 1024 characters each). There is no
     per-agent environment variable support in v1.
   - The `id` is derived from `displayName` as `custom-<slug>` and is
@@ -235,9 +236,11 @@ through the CLI: `ferngeist-gateway agents add|list|update|rm`
   - Requires `read` scope.
 
 - `POST /v1/runtimes/{runtimeId}/restart`
-  - Restarts the agent behind a runtime: the gateway session owning the runtime
-    is closed (its agent process stopped) and a fresh agent process + session are
-    created, mirroring `POST /v1/agents/{agentId}/connect`.
+  - Restarts the agent behind a runtime: a fresh agent process + session are
+    created, mirroring `POST /v1/agents/{agentId}/connect`, and only then is the
+    gateway session owning the old runtime closed (its agent process stopped).
+    If the new launch fails, the old session keeps running. Only the device
+    that owns the runtime's session may restart it.
   - Requires `control` scope.
   - Optional JSON request body with environment overrides:
     ```json
@@ -249,9 +252,11 @@ through the CLI: `ferngeist-gateway agents add|list|update|rm`
     `host`, `websocketUrl`, `websocketPath`, `sessionId`, `attachToken`) for the
     **new** runtime and session. `runtimeId` differs from the one restarted.
   - Error responses:
+    - `403` — the runtime's session belongs to another device
     - `404` — runtime not found
     - `409` — runtime is not running, or it has no session to restart
     - `424` — agent executable not found (auto-install failed/unavailable)
+    - `502` — the new agent exited during startup
     - `503` — session service not available
 
 ### Workspace browsing

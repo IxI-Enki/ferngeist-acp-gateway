@@ -144,10 +144,10 @@ daemon. Neither the dispatcher nor the session layer changes.
 The gateway exposes **read-only** views into the code the agent is working on
 (files, git status, git diff) so a phone client can inspect the project without
 an editor. The anchor is the **project directory the client opened in the
-agent**: the pump snoops the ACP `session/new` request's `params.cwd` inbound
-(and re-captures it from `session/load`, which Ferngeist sends when resuming a
-session) in `internal/session/pump.go`, holds it on the session under the same
-lock as the ACP session id, and surfaces it via
+agent**: the session's ACP state records the ACP `session/new` request's
+`params.cwd` inbound (and re-captures it from `session/load`, which Ferngeist
+sends when resuming a session) in `internal/session/acpstate.go`, holds it under
+the same lock as the ACP session id, and surfaces it via
 `RuntimeSession.WorkingDir(runtimeID)` (`internal/session/lifecycle.go`). This is
 deliberately **not** the launch working directory — PATH-resolved agents run in
 the gateway's own cwd, which is not the project.

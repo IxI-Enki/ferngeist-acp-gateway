@@ -55,18 +55,7 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 	if err != nil {
 		return fmt.Errorf("initialize logger: %w", err)
 	}
-	// Route the embedded Tailscale node's chatter into the structured log:
-	// subsystem lines at Debug (diagnostic; a fresh node is created on every
-	// retry attempt), user-facing lines at Info (state path, login link, auth
-	// loop — the operator needs these). Without the second sink tsnet prints
-	// the user-facing lines via the standard library logger in a different
-	// format.
-	tsnetLogf = func(format string, args ...any) {
-		logger.Debug("tsnet", slog.String("detail", fmt.Sprintf(format, args...)))
-	}
-	tsnetUserLogf = func(format string, args ...any) {
-		logger.Info("tsnet", slog.String("detail", fmt.Sprintf(format, args...)))
-	}
+	routeTsnetLogs(logger)
 	defer logSvc.Close()
 
 	store, err := storage.Open(cfg.StateDBPath)
@@ -99,24 +88,7 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 	catalogSvc.SetNpmResolver(catalog.ResolveNpmBinaryNames)
 	// Custom agents live in SQLite; the catalog pulls them on every refresh so
 	// client edits show up without a daemon restart.
-	catalogSvc.SetCustomProvider(func() []catalog.CustomAgent {
-		records, err := store.ListCustomAgents(context.Background())
-		if err != nil {
-			logger.Warn("list custom agents failed", slog.String("error", err.Error()))
-			return nil
-		}
-		out := make([]catalog.CustomAgent, 0, len(records))
-		for _, record := range records {
-			out = append(out, catalog.CustomAgent{
-				ID:          record.ID,
-				DisplayName: record.DisplayName,
-				Command:     record.Command,
-				Args:        record.Args,
-				Hint:        record.Hint,
-			})
-		}
-		return out
-	})
+	catalogSvc.SetCustomProvider(customAgentProvider(store, logger))
 	installer := acquire.New(logger, cfg.ManagedBinDir, store)
 	runtimeSvc := gatewayruntime.NewSupervisor(logger, ".", store, installer)
 	pairingSvc := pairing.NewServiceWithOptions(logger, store, pairing.Options{
@@ -133,42 +105,8 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 	}
 	cfg.VAPIDPublicKey = vapidPublicKey
 
-	// Remote access provisioning: Tailscale CLI when available, embedded tsnet
-	// node otherwise. Best-effort — a provisioning failure never prevents the
-	// daemon from booting. With an auth key login is non-interactive, so the URL
-	// is known before the API server starts; otherwise Start runs the background
-	// retry loop so fixing a tailnet setting is enough — no restart.
-	var access *remote.Access
-	if cfg.TailscaleMode != "off" {
-		port, parseErr := portOf(cfg.ListenAddr)
-		if parseErr != nil {
-			logger.Warn("remote access disabled: invalid listen address", slog.String("error", parseErr.Error()))
-		} else {
-			access = remote.New(remoteProvision, store, pushSvc, logger, cfg, port)
-			if cfg.TailscaleAuthKey != "" {
-				// Synchronous: the URL is known before the API server starts.
-				// Failures here are configuration errors — log once, don't retry.
-				if res, err := access.Provision(ctx); err != nil {
-					remote.LogSetupIssue(logger, err)
-				} else if res != nil {
-					cfg.PublicBaseURL = res.URL
-				}
-			}
-		}
-	}
-
-	// Periodic update-available check: fetch the latest stable release and push
-	// a notification to paired devices when a newer version exists. Never
-	// applies the update — the user runs `ferngeist-gateway update`.
-	// Package-manager builds (apt, pacman, brew) are updated by their package
-	// manager, so they never announce `ferngeist-gateway update`.
-	selfUpdating := build.UpdateChannel == "" || build.UpdateChannel == "self"
-	if cfg.UpdateCheckEnabled && selfUpdating {
-		checker := update.NewChecker("arafatamim/ferngeist-acp-gateway")
-		notifier := update.NewNotifier(checker, pushSvc, store.GetPairedDeviceIDs)
-		notifier.Interval = cfg.UpdateCheckInterval
-		go notifier.Run(ctx, build.Version)
-	}
+	access := newRemoteAccess(ctx, &cfg, store, pushSvc, logger)
+	startUpdateNotifier(ctx, cfg, build, pushSvc, store)
 	sessionSvc := session.NewRuntimeSession(logger, store, runtimeSvc, tokenSvc, session.Config{
 		MaxDisconnected:    cfg.SessionMaxDisconnected,
 		MaxPerDevice:       cfg.MaxSessionsPerDevice,
@@ -183,13 +121,7 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 	discoverySvc := discovery.New(logger)
 
 	if cfg.EnableLAN {
-		if _, portText, err := net.SplitHostPort(cfg.ListenAddr); err == nil {
-			if port, parseErr := net.LookupPort("tcp", portText); parseErr == nil {
-				if err := discoverySvc.Start(cfg.GatewayName, port, DiscoveryTXTRecords(cfg, pairingSvc.ActiveDeviceCount())); err != nil {
-					logger.Warn("mdns discovery unavailable", slog.String("error", err.Error()))
-				}
-			}
-		}
+		startDiscovery(cfg, discoverySvc, pairingSvc, logger)
 	}
 	defer discoverySvc.Stop()
 
@@ -222,17 +154,19 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 		slog.String("admin_listen_addr", cfg.AdminListenAddr),
 		slog.Bool("lan_enabled", cfg.EnableLAN),
 	)
+	return serve(ctx, server, access, sessionSvc, logger)
+}
 
+// serve runs the API server until ctx is cancelled or the server fails, then
+// drains. A ListenAndServe failure still runs the whole shutdown sequence (HTTP
+// drain, remote close, session shutdown): returning early would orphan the
+// agent processes. The serve error is reported after cleanup completes.
+func serve(ctx context.Context, server *api.Server, access *remote.Access, sessionSvc *session.RuntimeSession, logger *slog.Logger) error {
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- server.ListenAndServe()
 	}()
 
-	// A ListenAndServe failure must still drain through the shutdown sequence
-	// below (HTTP drain, remote close, session + runtime shutdown) instead of
-	// returning early: an early return orphans child agent processes and
-	// leaks session goroutines/leases. The serve error is reported after
-	// cleanup completes.
 	var serveErr error
 	select {
 	case <-ctx.Done():
@@ -248,11 +182,11 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 	defer cancel()
 
 	var shutdownErr error
+	// Drain HTTP first so no request starts an agent during teardown, then
+	// stop remote access.
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		shutdownErr = fmt.Errorf("graceful shutdown failed: %w", err)
 	}
-	// Stop remote access first so no new inbound traffic arrives while the API
-	// server drains.
 	if access != nil {
 		if err := access.Close(); err != nil {
 			logger.Warn("remote access shutdown", slog.String("error", err.Error()))
@@ -264,6 +198,98 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 
 	logger.Info("gateway daemon stopped")
 	return errors.Join(serveErr, shutdownErr)
+}
+
+// routeTsnetLogs sends the embedded Tailscale node's chatter into the
+// structured log: subsystem lines at Debug (diagnostic; a fresh node is
+// created on every retry attempt), user-facing lines at Info (state path,
+// login link, auth loop — the operator needs these). Without the second sink
+// tsnet prints the user-facing lines via the standard library logger in a
+// different format.
+func routeTsnetLogs(logger *slog.Logger) {
+	tsnetLogf = func(format string, args ...any) {
+		logger.Debug("tsnet", slog.String("detail", fmt.Sprintf(format, args...)))
+	}
+	tsnetUserLogf = func(format string, args ...any) {
+		logger.Info("tsnet", slog.String("detail", fmt.Sprintf(format, args...)))
+	}
+}
+
+// customAgentProvider feeds the catalog the custom agents stored in SQLite.
+func customAgentProvider(store *storage.SQLiteStore, logger *slog.Logger) func() []catalog.CustomAgent {
+	return func() []catalog.CustomAgent {
+		records, err := store.ListCustomAgents(context.Background())
+		if err != nil {
+			logger.Warn("list custom agents failed", slog.String("error", err.Error()))
+			return nil
+		}
+		out := make([]catalog.CustomAgent, 0, len(records))
+		for _, record := range records {
+			out = append(out, catalog.CustomAgent{
+				ID:          record.ID,
+				DisplayName: record.DisplayName,
+				Command:     record.Command,
+				Args:        record.Args,
+				Hint:        record.Hint,
+			})
+		}
+		return out
+	}
+}
+
+// newRemoteAccess sets up remote access provisioning: Tailscale CLI when
+// available, embedded tsnet node otherwise. Best-effort — a provisioning
+// failure never prevents the daemon from booting. With an auth key login is
+// non-interactive, so it provisions now and records the URL in cfg before the
+// API server starts; otherwise the caller runs Start's background retry loop,
+// so fixing a tailnet setting is enough — no restart. Returns nil when remote
+// access is off or the listen address is unusable.
+func newRemoteAccess(ctx context.Context, cfg *config.Config, store *storage.SQLiteStore, pushSvc push.PushService, logger *slog.Logger) *remote.Access {
+	if cfg.TailscaleMode == "off" {
+		return nil
+	}
+	port, err := portOf(cfg.ListenAddr)
+	if err != nil {
+		logger.Warn("remote access disabled: invalid listen address", slog.String("error", err.Error()))
+		return nil
+	}
+	access := remote.New(remoteProvision, store, pushSvc, logger, *cfg, port)
+	if cfg.TailscaleAuthKey != "" {
+		// Failures here are configuration errors — log once, don't retry.
+		if res, err := access.Provision(ctx); err != nil {
+			remote.LogSetupIssue(logger, err)
+		} else if res != nil {
+			cfg.PublicBaseURL = res.URL
+		}
+	}
+	return access
+}
+
+// startUpdateNotifier runs the periodic update-available check: it fetches the
+// latest stable release and pushes a notification to paired devices when a
+// newer version exists. It never applies the update — the user runs
+// `ferngeist-gateway update`. Package-manager builds (apt, pacman, brew) are
+// updated by their package manager, so they never announce it.
+func startUpdateNotifier(ctx context.Context, cfg config.Config, build api.BuildInfo, pushSvc push.PushService, store *storage.SQLiteStore) {
+	selfUpdating := build.UpdateChannel == "" || build.UpdateChannel == "self"
+	if !cfg.UpdateCheckEnabled || !selfUpdating {
+		return
+	}
+	checker := update.NewChecker("arafatamim/ferngeist-acp-gateway")
+	notifier := update.NewNotifier(checker, pushSvc, store.GetPairedDeviceIDs)
+	notifier.Interval = cfg.UpdateCheckInterval
+	go notifier.Run(ctx, build.Version)
+}
+
+// startDiscovery advertises the gateway over mDNS on the LAN.
+func startDiscovery(cfg config.Config, discoverySvc *discovery.Service, pairingSvc *pairing.Service, logger *slog.Logger) {
+	port, err := portOf(cfg.ListenAddr)
+	if err != nil {
+		return
+	}
+	if err := discoverySvc.Start(cfg.GatewayName, port, DiscoveryTXTRecords(cfg, pairingSvc.ActiveDeviceCount())); err != nil {
+		logger.Warn("mdns discovery unavailable", slog.String("error", err.Error()))
+	}
 }
 
 // portOf extracts the TCP port from a listen address like "127.0.0.1:5788".

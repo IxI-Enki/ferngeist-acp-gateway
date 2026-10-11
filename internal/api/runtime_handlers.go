@@ -163,7 +163,7 @@ func (s *Server) handleAgentConnect(w http.ResponseWriter, r *http.Request) {
 
 	descriptor, err := s.runtime.Connect(sess.RuntimeID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "session runtime is not connectable")
+		s.writeStartupExit(w, r, sess, credential.DeviceID)
 		return
 	}
 	resp := connectResponseFromDescriptor(r, descriptor)
@@ -190,6 +190,18 @@ func writeAgentLaunchError(w http.ResponseWriter, err error) {
 	}
 }
 
+// writeStartupExit reports an agent that exited before its connect response
+// was built, with the exit error when there was one. The exit watcher may
+// already have reclaimed the session; otherwise it is closed here.
+func (s *Server) writeStartupExit(w http.ResponseWriter, r *http.Request, sess *session.Session, deviceID string) {
+	_ = s.sessionSvc.Close(r.Context(), sess.ID, deviceID)
+	message := "agent exited during startup"
+	if rt, err := s.runtime.Get(sess.RuntimeID); err == nil && rt.LastError != "" {
+		message += ": " + rt.LastError
+	}
+	writeError(w, http.StatusBadGateway, message)
+}
+
 // handleAgentStop stops every runtime for the agent (each is owned by one
 // session) and reports the newest stopped runtime.
 func (s *Server) handleAgentStop(w http.ResponseWriter, r *http.Request) {
@@ -214,8 +226,9 @@ func (s *Server) handleAgentStop(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, runtimeStopResponse{Runtime: runtimeInfo})
 }
 
-// handleRuntimeRestart restarts an agent: it stops the session that owns the
-// runtime's process and connects afresh with the merged environment. The env
+// handleRuntimeRestart restarts an agent: it launches a fresh agent process and
+// session with the requested environment, then closes the session that owned
+// the runtime. Only the device that owns the runtime may restart it. The env
 // scope check ensures only credentials with runtimeRestartEnv scope can pass
 // custom environment variables.
 func (s *Server) handleRuntimeRestart(w http.ResponseWriter, r *http.Request) {
@@ -259,24 +272,22 @@ func (s *Server) handleRuntimeRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := s.sessionSvc.StopByRuntimeID(r.Context(), runtimeID); err != nil {
-		if errors.Is(err, session.ErrSessionNotFound) {
-			writeError(w, http.StatusConflict, "runtime has no session to restart")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to stop runtime for restart")
+	sess, attachToken, err := s.sessionSvc.Restart(r.Context(), runtimeID, credential.DeviceID, agent, request.Env)
+	switch {
+	case errors.Is(err, session.ErrSessionNotFound):
+		writeError(w, http.StatusConflict, "runtime has no session to restart")
 		return
-	}
-
-	sess, attachToken, err := s.sessionSvc.Create(r.Context(), agent, credential.DeviceID, request.Env)
-	if err != nil {
+	case errors.Is(err, session.ErrDeviceMismatch):
+		writeError(w, http.StatusForbidden, "runtime belongs to another device")
+		return
+	case err != nil:
 		writeAgentLaunchError(w, err)
 		return
 	}
 
 	descriptor, err := s.runtime.Connect(sess.RuntimeID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "restarted runtime is not connectable")
+		s.writeStartupExit(w, r, sess, credential.DeviceID)
 		return
 	}
 	resp := connectResponseFromDescriptor(r, descriptor)

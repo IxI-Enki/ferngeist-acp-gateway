@@ -51,33 +51,19 @@ func newLoadRecovery(logger *slog.Logger) *LoadRecovery {
 // response (a success to cache, or an "already loaded" error to recover from)
 // can be correlated to the session it targets. Called on the client->agent path
 // before the frame is forwarded.
-func (r *LoadRecovery) OnOutbound(payload []byte) {
-	var req struct {
-		Method string          `json:"method"`
-		ID     json.RawMessage `json:"id"`
-		Params *struct {
-			SessionID string            `json:"sessionId"`
-			Prompt    []json.RawMessage `json:"prompt"`
-		} `json:"params"`
-	}
-	if err := json.Unmarshal(payload, &req); err != nil {
+func (r *LoadRecovery) OnOutbound(f *clientFrame) {
+	if f.Method == "session/prompt" && f.Params.SessionID != "" {
+		r.bufferPrompt(f.Params.SessionID, f.Params.Prompt)
 		return
 	}
-	if req.Method == "session/prompt" && req.Params != nil && req.Params.SessionID != "" {
-		r.bufferPrompt(req.Params.SessionID, req.Params.Prompt)
-		return
-	}
-	if req.Method != "session/load" {
-		return
-	}
-	if req.Params == nil || req.Params.SessionID == "" || len(req.ID) == 0 {
+	if f.Method != "session/load" || f.Params.SessionID == "" || len(f.ID) == 0 {
 		return
 	}
 	r.mu.Lock()
 	if r.pendingLoads == nil {
 		r.pendingLoads = make(map[string]string)
 	}
-	r.pendingLoads[responseIDKey(req.ID)] = req.Params.SessionID
+	r.pendingLoads[responseIDKey(f.ID)] = f.Params.SessionID
 	r.mu.Unlock()
 }
 

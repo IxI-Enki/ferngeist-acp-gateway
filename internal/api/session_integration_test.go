@@ -496,10 +496,10 @@ func TestResilientSession_ConcurrentAttachTakesOver(t *testing.T) {
 	}
 }
 
-// Connecting always launches a fresh agent and session: the runtime lease that
-// used to make a second connect reuse the first session is gone. The client
-// reconnects to an existing session via resume, so a re-connect must produce
-// distinct credentials while leaving the original session reconnectable.
+// Connecting always launches a fresh agent and session, so a second connect
+// never reuses the first session. The client reconnects to an existing session
+// via resume, so a re-connect must produce distinct credentials while leaving
+// the original session reconnectable.
 func TestResilientSession_ConnectLaunchesIndependentSessions(t *testing.T) {
 	h := newResilientTestHarness(t)
 

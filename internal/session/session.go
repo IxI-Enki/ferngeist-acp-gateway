@@ -4,7 +4,8 @@
 // via single-use attach tokens, using ACP session/load for context restoration.
 //
 // Key guarantees:
-//   - One session per runtime (enforced at create time via exclusive lease).
+//   - One session per runtime: connecting launches the agent, and the session
+//     owns that process directly.
 //   - The pump runs regardless of client connectivity.
 //   - Close always stops the backing runtime (no reference counting).
 //   - Inbound client messages are logged asynchronously for audit; hot path never
@@ -40,6 +41,11 @@ const (
 	// closeWriteTimeout bounds how long Close waits for the agent to accept the
 	// session/close frame before stopping the runtime anyway.
 	closeWriteTimeout = 2 * time.Second
+
+	// shutdownTimeout bounds Shutdown's parallel stop of every agent process:
+	// each Stop escalates to a kill after 2s, so this leaves room to record
+	// the exits.
+	shutdownTimeout = 5 * time.Second
 
 	// awaitingClientGrace is how long a disconnected session survives while the
 	// agent waits on a request the client has not answered. ponytail: a fixed
@@ -109,6 +115,9 @@ type RuntimeSession struct {
 	mu       sync.Mutex
 	sessions map[string]*Session // in-memory registry, keyed by session ID
 	closed   bool                // set by Shutdown; refuses new sessions
+	// launching counts each device's Creates between the quota check and
+	// registration, so in-flight launches hold their quota slot.
+	launching map[string]int
 
 	inbound *inboundWriter // async diagnostic logger for client->agent messages
 
@@ -163,6 +172,7 @@ func NewRuntimeSession(logger *slog.Logger, store *storage.SQLiteStore, runtimeS
 		tokenSvc:   tokenSvc,
 		cfg:        cfg,
 		sessions:   make(map[string]*Session),
+		launching:  make(map[string]int),
 		frameLog:   frameLog,
 	}
 	if cfg.MaxDisconnected <= 0 {

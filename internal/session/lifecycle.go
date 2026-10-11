@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/catalog"
@@ -24,55 +25,58 @@ import (
 // process. It is best-effort: if the session record cannot be saved after the
 // process was launched, the process is stopped so no orphan remains.
 func (rs *RuntimeSession) Create(ctx context.Context, agent catalog.Agent, deviceID string, env map[string]string) (*Session, string, error) {
+	return rs.create(ctx, agent, deviceID, env, "")
+}
+
+// create is Create with an optional session the new one replaces: that session
+// belongs to the same device and is closed by the caller once this returns, so
+// it does not count against the device's quota.
+func (rs *RuntimeSession) create(ctx context.Context, agent catalog.Agent, deviceID string, env map[string]string, replaces string) (*Session, string, error) {
 	rs.mu.Lock()
 	if rs.closed {
 		rs.mu.Unlock()
 		return nil, "", ErrSessionNotActive
 	}
-	if rs.cfg.MaxPerDevice > 0 {
-		existing, err := rs.store.ListSessionsByDevice(ctx, deviceID)
-		if err == nil {
-			// Only live sessions (active or disconnected) consume a device's quota.
-			// Failed and closing records are dead — they linger in storage after a
-			// crash or a daemon restart's startup reconciliation, and counting them
-			// would permanently exhaust the limit, blocking every new session for the
-			// device even though none are actually running.
-			live := 0
-			for _, rec := range existing {
-				if rec.Status == StatusActive || rec.Status == StatusDisconnected {
-					live++
-				}
-			}
-			if live >= rs.cfg.MaxPerDevice {
-				rs.mu.Unlock()
-				return nil, "", ErrSessionLimitReached
-			}
-		}
+	if rs.cfg.MaxPerDevice > 0 && rs.liveSessionsLocked(deviceID, replaces) >= rs.cfg.MaxPerDevice {
+		rs.mu.Unlock()
+		return nil, "", ErrSessionLimitReached
 	}
+	// The launch below runs unlocked, so the slot is reserved until the
+	// session is registered: concurrent connects from one device must not all
+	// pass the quota check.
+	rs.launching[deviceID]++
 	sessionID := generateID()
 	rs.mu.Unlock()
 
 	// Connecting starts the agent: the session owns the process it launches.
 	proc, err := rs.runtimeSvc.Launch(agent, env)
 	if err != nil {
+		rs.releaseLaunchSlot(deviceID)
 		return nil, "", err
 	}
 	runtimeID := proc.Runtime.ID
+	// abandon stops a process that never got a session. No exit watcher runs
+	// for it yet, so the exit is recorded here.
+	abandon := func() {
+		_ = proc.Stop(2 * time.Second)
+		rs.runtimeSvc.RecordExit(runtimeID, nil, true)
+	}
 
 	now := time.Now().UTC()
 	rec := storage.SessionRecord{
-		SessionID:   sessionID,
-		RuntimeID:   runtimeID,
-		DeviceID:    deviceID,
-		AgentID:     agent.ID,
-		Status:      StatusDisconnected,
-		CreatedAt:   now,
+		SessionID: sessionID,
+		RuntimeID: runtimeID,
+		DeviceID:  deviceID,
+		AgentID:   agent.ID,
+		Status:    StatusDisconnected,
+		CreatedAt: now,
 		// Born disconnected: the reaper reclaims a session whose client never
 		// attaches. AttachClient flips it to active.
 		DisconnectedSince: &now,
 	}
 	if err := rs.store.SaveSession(ctx, rec); err != nil {
-		_ = proc.Stop(2 * time.Second)
+		abandon()
+		rs.releaseLaunchSlot(deviceID)
 		return nil, "", err
 	}
 
@@ -122,10 +126,11 @@ func (rs *RuntimeSession) Create(ctx context.Context, agent catalog.Agent, devic
 	}
 
 	rs.mu.Lock()
+	rs.releaseLaunchSlotLocked(deviceID)
 	if rs.closed {
 		rs.mu.Unlock()
 		pumpCancel()
-		_ = proc.Stop(2 * time.Second)
+		abandon()
 		_ = rs.store.DeleteSession(context.Background(), sessionID)
 		return nil, "", ErrSessionNotActive
 	}
@@ -142,6 +147,39 @@ func (rs *RuntimeSession) Create(ctx context.Context, agent catalog.Agent, devic
 	}
 
 	return sess, attachToken, nil
+}
+
+// liveSessionsLocked counts the device's sessions that hold a quota slot: live
+// registered sessions plus launches still in flight, excluding the session
+// being replaced. Caller holds rs.mu.
+func (rs *RuntimeSession) liveSessionsLocked(deviceID, replaces string) int {
+	live := rs.launching[deviceID]
+	for _, s := range rs.sessions {
+		if s.DeviceID != deviceID || s.ID == replaces {
+			continue
+		}
+		s.mu.Lock()
+		status := s.Status
+		s.mu.Unlock()
+		if status == StatusActive || status == StatusDisconnected {
+			live++
+		}
+	}
+	return live
+}
+
+func (rs *RuntimeSession) releaseLaunchSlot(deviceID string) {
+	rs.mu.Lock()
+	rs.releaseLaunchSlotLocked(deviceID)
+	rs.mu.Unlock()
+}
+
+func (rs *RuntimeSession) releaseLaunchSlotLocked(deviceID string) {
+	if rs.launching[deviceID] <= 1 {
+		delete(rs.launching, deviceID)
+		return
+	}
+	rs.launching[deviceID]--
 }
 
 // watchProcess waits for the session's agent process to exit and records the
@@ -355,12 +393,12 @@ func (rs *RuntimeSession) AttachClient(ctx context.Context, sessionID, attachTok
 	sess.Status = StatusActive
 	sess.DisconnectedAt = nil
 	record := storage.SessionRecord{
-		SessionID:   sess.ID,
-		RuntimeID:   sess.RuntimeID,
-		DeviceID:    sess.DeviceID,
-		AgentID:     sess.AgentID,
-		Status:      StatusActive,
-		CreatedAt:   sess.CreatedAt,
+		SessionID: sess.ID,
+		RuntimeID: sess.RuntimeID,
+		DeviceID:  sess.DeviceID,
+		AgentID:   sess.AgentID,
+		Status:    StatusActive,
+		CreatedAt: sess.CreatedAt,
 	}
 	runtimeID := sess.RuntimeID
 	sess.mu.Unlock()
@@ -481,20 +519,29 @@ func (rs *RuntimeSession) Close(ctx context.Context, sessionID, deviceID string)
 	return rs.closeSession(ctx, sess)
 }
 
-// StopByRuntimeID closes the session bound to runtimeID, stopping its agent
-// process. Runtimes are gateway-global, so any control-scoped client may stop
-// one. Returns the runtime's final record.
-func (rs *RuntimeSession) StopByRuntimeID(ctx context.Context, runtimeID string) (runtime.Runtime, error) {
+// Restart replaces the device's session on runtimeID with a fresh launch of
+// agent carrying env. The new session starts before the old one closes, so a
+// failed launch leaves the old session running; the replaced session does not
+// count against the device's quota. A runtime owned by another device is
+// refused with ErrDeviceMismatch.
+func (rs *RuntimeSession) Restart(ctx context.Context, runtimeID, deviceID string, agent catalog.Agent, env map[string]string) (*Session, string, error) {
 	rs.mu.Lock()
-	sess, ok := rs.sessionByRuntimeLocked(runtimeID)
+	old, ok := rs.sessionByRuntimeLocked(runtimeID)
 	rs.mu.Unlock()
 	if !ok {
-		return runtime.Runtime{}, ErrSessionNotFound
+		return nil, "", ErrSessionNotFound
 	}
-	if err := rs.closeSession(ctx, sess); err != nil {
-		return runtime.Runtime{}, err
+	if old.DeviceID != deviceID {
+		return nil, "", ErrDeviceMismatch
 	}
-	return rs.runtimeSvc.Get(runtimeID)
+	sess, attachToken, err := rs.create(ctx, agent, deviceID, env, old.ID)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := rs.closeSession(ctx, old); err != nil {
+		rs.logger.Warn("failed to close replaced session", "session_id", old.ID, "error", err)
+	}
+	return sess, attachToken, nil
 }
 
 // StopByAgent closes every session for the agent, stopping each agent process.
@@ -544,8 +591,13 @@ func (rs *RuntimeSession) sessionByRuntimeLocked(runtimeID string) (*Session, bo
 func (rs *RuntimeSession) closeSession(ctx context.Context, sess *Session) error {
 	// Step 1: mark the session as closing and its exit intentional, so no
 	// concurrent operation treats it as live and the exit watcher records a
-	// clean stop even if the process dies during teardown.
-	sess.stopping.Store(true)
+	// clean stop even if the process dies during teardown. Only the first
+	// close tears down; a concurrent one (Close racing the reaper or a stop)
+	// just waits for that teardown to stop the process.
+	if !sess.stopping.CompareAndSwap(false, true) {
+		rs.awaitExit(sess)
+		return nil
+	}
 	sess.mu.Lock()
 	sess.Status = StatusClosing
 	sess.mu.Unlock()
@@ -576,10 +628,10 @@ func (rs *RuntimeSession) closeSession(ctx context.Context, sess *Session) error
 	// Uses acp.CloseSessionRequest for typed param construction. Routed through
 	// the pump (WriteSessionClose) so the frame log records the teardown
 	// handshake; the frame is gateway-originated, so it deliberately skips the
-	// client-snooping in WriteToAgent.
+	// client-frame observation in WriteToAgent.
 	//
 	// The sessionId must be the agent-side ACP id the client negotiated via
-	// session/new (snooped by the pump) — the gateway's own resilient
+	// session/new (recorded in the pump's ACP state) — the gateway's own resilient
 	// sessionID is a different namespace and an agent that doesn't recognize
 	// it will silently no-op the close, skipping the cancel-in-flight-work
 	// handshake before the process is killed.
@@ -619,13 +671,7 @@ func (rs *RuntimeSession) closeSession(ctx context.Context, sess *Session) error
 	if err := sess.proc.Stop(2 * time.Second); err != nil {
 		rs.logger.Warn("agent process did not stop cleanly", "runtime_id", sess.RuntimeID, "error", err)
 	}
-	if sess.exited != nil {
-		select {
-		case <-sess.exited:
-		case <-time.After(5 * time.Second):
-			rs.logger.Warn("timed out waiting for process exit to be recorded", "runtime_id", sess.RuntimeID)
-		}
-	}
+	rs.awaitExit(sess)
 
 	// Step 6: delete from storage — cascades to outbound/inbound rows.
 	if err := rs.store.DeleteSession(ctx, sess.ID); err != nil {
@@ -633,6 +679,19 @@ func (rs *RuntimeSession) closeSession(ctx context.Context, sess *Session) error
 	}
 
 	return nil
+}
+
+// awaitExit waits, bounded, for the exit watcher to record the session's
+// process exit.
+func (rs *RuntimeSession) awaitExit(sess *Session) {
+	if sess.exited == nil {
+		return
+	}
+	select {
+	case <-sess.exited:
+	case <-time.After(5 * time.Second):
+		rs.logger.Warn("timed out waiting for process exit to be recorded", "runtime_id", sess.RuntimeID)
+	}
 }
 
 // ListByDevice returns summaries of all sessions owned by a device.
@@ -655,7 +714,7 @@ func (rs *RuntimeSession) ListByDevice(ctx context.Context, deviceID string) ([]
 }
 
 // GetPump returns the StdioPump for a session (used by HTTP handlers to write
-// to the agent via WriteToAgent/MaybeReplayInitialize). The pump's connection
+// to the agent via WriteToAgent). The pump's connection
 // lifecycle is driven through RuntimeSession's AttachClient/BindConn/DetachClient.
 func (rs *RuntimeSession) GetPump(sessionID string) (*StdioPump, error) {
 	rs.mu.Lock()
@@ -762,8 +821,11 @@ func (rs *RuntimeSession) reapExpired(maxDisc time.Duration) {
 	}
 }
 
-// Shutdown stops the reaper, cancels all active session pumps, stops every
-// agent process, and stops the inbound diagnostic writer.
+// Shutdown stops the reaper and every agent process, then the inbound
+// diagnostic writer. Unlike Close it sends no session/close and keeps the
+// session records: the agents are only stopped because the daemon is, and
+// startup reconciliation marks the records failed. Processes stop in parallel
+// under one deadline so a service manager's stop timeout is never exceeded.
 func (rs *RuntimeSession) Shutdown() {
 	if rs.cancelReaper != nil {
 		rs.cancelReaper()
@@ -771,15 +833,41 @@ func (rs *RuntimeSession) Shutdown() {
 	rs.mu.Lock()
 	rs.closed = true
 	sessions := make([]*Session, 0, len(rs.sessions))
-	for _, sess := range rs.sessions {
+	for id, sess := range rs.sessions {
 		sessions = append(sessions, sess)
+		// Out of the registry first, so the exit watcher sees no live session
+		// and does not report a crash.
+		delete(rs.sessions, id)
 	}
 	rs.mu.Unlock()
 
+	var wg sync.WaitGroup
 	for _, sess := range sessions {
-		if err := rs.closeSession(context.Background(), sess); err != nil {
-			rs.logger.Warn("failed to stop session during shutdown", "session_id", sess.ID, "error", err)
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if !sess.stopping.CompareAndSwap(false, true) {
+				rs.awaitExit(sess) // a Close already owns the teardown
+				return
+			}
+			if sess.cancelPump != nil {
+				sess.cancelPump()
+			}
+			if err := sess.proc.Stop(2 * time.Second); err != nil {
+				rs.logger.Warn("agent process did not stop cleanly", "runtime_id", sess.RuntimeID, "error", err)
+			}
+			rs.awaitExit(sess)
+		}()
+	}
+	stopped := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(shutdownTimeout):
+		rs.logger.Warn("timed out stopping agent processes during shutdown")
 	}
 
 	if rs.inbound != nil {

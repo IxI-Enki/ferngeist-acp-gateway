@@ -22,8 +22,8 @@ func onFrame(t *testing.T, r *LoadRecovery, line string) ([]string, bool) {
 	return r.OnFrame(line, probe, ok)
 }
 
-func loadRequest(id, sessionID string) []byte {
-	return []byte(`{"jsonrpc":"2.0","id":` + id + `,"method":"session/load","params":{"sessionId":"` + sessionID + `"}}`)
+func loadRequest(id, sessionID string) *clientFrame {
+	return parseClientFrame([]byte(`{"jsonrpc":"2.0","id":` + id + `,"method":"session/load","params":{"sessionId":"` + sessionID + `"}}`))
 }
 
 func updateFrame(sessionID, text string) string {
@@ -166,9 +166,9 @@ func TestBufferLoadHistoryEvictsOldest(t *testing.T) {
 	}
 }
 
-func promptRequest(sessionID, text string) []byte {
-	return []byte(`{"jsonrpc":"2.0","id":9,"method":"session/prompt","params":{"sessionId":"` + sessionID +
-		`","prompt":[{"type":"text","text":"` + text + `"}]}}`)
+func promptRequest(sessionID, text string) *clientFrame {
+	return parseClientFrame([]byte(`{"jsonrpc":"2.0","id":9,"method":"session/prompt","params":{"sessionId":"` + sessionID +
+		`","prompt":[{"type":"text","text":"` + text + `"}]}}`))
 }
 
 // A live prompt is a request, never echoed as an update, so the replay must

@@ -8,10 +8,12 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/arafatamim/ferngeist-acp-gateway/internal/runtime"
 )
 
 // newRecoveryPump builds a bare StdioPump suitable for exercising pump helpers
-// that never touch the websocket client or leased pipes.
+// that never touch the websocket client or the agent process.
 func newRecoveryPump() *StdioPump {
 	return &StdioPump{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 }
@@ -163,8 +165,8 @@ func TestWorkingTitleUsesAgentInfo(t *testing.T) {
 // cwd binds when that response comes back with the same request id.
 func TestSessionNewCwdBindsOnResponse(t *testing.T) {
 	p := newRecoveryPump()
-	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":7,"method":"session/new","params":{"cwd":"/a"}}`))
-	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":8,"method":"session/new","params":{"cwd":"/b"}}`))
+	p.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":7,"method":"session/new","params":{"cwd":"/a"}}`)))
+	p.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":8,"method":"session/new","params":{"cwd":"/b"}}`)))
 
 	respond := func(line string) {
 		t.Helper()
@@ -185,10 +187,25 @@ func TestSessionNewCwdBindsOnResponse(t *testing.T) {
 	}
 
 	// A failed session/new binds nothing and drops its pending entry.
-	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":9,"method":"session/new","params":{"cwd":"/c"}}`))
+	p.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":9,"method":"session/new","params":{"cwd":"/c"}}`)))
 	respond(`{"jsonrpc":"2.0","id":9,"error":{"code":-32000,"message":"nope"}}`)
 	if len(p.acp.pendingCwd) != 0 {
 		t.Fatalf("pendingCwd = %v, want empty after error response", p.acp.pendingCwd)
+	}
+}
+
+// Through the real write path the client's request id is rewritten before the
+// cwd is recorded, so the agent's reply (which carries the agent-side id) still
+// binds the cwd to the new ACP session.
+func TestSessionNewCwdBindsThroughIDRewrite(t *testing.T) {
+	p := newRecoveryPump()
+	p.proc = &runtime.Process{Stdin: nopWriteCloser{}}
+	if err := p.WriteToAgent([]byte(`{"jsonrpc":"2.0","id":"client-7","method":"session/new","params":{"cwd":"/proj"}}`)); err != nil {
+		t.Fatalf("WriteToAgent: %v", err)
+	}
+	p.handleStdoutLine(`{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_x"}}`)
+	if got := p.AcpCwdFor("ses_x"); got != "/proj" {
+		t.Fatalf("AcpCwdFor(ses_x) = %q, want /proj", got)
 	}
 }
 
@@ -196,8 +213,8 @@ func TestSessionNewCwdBindsOnResponse(t *testing.T) {
 // their cwd immediately; pushes for them carry it for the client's deep-link.
 func TestSessionLoadAndResumeCwdBindImmediately(t *testing.T) {
 	p := newRecoveryPump()
-	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"sl","cwd":"/l"}}`))
-	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"sr","cwd":"/r"}}`))
+	p.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"sl","cwd":"/l"}}`)))
+	p.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"sr","cwd":"/r"}}`)))
 	if got := p.AcpCwdFor("sl"); got != "/l" {
 		t.Fatalf("AcpCwdFor(sl) = %q, want /l", got)
 	}
@@ -210,31 +227,31 @@ func TestObserveInboundCwd(t *testing.T) {
 	p := newRecoveryPump()
 
 	// A non-session/new frame must not set cwd.
-	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1","cwd":"/should/not/apply"}}`))
+	p.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1","cwd":"/should/not/apply"}}`)))
 	if got := p.AcpCwd(); got != "" {
 		t.Fatalf("AcpCwd() after session/prompt = %q, want empty", got)
 	}
 
 	// A session/new with cwd captures it.
-	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/home/user/project"}}`))
+	p.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/home/user/project"}}`)))
 	if got := p.AcpCwd(); got != "/home/user/project" {
 		t.Fatalf("AcpCwd() = %q, want %q", got, "/home/user/project")
 	}
 
 	// A session/load with cwd also captures it (Ferngeist sends session/load on resume).
-	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":5,"method":"session/load","params":{"sessionId":"s1","cwd":"/home/user/loaded"}}`))
+	p.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":5,"method":"session/load","params":{"sessionId":"s1","cwd":"/home/user/loaded"}}`)))
 	if got := p.AcpCwd(); got != "/home/user/loaded" {
 		t.Fatalf("AcpCwd() after session/load = %q, want %q", got, "/home/user/loaded")
 	}
 
 	// A project switch updates it.
-	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":"/home/user/other"}}`))
+	p.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":"/home/user/other"}}`)))
 	if got := p.AcpCwd(); got != "/home/user/other" {
 		t.Fatalf("AcpCwd() after switch = %q, want %q", got, "/home/user/other")
 	}
 
 	// Empty cwd is ignored.
-	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":4,"method":"session/new","params":{"cwd":""}}`))
+	p.acp.observeInbound(parseClientFrame([]byte(`{"jsonrpc":"2.0","id":4,"method":"session/new","params":{"cwd":""}}`)))
 	if got := p.AcpCwd(); got != "/home/user/other" {
 		t.Fatalf("AcpCwd() after empty = %q, want unchanged", got)
 	}

@@ -162,18 +162,8 @@ func (s *Server) handleSessionWebSocket(w http.ResponseWriter, r *http.Request, 
 	defer stopPing()
 	go keepAliveWebSocket(pingCtx, conn, s.logger, pump.LastClientWriteAt)
 
-	// Intercept a duplicate `initialize` from a reconnecting client: the agent is
-	// already initialized, so replay the cached response instead of forwarding a
-	// second handshake that a strict agent may reject by exiting.
-	writeToAgent := func(payload []byte) error {
-		if pump.MaybeReplayInitialize(payload) {
-			return nil
-		}
-		return pump.WriteToAgent(payload)
-	}
-
 	done := make(chan error, 1)
-	go proxyWebSocketToStdio(conn, writeToAgent, func() {}, runtimeID, s.runtime.AppendLog,
+	go proxyWebSocketToStdio(conn, pump.WriteToAgent, func() {}, runtimeID, s.runtime.AppendLog,
 		func(payload []byte) {
 			s.sessionSvc.LogInbound(sessionID, string(payload))
 		}, done)

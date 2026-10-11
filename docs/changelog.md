@@ -181,16 +181,29 @@ not be coupled. Full release notes live in GitHub Releases.
   the agent, now by closing each gateway session that owns one. Behaves the same
   from a client's point of view; returns `503` when the session service is
   unavailable. (2026-10-11)
-- `[semantic]` `POST /v1/runtimes/{runtimeId}/restart` — stops the session
-  owning the runtime and connects afresh, so its response now carries
+- `[semantic]` `POST /v1/runtimes/{runtimeId}/restart` — launches a fresh agent
+  and session first and only then closes the session owning the runtime, so a
+  failed launch leaves the old session running. Its response now carries
   `sessionId` and `attachToken` (additive fields) alongside the new `runtimeId`.
-  The `env` override body and its `gateway.runtime.restart_env` scope are
-  unchanged. (2026-10-11)
+  Only the device that owns the runtime's session may restart it; another
+  device gets `403`. The `env` override body and its
+  `gateway.runtime.restart_env` scope are unchanged. (2026-10-11)
+- `[additive]` `POST /v1/agents/{agentId}/connect` and
+  `POST /v1/runtimes/{runtimeId}/restart` return `502` with the agent's exit
+  error when the agent exits during startup, instead of a generic `500`.
+  (2026-10-11)
+- `[semantic]` Agent objects from `GET /v1/agents` no longer carry
+  `launch.restart`: the gateway never restarts an agent, so the policy had no
+  effect. (2026-10-11)
 - `[semantic]` `GET /v1/status` `runtimeCounts` and the diagnostics runtime
   summary — the `stopping` and `circuitOpen` counters are removed (stopping is
   no longer a distinct runtime state, and the restart circuit breaker is gone).
   `GET /v1/runtimes` runtime objects likewise drop `restartAttempts`,
   `failureStreak` and `circuitOpen`. (2026-10-11)
+- `[semantic]` Not client-visible: the database drops the unused
+  `gateway_sessions.leaseholder` column on first start. Gateway `v0.13.0` and
+  earlier cannot use the migrated database, so downgrading the gateway is not
+  supported. (2026-10-11)
 
 ## History
 

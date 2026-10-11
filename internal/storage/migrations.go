@@ -121,7 +121,6 @@ var baselineSchema = []string{
 		device_id TEXT NOT NULL,
 		agent_id TEXT NOT NULL,
 		status TEXT NOT NULL DEFAULT 'active',
-		leaseholder TEXT NOT NULL DEFAULT '',
 		created_at TEXT NOT NULL,
 		last_client_connect_at TEXT,
 		last_client_disconnect_at TEXT,
@@ -207,17 +206,39 @@ func migrateBaseline(ctx context.Context, tx *sql.Tx) error {
 		}
 	}
 
+	// gateway_sessions.leaseholder recorded the stdio pipe lease, which no longer
+	// exists. Dropping it makes the database unusable by v0.13 and earlier,
+	// whose session queries name the column: downgrades are not supported.
+	hasLeaseholder, err := hasColumn(ctx, tx, "gateway_sessions", "leaseholder")
+	if err != nil {
+		return err
+	}
+	if hasLeaseholder {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE gateway_sessions DROP COLUMN leaseholder`); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
-// ensureColumn adds a column only when PRAGMA table_info shows it missing.
-// modernc.org/sqlite's bundled SQLite does not accept ADD COLUMN IF NOT EXISTS,
-// so a fresh database (which already has the column from the CREATE above) must
-// skip the ALTER.
+// ensureColumn adds a column only when it is missing. modernc.org/sqlite's
+// bundled SQLite does not accept ADD COLUMN IF NOT EXISTS, so a fresh database
+// (which already has the column from the CREATE above) must skip the ALTER.
 func ensureColumn(ctx context.Context, tx *sql.Tx, table, column, addStatement string) error {
+	present, err := hasColumn(ctx, tx, table, column)
+	if err != nil || present {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, addStatement)
+	return err
+}
+
+// hasColumn reports whether PRAGMA table_info lists column on table.
+func hasColumn(ctx context.Context, tx *sql.Tx, table, column string) (bool, error) {
 	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -230,15 +251,11 @@ func ensureColumn(ctx context.Context, tx *sql.Tx, table, column, addStatement s
 			pk         int
 		)
 		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultVal, &pk); err != nil {
-			return err
+			return false, err
 		}
 		if name == column {
-			return nil
+			return true, nil
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, addStatement)
-	return err
+	return false, rows.Err()
 }

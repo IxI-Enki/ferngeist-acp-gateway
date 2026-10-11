@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/config"
 )
@@ -34,6 +35,33 @@ func TestProvisionSuccessClearsSnapshot(t *testing.T) {
 	}
 	if a.Snapshot() != nil {
 		t.Fatal("snapshot should be nil after success")
+	}
+}
+
+// A provisioning that outlives Close's grace window must close its own result:
+// Close has already run and nothing else would release the node.
+func TestProvisionAfterCloseClosesItsResult(t *testing.T) {
+	release := make(chan struct{})
+	closed := make(chan struct{})
+	a := New(
+		func(context.Context, config.Config, string, int, func(string)) (*Result, error) {
+			<-release
+			return &Result{URL: "https://gw.tail.ts.net", Close: func() error {
+				close(closed)
+				return nil
+			}}, nil
+		},
+		nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), config.Config{}, 5788,
+	)
+	a.Start(context.Background(), nil)
+	if err := a.Close(); err != nil { // returns after the grace window
+		t.Fatalf("Close: %v", err)
+	}
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("late provisioning result was never closed")
 	}
 }
 

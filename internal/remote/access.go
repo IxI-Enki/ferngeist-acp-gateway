@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,6 +27,9 @@ var RetryInterval = 15 * time.Second
 // off its result.
 const closeGrace = 500 * time.Millisecond
 
+// errAccessClosed is returned by a provisioning that finished after Close.
+var errAccessClosed = errors.New("remote access closed")
+
 // Access provisions remote access and manages its lifecycle: it owns the
 // retry loop, persists the public URL, notifies paired devices, and surfaces
 // provisioning state (auth pending, setup blockers) to the status API.
@@ -38,9 +42,12 @@ type Access struct {
 	port      int
 
 	snapshot atomic.Pointer[RemoteSetupSnapshot]
-	result   atomic.Pointer[Result]
 	cancel   context.CancelFunc
 	done     chan struct{}
+
+	mu     sync.Mutex
+	result *Result // the provisioned node, closed by Close
+	closed bool    // set by Close; a later provision closes its own result
 }
 
 // New creates an Access module. provision is the seam for tests; in production
@@ -75,7 +82,18 @@ func (a *Access) Provision(ctx context.Context) (*Result, error) {
 	if res == nil {
 		return nil, nil
 	}
-	a.result.Store(res)
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		// Close has already run and will not see this result, so close it
+		// here rather than leak the node.
+		if res.Close != nil {
+			_ = res.Close()
+		}
+		return nil, errAccessClosed
+	}
+	a.result = res
+	a.mu.Unlock()
 
 	// Persist the public URL so the daemon reports it on restart without
 	// re-provisioning.
@@ -126,6 +144,9 @@ func (a *Access) Start(ctx context.Context, onURL func(string)) {
 		defer close(a.done)
 		for attempt := 1; ; attempt++ {
 			res, err := a.Provision(ctx)
+			if errors.Is(err, errAccessClosed) {
+				return
+			}
 			if err == nil && res != nil {
 				if onURL != nil {
 					onURL(res.URL)
@@ -146,18 +167,11 @@ func (a *Access) Start(ctx context.Context, onURL func(string)) {
 	}()
 }
 
-// URL returns the live public URL, or "" before provisioning succeeds.
-func (a *Access) URL() string {
-	if res := a.result.Load(); res != nil {
-		return res.URL
-	}
-	return ""
-}
-
 // Close stops the retry loop and closes a provisioned result. An in-flight
-// successful provisioning gets a short grace window to hand off its result; a
-// provision still waiting on interactive login cannot be cancelled (tsnet's Up
-// is not ctx-cancellable) and is abandoned — process exit cleans it up.
+// successful provisioning gets a short grace window to hand off its result; one
+// that finishes later closes its own result. A provision still waiting on
+// interactive login cannot be cancelled (tsnet's Up is not ctx-cancellable)
+// and is abandoned — process exit cleans it up.
 func (a *Access) Close() error {
 	if a.cancel != nil {
 		a.cancel()
@@ -166,7 +180,12 @@ func (a *Access) Close() error {
 		case <-time.After(closeGrace):
 		}
 	}
-	if res := a.result.Load(); res != nil && res.Close != nil {
+	a.mu.Lock()
+	a.closed = true
+	res := a.result
+	a.result = nil
+	a.mu.Unlock()
+	if res != nil && res.Close != nil {
 		return res.Close()
 	}
 	return nil

@@ -91,7 +91,7 @@ func (q *clientQueue) take() []string {
 // attached, a poor proxy). The client decides whether to display them.
 //
 // The pump itself parses nothing: it reads a frame, hands it to the ordered
-// stage list in acpstate.go, and queues whatever comes back. Agent-side
+// stage list in pipeline.go, and queues whatever comes back. Agent-side
 // conversation state lives in acp (acpstate.go), push notification decisions in
 // notify.go, client request ids in request_ids.go, and re-load replay in
 // load_recovery.go.
@@ -321,11 +321,17 @@ func (p *StdioPump) queueLocked(frames []string) *websocket.Conn {
 	return nil
 }
 
-// WriteToAgent writes one client→agent frame to the agent's stdin: it rewrites
-// the client's request id for this connection, records what the frame says
-// about the conversation, and buffers anything a later re-load has to replay.
+// WriteToAgent writes one client→agent frame to the agent's stdin. The frame is
+// parsed once. A duplicate `initialize` from a reconnecting client is answered
+// from the cached response instead: the agent is already initialized, and a
+// strict agent may reject a second handshake by exiting. Anything else is
+// rewritten for this connection and recorded (see prepareOutbound).
 func (p *StdioPump) WriteToAgent(payload []byte) error {
-	payload = p.prepareOutbound(payload)
+	f := parseClientFrame(payload)
+	if p.replayInitialize(f) {
+		return nil
+	}
+	payload = p.prepareOutbound(f)
 	if p.frameLog != nil {
 		p.frameLog.append(p.agentID, p.runtimeID, p.sessionID, "in", payload)
 	}

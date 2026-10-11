@@ -78,7 +78,7 @@ func connect(t *testing.T, p *StdioPump) (int64, *websocket.Conn) {
 // the agent's success reply through the drain path.
 func loadAndReply(t *testing.T, p *StdioPump, gen int64, sessionID string) {
 	t.Helper()
-	agent := p.reqIDs.outbound(gen, []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":%q}}`, sessionID)))
+	agent := p.reqIDs.outbound(gen, parseClientFrame([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":%q}}`, sessionID))))
 	p.handleStdoutLine(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":null}`, agentIDOf(t, agent)))
 }
 
@@ -114,7 +114,7 @@ func TestAgentRequestRedeliveredAfterLoadUntilAnswered(t *testing.T) {
 	readFrames(t, pump, c2, 1)
 
 	// Answered: gone for good.
-	pump.reqIDs.outbound(gen2, []byte(`{"jsonrpc":"2.0","id":7,"result":{"outcome":{"outcome":"cancelled"}}}`))
+	pump.reqIDs.outbound(gen2, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":7,"result":{"outcome":{"outcome":"cancelled"}}}`)))
 	gen3, c3 := connect(t, pump)
 	loadAndReply(t, pump, gen3, "ses_a")
 	readFrames(t, pump, c3, 1)
@@ -142,8 +142,8 @@ func TestAgentRequestRedeliveredAfterRecoveredLoad(t *testing.T) {
 	pump.handleStdoutLine(permissionRequest)
 
 	gen, c := connect(t, pump)
-	agent := pump.reqIDs.outbound(gen, []byte(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"ses_a"}}`))
-	pump.loadRecovery.OnOutbound(agent)
+	agent := pump.reqIDs.outbound(gen, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"ses_a"}}`)))
+	pump.loadRecovery.OnOutbound(parseClientFrame(agent))
 	pump.handleStdoutLine(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"Session already loaded"}}`, agentIDOf(t, agent)))
 	got := readFrames(t, pump, c, 3)
 	if got[0] != resumedFrame("ses_a", 0) {
@@ -181,11 +181,11 @@ func TestErrorPushOnlyForPromptReplies(t *testing.T) {
 	pump.loadRecovery = newTestLoadRecovery()
 	events := pushCollector(pump)
 
-	load := pump.reqIDs.outbound(1, []byte(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"ses_a"}}`))
-	pump.loadRecovery.OnOutbound(load)
+	load := pump.reqIDs.outbound(1, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"ses_a"}}`)))
+	pump.loadRecovery.OnOutbound(parseClientFrame(load))
 	pump.handleStdoutLine(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"Session already loaded"}}`, agentIDOf(t, load)))
 
-	mode := pump.reqIDs.outbound(1, []byte(`{"jsonrpc":"2.0","id":2,"method":"session/set_mode","params":{"sessionId":"ses_a","modeId":"x"}}`))
+	mode := pump.reqIDs.outbound(1, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/set_mode","params":{"sessionId":"ses_a","modeId":"x"}}`)))
 	pump.handleStdoutLine(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"nope"}}`, agentIDOf(t, mode)))
 
 	pump.handleStdoutLine(`{"jsonrpc":"2.0","id":99,"error":{"code":-1,"message":"unknown id"}}`)
@@ -193,7 +193,7 @@ func TestErrorPushOnlyForPromptReplies(t *testing.T) {
 		t.Fatalf("unexpected pushes: %+v", *events)
 	}
 
-	prompt := pump.reqIDs.outbound(1, []byte(`{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"ses_b","prompt":[]}}`))
+	prompt := pump.reqIDs.outbound(1, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"ses_b","prompt":[]}}`)))
 	pump.handleStdoutLine(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-1,"message":"boom"}}`, agentIDOf(t, prompt)))
 	if len(*events) != 1 || (*events)[0].Category != push.CategoryError || (*events)[0].AcpSessionID != "ses_b" {
 		t.Fatalf("prompt error push = %+v", *events)
@@ -207,7 +207,7 @@ func TestPushSessionIDFollowsTheFrame(t *testing.T) {
 	events := pushCollector(pump)
 	pump.handleStdoutLine(`{"jsonrpc":"2.0","id":"n1","result":{"sessionId":"ses_first"}}`)
 
-	prompt := pump.reqIDs.outbound(1, []byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"ses_second","prompt":[]}}`))
+	prompt := pump.reqIDs.outbound(1, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"ses_second","prompt":[]}}`)))
 	pump.handleStdoutLine(`{"jsonrpc":"2.0","id":5,"method":"session/request_permission","params":{"sessionId":"ses_second","options":[]}}`)
 	pump.handleStdoutLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_second","update":{"sessionUpdate":"tool_call","toolCallId":"c","status":"in_progress","title":"Editing"}}}`)
 	pump.handleStdoutLine(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn","usage":{"totalTokens":3}}}`, agentIDOf(t, prompt)))
@@ -230,9 +230,9 @@ func TestPushSessionIDFollowsTheFrame(t *testing.T) {
 // real prompt result.
 func TestSetModeReplyMidTurnDoesNotDisarmSwallowedFailureDetection(t *testing.T) {
 	pump := newPump()
-	prompt := pump.reqIDs.outbound(1, []byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"ses_a","prompt":[]}}`))
-	pump.acp.observeInbound(prompt)
-	mode := pump.reqIDs.outbound(1, []byte(`{"jsonrpc":"2.0","id":2,"method":"session/set_mode","params":{"sessionId":"ses_a","modeId":"x"}}`))
+	prompt := pump.reqIDs.outbound(1, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"ses_a","prompt":[]}}`)))
+	pump.acp.observeInbound(parseClientFrame(prompt))
+	mode := pump.reqIDs.outbound(1, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/set_mode","params":{"sessionId":"ses_a","modeId":"x"}}`)))
 
 	modeReply := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{}}`, agentIDOf(t, mode))
 	if _, handled := turnReplacement(t, pump, modeReply); handled {
@@ -246,7 +246,7 @@ func TestSetModeReplyMidTurnDoesNotDisarmSwallowedFailureDetection(t *testing.T)
 
 func TestAgentRequestsDroppedWhenTheirTurnEnds(t *testing.T) {
 	var r requestIDs
-	r.outbound(1, []byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1"}}`))
+	r.outbound(1, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1"}}`)))
 	req := `{"jsonrpc":"2.0","id":"perm-1","method":"session/request_permission","params":{"sessionId":"s1"}}`
 	probe, _ := parseFrameProbe([]byte(req))
 	r.trackAgentRequest(probe, req, 0)
@@ -267,7 +267,7 @@ func TestElicitationPushesAndNamesTheClientRequest(t *testing.T) {
 	events := pushCollector(pump)
 	gen, c := connect(t, pump)
 
-	auth := pump.reqIDs.outbound(gen, []byte(`{"jsonrpc":"2.0","id":"auth-1","method":"authenticate","params":{"methodId":"x"}}`))
+	auth := pump.reqIDs.outbound(gen, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":"auth-1","method":"authenticate","params":{"methodId":"x"}}`)))
 	pump.handleStdoutLine(fmt.Sprintf(`{"jsonrpc":"2.0","id":"e1","method":"elicitation/create","params":{"requestId":%s,"mode":"form","message":"key?","requestedSchema":{}}}`, agentIDOf(t, auth)))
 	got := readFrames(t, pump, c, 1)
 	if got[0] != `{"id":"e1","jsonrpc":"2.0","method":"elicitation/create","params":{"message":"key?","mode":"form","requestId":"auth-1","requestedSchema":{}}}` {
@@ -294,7 +294,7 @@ func TestProgressPushOnlyDuringPromptAndPerSession(t *testing.T) {
 		pump.handleStdoutLine(fmt.Sprintf(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":%q,"update":{"sessionUpdate":"tool_call","toolCallId":%q,"status":%q,"title":"Read %s"}}}`, session, call, status, call))
 	}
 
-	load := pump.reqIDs.outbound(1, []byte(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"a"}}`))
+	load := pump.reqIDs.outbound(1, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"a"}}`)))
 	update("a", "old1", "completed")
 	update("a", "old2", "completed")
 	pump.handleStdoutLine(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":null}`, agentIDOf(t, load)))
@@ -302,8 +302,8 @@ func TestProgressPushOnlyDuringPromptAndPerSession(t *testing.T) {
 		t.Fatalf("load replay pushed: %+v", *events)
 	}
 
-	pump.reqIDs.outbound(1, []byte(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"a","prompt":[]}}`))
-	pump.reqIDs.outbound(1, []byte(`{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"b","prompt":[]}}`))
+	pump.reqIDs.outbound(1, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"a","prompt":[]}}`)))
+	pump.reqIDs.outbound(1, parseClientFrame([]byte(`{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"b","prompt":[]}}`)))
 	update("a", "c1", "in_progress")
 	update("b", "c2", "in_progress") // within a's interval, but b's own throttle
 	update("a", "c3", "in_progress") // throttled
@@ -319,8 +319,8 @@ func TestSwallowedFailurePushesOnceAndCancelIsSilent(t *testing.T) {
 	events := pushCollector(pump)
 	prompt := func(stopReason string) {
 		req := []byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}`)
-		pump.acp.observeInbound(req)
-		id := agentIDOf(t, pump.reqIDs.outbound(1, req))
+		pump.acp.observeInbound(parseClientFrame(req))
+		id := agentIDOf(t, pump.reqIDs.outbound(1, parseClientFrame(req)))
 		pump.handleStdoutLine(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"stopReason":%q}}`, id, stopReason))
 	}
 

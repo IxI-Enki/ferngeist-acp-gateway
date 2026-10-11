@@ -153,7 +153,6 @@ func TestInvalidAdapterFallsBackToRegistryLaunch(t *testing.T) {
 				Launch: LaunchConfig{
 					Mode:    "external",
 					Command: "bad/command",
-					Restart: RestartConfig{Mode: "never"},
 				},
 				Security: SecurityConfig{
 					CuratedLaunch: true,
@@ -671,13 +670,6 @@ func TestRegistryBinaryAgentIsLaunchableWithoutPathWhenDownloadable(t *testing.T
 	}
 }
 
-func TestValidateRestartAllowsAutoRestart(t *testing.T) {
-	err := validateRestart(RestartConfig{Mode: "on_failure", MaxRetries: 1})
-	if err != nil {
-		t.Fatalf("validateRestart() error = %v", err)
-	}
-}
-
 type fakeRegistrySource struct {
 	snapshot acpregistry.Snapshot
 	err      error
@@ -731,7 +723,7 @@ func TestValidateAbsolutePathLaunch(t *testing.T) {
 		ID: "custom-foo", DisplayName: "Foo", Protocol: "acp",
 		PlatformSupport: []string{"windows", "darwin", "linux", "android"},
 		Detection:       DetectionConfig{Mode: "path_lookup", Command: abs},
-		Launch:          LaunchConfig{Mode: "external", Command: abs, Args: []string{"--acp"}, Restart: RestartConfig{Mode: "never"}},
+		Launch:          LaunchConfig{Mode: "external", Command: abs, Args: []string{"--acp"}},
 		Security:        SecurityConfig{CuratedLaunch: true, AllowsRemoteStart: true},
 	}
 	if err := validateAgent(agent); err != nil {

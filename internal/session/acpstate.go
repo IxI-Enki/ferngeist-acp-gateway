@@ -4,252 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
-	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/coder/websocket"
 )
 
-// This file holds the pump's ACP layer: the frame pipeline that every agent
-// stdout line runs through, and the state that pipeline maintains. One struct
-// (acpState) with one mutex holds everything the gateway remembers about the
-// conversation on one agent process.
-
-// frameProbe is the single-parse view of an ACP frame. The hot path previously
-// paid 5-6 json.Unmarshal scans per stdout line (turn activity, turn complete,
-// permission request, JSON-RPC error, progress event, load-recovery buffering),
-// each with its own []byte(line) copy. Every stage now reads this one parse, so
-// per-frame CPU/GC is one scan + one copy; rare paths (typed initialize
-// capabilities, load-success synthesis) keep their second parse off the hot
-// path.
-type frameProbe struct {
-	Method string           `json:"method"`
-	ID     *json.RawMessage `json:"id"`
-	Result *struct {
-		ProtocolVersion *int           `json:"protocolVersion"`
-		SessionID       string         `json:"sessionId"`
-		StopReason      acp.StopReason `json:"stopReason"`
-		Usage           *acp.Usage     `json:"usage"`
-	} `json:"result"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error"`
-	Params *struct {
-		SessionID string `json:"sessionId"`
-		// The client request a request-scoped elicitation/create is tied to.
-		RequestID json.RawMessage `json:"requestId"`
-		Update    *struct {
-			Discriminator string `json:"sessionUpdate"`
-			ToolCallID    string `json:"toolCallId"`
-			Status        string `json:"status"`
-			Title         string `json:"title"`
-			Kind          string `json:"kind"`
-			// Content is RawMessage because agents emit both a single
-			// object and an array; a typed slice would fail the whole
-			// probe parse on the object shape (history buffering must
-			// never depend on content shape).
-			Content json.RawMessage `json:"content"`
-		} `json:"update"`
-	} `json:"params"`
-}
-
-// parseFrameProbe parses one frame once. ok=false means invalid JSON; callers
-// treat it as opaque (no stage claims it, it forwards unchanged).
-func parseFrameProbe(data []byte) (frameProbe, bool) {
-	var probe frameProbe
-	if err := json.Unmarshal(data, &probe); err != nil {
-		return frameProbe{}, false
-	}
-	return probe, true
-}
-
-// frame is one agent stdout frame plus what the pipeline decided about it.
-type frame struct {
-	// raw is the frame's bytes: one copy, shared by every stage.
-	raw []byte
-	// line is the frame as it will be forwarded: a stage may replace it.
-	line  string
-	probe frameProbe
-	ok    bool
-	// origin is the client request this frame replies to, if any, and isReply
-	// whether it is a reply at all.
-	origin  pendingRequest
-	isReply bool
-	// out is what the client receives: one frame normally, a resume replay
-	// burst after a rejected duplicate session/load.
-	out []string
-	// replaced marks a frame this pipeline rewrote itself (swallowed-failure
-	// error), which has already raised its own notification.
-	replaced bool
-	// resumed marks the out burst as a gateway-synthesized resume replay: the
-	// load recovery stage replaced the frame with buffered history plus a
-	// success it built itself.
-	resumed bool
-}
-
-// handleStdoutLine processes one complete agent stdout frame. The frame is
-// parsed once and passed through a fixed ordered list of stages:
-//
-//	request ids → ACP state → load recovery → notifications → forward
-//
-// Every stage reads the same parse, so no two stages can disagree about what
-// the frame is, and each stage is a plain function call rather than a hook.
-func (p *StdioPump) handleStdoutLine(line string) {
-	// Track when the agent last produced output, so the reaper can
-	// distinguish abandoned sessions from actively-streaming ones.
-	p.lastStdoutMu.Lock()
-	p.lastStdoutAt = time.Now()
-	p.lastStdoutMu.Unlock()
-
-	if p.appendLog != nil {
-		p.appendLog(p.runtimeID, "acp.stdout", line)
-	}
-	if p.frameLog != nil {
-		p.frameLog.append(p.agentID, p.runtimeID, p.sessionID, "out", []byte(line))
-	}
-
-	f := &frame{line: line, raw: []byte(line), out: []string{line}}
-	f.probe, f.ok = parseFrameProbe(f.raw)
-	// Request ids: which client request (if any) this frame answers. Read-only,
-	// so later stages can use the answer without consuming it.
-	f.origin, f.isReply = p.reqIDs.peek(f.probe)
-
-	p.observeACPState(f)
-	p.applyLoadRecovery(f)
-	p.notifyFrame(f)
-	p.forward(f)
-}
-
-// observeACPState is the ACP-state stage: it feeds the frame into acpState
-// (initialize cache, agent name, session id, cwds, turn state) and, when the
-// agent swallowed a failed LLM call, replaces the frame with a JSON-RPC error
-// so the client sees the turn fail instead of an empty success.
-func (p *StdioPump) observeACPState(f *frame) {
-	p.acp.observeInitialize(f.probe, f.raw)
-	p.acp.observeSessionID(f.probe)
-	p.acp.bindPendingCwd(f.probe)
-	replacement, handled := p.observeTurn(f.probe, f.origin, f.isReply)
-	if !handled {
-		return
-	}
-	f.line, f.raw, f.out, f.replaced = replacement, []byte(replacement), []string{replacement}, true
-	// The replacement is a synthesized frame; re-probe it cheaply so the
-	// stages below see the frame actually forwarded.
-	if rp, ok := parseFrameProbe(f.raw); ok {
-		f.probe, f.ok = rp, true
-	}
-}
-
-// applyLoadRecovery is the load-recovery stage: it buffers conversation history
-// so a reconnecting client can be re-hydrated even when the agent rejects a
-// duplicate session/load as "already loaded". Normally the frame passes through
-// as-is; a rejected duplicate is replaced by the buffered history and a
-// synthesized success, opened by an explicit `_ferngeist/resumed` notification
-// (see LoadRecovery and docs/api.md).
-func (p *StdioPump) applyLoadRecovery(f *frame) {
-	if p.loadRecovery == nil {
-		return
-	}
-	if replacements, handled := p.loadRecovery.OnFrame(f.line, f.probe, f.ok); handled {
-		f.out = replacements
-		f.resumed = true
-	}
-}
-
-// forward is the last stage: it routes the frame(s) to the attached client.
-// It restores the client's own request id on a reply, withholds a reply for a
-// superseded connection (a finished prompt there becomes a _ferngeist/turn_ended
-// notification), re-sends the agent's unanswered requests behind a session/load
-// reply, scopes a request-bound elicitation, and queues the result to the
-// client's writer goroutine. A client whose backlog overflows is disconnected
-// rather than sent a stream with holes in it.
-func (p *StdioPump) forward(f *frame) {
-	var evict *websocket.Conn
-	p.clientMu.Lock()
-	// Under clientMu: a reply routed for one generation must not reach the next.
-	out := p.reqIDs.reply(p.connGen, f.probe, f.out)
-	bound := p.client != nil && p.writerQ != nil
-	// The agent's unanswered requests are not in load history, so the reply that
-	// restores their session carries them. Only for the connection that asked,
-	// and only once the load succeeded (a recovered "already loaded" counts).
-	if f.isReply && f.origin.method == "session/load" && f.origin.gen == p.connGen &&
-		bound && (f.resumed || f.probe.Error == nil) {
-		out = p.reqIDs.redeliver(p.connGen, f.origin.loadSession, out)
-	}
-	var deliveredGen int64
-	if bound {
-		deliveredGen = p.connGen
-	}
-	p.reqIDs.trackAgentRequest(f.probe, f.line, deliveredGen)
-	if bound {
-		out = p.reqIDs.scopeElicitation(p.connGen, f.probe, out)
-		evict = p.queueLocked(out)
-	}
-	p.clientMu.Unlock()
-	if evict != nil {
-		_ = evict.CloseNow()
-	}
-}
-
-// prepareOutbound rewrites one client→agent frame for the current connection
-// and records what it says about the conversation: the request id it is given,
-// the ACP session and project directory it names, a prompt starting a turn, and
-// anything the re-load replay has to remember.
-func (p *StdioPump) prepareOutbound(payload []byte) []byte {
-	p.clientMu.Lock()
-	gen := p.connGen
-	p.clientMu.Unlock()
-	payload = p.reqIDs.outbound(gen, payload)
-	p.acp.observeInbound(payload)
-	if p.loadRecovery != nil {
-		p.loadRecovery.OnOutbound(payload)
-	}
-	return payload
-}
-
-// observeTurn records content on the active turn and evaluates the prompt
-// result. A success with end_turn, zero usage, and no content is how some
-// agents (e.g. Opencode) report a swallowed LLM failure; in that case the frame
-// is replaced with a JSON-RPC error (same request id) so the client sees the
-// turn as failed, and handled reports the replacement. Log and push happen
-// outside the state lock: the callback reaches network code, and the next
-// prompt must never queue behind push I/O.
-func (p *StdioPump) observeTurn(probe frameProbe, origin pendingRequest, isReply bool) (out string, handled bool) {
-	if !p.acp.observeTurn(probe, origin, isReply) {
-		return "", false
-	}
-	p.logger.Warn("agent returned empty success; rewriting as JSON-RPC error "+
-		"(likely swallowed LLM failure: rate limit / invalid model setting)",
-		"runtime_id", p.runtimeID, "session_id", p.sessionID)
-	p.notifySwallowedFailure(probe, origin)
-	frame, ok := swallowedFailureFrame(probe)
-	if !ok {
-		p.logger.Error("failed to marshal swallowed-failure error frame")
-		return "", false // forward path treats ""+false as no replacement
-	}
-	return frame, true
-}
-
-// swallowedFailureFrame builds the JSON-RPC error that replaces an empty
-// success, keeping the request id so the client correlates it with its prompt.
-func swallowedFailureFrame(probe frameProbe) (string, bool) {
-	if probe.ID == nil {
-		return "", false
-	}
-	errFrame := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      *probe.ID,
-		"error": map[string]any{
-			"code":    -32000,
-			"message": "Agent produced no output for this turn. The model call likely failed (rate limit or invalid model setting); see the gateway logs for details.",
-		},
-	}
-	outBytes, err := json.Marshal(errFrame)
-	if err != nil {
-		return "", false
-	}
-	return string(outBytes), true
-}
+// This file holds the ACP state the frame pipeline (pipeline.go) maintains:
+// one struct (acpState) with one mutex holds everything the gateway remembers
+// about the conversation on one agent process.
 
 // acpState is everything the gateway remembers about the ACP conversation on one
 // agent process: the agent's initialize response and name, whether the agent
@@ -307,30 +69,26 @@ type acpState struct {
 
 // observeInitialize caches the agent's `initialize` response — identified by the
 // presence of result.protocolVersion, which only initialize responses carry —
-// along with the agent name and close capability it advertises.
+// along with the agent name and close capability it advertises. The typed
+// decode runs once per agent process: only the first initialize response gets
+// past the probe check and the cache check.
 func (s *acpState) observeInitialize(probe frameProbe, raw []byte) {
-	s.mu.Lock()
-	cached := s.initResponse != nil
-	s.mu.Unlock()
-	if cached {
+	if probe.Result == nil || probe.Result.ProtocolVersion == nil || s.initializeResponse() != nil {
 		return
 	}
-	if probe.Result == nil || probe.Result.ProtocolVersion == nil {
-		return
-	}
-
-	s.mu.Lock()
-	s.initResponse = append([]byte(nil), raw...)
-	s.mu.Unlock()
-
 	var typed struct {
 		Result *acp.InitializeResponse `json:"result"`
 	}
-	if err := json.Unmarshal(raw, &typed); err != nil || typed.Result == nil {
-		return
+	if err := json.Unmarshal(raw, &typed); err != nil {
+		typed.Result = nil // cache the response; only name/capability are lost
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.initResponse = append([]byte(nil), raw...)
+	if typed.Result == nil {
+		return
+	}
 	if typed.Result.AgentCapabilities.SessionCapabilities.Close != nil {
 		s.closeSupported = true
 	}
@@ -417,55 +175,40 @@ func (s *acpState) bindPendingCwd(probe frameProbe) {
 // would otherwise never be observed and the push SessionID would be empty. cwd
 // is set once when the client opens the project, so it is re-captured on each
 // such request and a project switch updates it.
-func (s *acpState) observeInbound(payload []byte) {
-	var req struct {
-		Method string           `json:"method"`
-		ID     *json.RawMessage `json:"id"`
-		Params *struct {
-			SessionID string `json:"sessionId"`
-			Cwd       string `json:"cwd"`
-		} `json:"params"`
-	}
-	if err := json.Unmarshal(payload, &req); err != nil {
-		return
-	}
-
+func (s *acpState) observeInbound(f *clientFrame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if req.Method == "session/prompt" {
+	if f.Method == "session/prompt" {
 		s.turnActive = true
 		s.turnHadContent = false
 	}
-	if req.Params == nil {
-		return
+	if f.Params.SessionID != "" && s.sessionID == "" {
+		s.sessionID = f.Params.SessionID
 	}
-	if req.Params.SessionID != "" && s.sessionID == "" {
-		s.sessionID = req.Params.SessionID
-	}
-	switch req.Method {
+	switch f.Method {
 	case "session/new", "session/load", "session/resume":
 	default:
 		return
 	}
-	cwd := req.Params.Cwd
+	cwd := f.Params.Cwd
 	if cwd == "" {
 		return
 	}
 	s.cwd = cwd
-	if req.Method == "session/new" {
-		if req.ID != nil {
+	if f.Method == "session/new" {
+		if f.ID != nil {
 			if s.pendingCwd == nil {
 				s.pendingCwd = make(map[string]string)
 			}
-			s.pendingCwd[string(*req.ID)] = cwd
+			s.pendingCwd[string(f.ID)] = cwd
 		}
 		return
 	}
-	if req.Params.SessionID != "" {
+	if f.Params.SessionID != "" {
 		if s.cwdBySession == nil {
 			s.cwdBySession = make(map[string]string)
 		}
-		s.cwdBySession[req.Params.SessionID] = cwd
+		s.cwdBySession[f.Params.SessionID] = cwd
 	}
 }
 
@@ -562,18 +305,14 @@ func (p *StdioPump) initResponseCached() bool {
 	return p.acp.initializeResponse() != nil
 }
 
-// MaybeReplayInitialize intercepts a client `initialize` request. If the agent
-// has already been initialized (its response is cached), it answers the client
+// replayInitialize intercepts a client `initialize` request. If the agent has
+// already been initialized (its response is cached), it answers the client
 // directly with that cached response — rewritten to carry the request's id — and
 // returns true so the caller does not forward a duplicate `initialize` to the
 // agent. It returns false for non-initialize frames, or for the first
 // `initialize` (no cache yet), which must reach the agent normally.
-func (p *StdioPump) MaybeReplayInitialize(payload []byte) bool {
-	var req struct {
-		Method string          `json:"method"`
-		ID     json.RawMessage `json:"id"`
-	}
-	if err := json.Unmarshal(payload, &req); err != nil || req.Method != "initialize" {
+func (p *StdioPump) replayInitialize(f *clientFrame) bool {
+	if f.Method != "initialize" {
 		return false
 	}
 
@@ -582,7 +321,7 @@ func (p *StdioPump) MaybeReplayInitialize(payload []byte) bool {
 		return false
 	}
 
-	out, ok := rewriteResponseID(cached, req.ID)
+	out, ok := rewriteResponseID(cached, f.ID)
 	if !ok {
 		return false // malformed cache: fall back to forwarding to the agent
 	}

@@ -1614,6 +1614,34 @@ func TestRuntimeRestartEndpointReturnsFreshConnectDescriptor(t *testing.T) {
 	}
 }
 
+// A device must not be able to restart (and so kill) another device's agent.
+func TestRuntimeRestartRefusesAnotherDevicesRuntime(t *testing.T) {
+	baseDir := newHarnessBaseDir(t)
+	buildMockAgent(t, baseDir)
+
+	server := newConfiguredTestServerWithBaseDir(baseDir, config.Config{ListenAddr: "127.0.0.1:0"})
+	attachTestSessionService(t, server)
+	owner := pairDevice(t, server)
+	other := pairDevice(t, server)
+
+	started := connectAgent(t, server, owner, "mock-acp")
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+started.RuntimeID+"/restart", nil)
+	request.Header.Set("Authorization", "Bearer "+other)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("restart status code = %d, want %d", recorder.Code, http.StatusForbidden)
+	}
+	rt, err := server.runtime.Get(started.RuntimeID)
+	if err != nil {
+		t.Fatalf("Get runtime: %v", err)
+	}
+	if rt.Status != runtime.StatusRunning {
+		t.Fatalf("owner's runtime status = %q, want %q", rt.Status, runtime.StatusRunning)
+	}
+}
+
 func TestRuntimeRestartWithEnvRequiresElevatedScopeByDefault(t *testing.T) {
 	baseDir := newHarnessBaseDir(t)
 	buildMockAgent(t, baseDir)
@@ -1704,24 +1732,20 @@ func TestExternalStdioRuntimeLifecycleEndpoints(t *testing.T) {
 	})
 }
 
-func dialTestWebSocket(t *testing.T, wsURL string, bearerToken ...string) *websocket.Conn {
+func dialTestWebSocket(t *testing.T, wsURL string) *websocket.Conn {
 	t.Helper()
 
-	conn, _, err := dialTestWebSocketConn(wsURL, bearerToken...)
+	conn, _, err := dialTestWebSocketConn(wsURL)
 	if err != nil {
 		t.Fatalf("Dial() error = %v", err)
 	}
 	return conn
 }
 
-func dialTestWebSocketConn(wsURL string, bearerToken ...string) (*websocket.Conn, *http.Response, error) {
+func dialTestWebSocketConn(wsURL string) (*websocket.Conn, *http.Response, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	options := &websocket.DialOptions{}
-	if len(bearerToken) > 0 && strings.TrimSpace(bearerToken[0]) != "" {
-		options.HTTPHeader = http.Header{"Authorization": []string{"Bearer " + bearerToken[0]}}
-	}
-	return websocket.Dial(ctx, wsURL, options)
+	return websocket.Dial(ctx, wsURL, nil)
 }
 
 func newTestServer() *Server {
