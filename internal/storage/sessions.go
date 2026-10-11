@@ -16,7 +16,6 @@ type SessionRecord struct {
 	DeviceID               string
 	AgentID                string
 	Status                 string
-	Leaseholder            string
 	CreatedAt              time.Time
 	LastClientConnectAt    *time.Time
 	LastClientDisconnectAt *time.Time
@@ -28,16 +27,15 @@ type SessionRecord struct {
 // so the same method works for both initial creation and incremental status updates.
 func (s *SQLiteStore) SaveSession(ctx context.Context, record SessionRecord) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO gateway_sessions(session_id, runtime_id, device_id, agent_id, status, leaseholder, created_at, last_client_connect_at, last_client_disconnect_at, disconnected_since, metadata)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO gateway_sessions(session_id, runtime_id, device_id, agent_id, status, created_at, last_client_connect_at, last_client_disconnect_at, disconnected_since, metadata)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(session_id) DO UPDATE SET
 		   status = excluded.status,
-		   leaseholder = excluded.leaseholder,
 		   last_client_connect_at = excluded.last_client_connect_at,
 		   last_client_disconnect_at = excluded.last_client_disconnect_at,
 		   disconnected_since = excluded.disconnected_since,
 		   metadata = excluded.metadata`,
-		record.SessionID, record.RuntimeID, record.DeviceID, record.AgentID, record.Status, record.Leaseholder,
+		record.SessionID, record.RuntimeID, record.DeviceID, record.AgentID, record.Status,
 		record.CreatedAt.UTC().Format(time.RFC3339Nano),
 		timeToNullable(record.LastClientConnectAt),
 		timeToNullable(record.LastClientDisconnectAt),
@@ -50,7 +48,7 @@ func (s *SQLiteStore) SaveSession(ctx context.Context, record SessionRecord) err
 func scanSession(row *sql.Row) (SessionRecord, error) {
 	var rec SessionRecord
 	var createdRaw, connRaw, discRaw, sinceRaw string
-	err := row.Scan(&rec.SessionID, &rec.RuntimeID, &rec.DeviceID, &rec.AgentID, &rec.Status, &rec.Leaseholder, &createdRaw, &connRaw, &discRaw, &sinceRaw, &rec.Metadata)
+	err := row.Scan(&rec.SessionID, &rec.RuntimeID, &rec.DeviceID, &rec.AgentID, &rec.Status, &createdRaw, &connRaw, &discRaw, &sinceRaw, &rec.Metadata)
 	if err != nil {
 		return SessionRecord{}, err
 	}
@@ -65,7 +63,7 @@ func scanSession(row *sql.Row) (SessionRecord, error) {
 // Returns ErrNotFound if no row exists.
 func (s *SQLiteStore) GetSession(ctx context.Context, sessionID string) (SessionRecord, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT session_id, runtime_id, device_id, agent_id, status, leaseholder, created_at, last_client_connect_at, last_client_disconnect_at, disconnected_since, metadata
+		`SELECT session_id, runtime_id, device_id, agent_id, status, created_at, last_client_connect_at, last_client_disconnect_at, disconnected_since, metadata
 		 FROM gateway_sessions WHERE session_id = ?`, sessionID)
 	rec, err := scanSession(row)
 	if err != nil {
@@ -89,7 +87,7 @@ func (s *SQLiteStore) DeleteSession(ctx context.Context, sessionID string) error
 // and for the sessions list endpoint.
 func (s *SQLiteStore) ListSessionsByDevice(ctx context.Context, deviceID string) ([]SessionRecord, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT session_id, runtime_id, device_id, agent_id, status, leaseholder, created_at, last_client_connect_at, last_client_disconnect_at, disconnected_since, metadata
+		`SELECT session_id, runtime_id, device_id, agent_id, status, created_at, last_client_connect_at, last_client_disconnect_at, disconnected_since, metadata
 		 FROM gateway_sessions WHERE device_id = ? ORDER BY created_at DESC`, deviceID)
 	if err != nil {
 		return nil, err
@@ -99,7 +97,7 @@ func (s *SQLiteStore) ListSessionsByDevice(ctx context.Context, deviceID string)
 	for rows.Next() {
 		var rec SessionRecord
 		var createdRaw, connRaw, discRaw, sinceRaw string
-		if err := rows.Scan(&rec.SessionID, &rec.RuntimeID, &rec.DeviceID, &rec.AgentID, &rec.Status, &rec.Leaseholder, &createdRaw, &connRaw, &discRaw, &sinceRaw, &rec.Metadata); err != nil {
+		if err := rows.Scan(&rec.SessionID, &rec.RuntimeID, &rec.DeviceID, &rec.AgentID, &rec.Status, &createdRaw, &connRaw, &discRaw, &sinceRaw, &rec.Metadata); err != nil {
 			return nil, err
 		}
 		rec.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdRaw)

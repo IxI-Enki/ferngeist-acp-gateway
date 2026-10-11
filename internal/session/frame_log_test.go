@@ -139,7 +139,7 @@ func TestFrameLogPumpTaps(t *testing.T) {
 	defer m.close()
 
 	pump := &StdioPump{
-		pipes: &runtime.LeasedPipes{
+		proc: &runtime.Process{
 			Stdin:  nopWriteCloser{},
 			Stdout: nil,
 		},

@@ -921,6 +921,7 @@ func TestAgentsEndpointIncludesRuntimeState(t *testing.T) {
 	buildMockAgent(t, baseDir)
 
 	server := newTestServerWithBaseDir(baseDir)
+	attachTestSessionService(t, server)
 	token := pairDevice(t, server)
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/agents", nil)
@@ -939,26 +940,13 @@ func TestAgentsEndpointIncludesRuntimeState(t *testing.T) {
 
 	mockAgent := findAgentState(t, initial.Agents, "mock-acp")
 	if mockAgent.Running {
-		t.Fatal("mock-acp should not be running before start")
+		t.Fatal("mock-acp should not be running before connect")
 	}
 	if mockAgent.RuntimeID != "" {
-		t.Fatalf("RuntimeID = %q, want empty before start", mockAgent.RuntimeID)
+		t.Fatalf("RuntimeID = %q, want empty before connect", mockAgent.RuntimeID)
 	}
 
-	startRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
-	startRequest.Header.Set("Authorization", "Bearer "+token)
-	startRecorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(startRecorder, startRequest)
-	if startRecorder.Code != http.StatusOK {
-		t.Fatalf("start status code = %d, want %d", startRecorder.Code, http.StatusOK)
-	}
-	t.Cleanup(func() {
-		stopRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/stop", nil)
-		stopRequest.Header.Set("Authorization", "Bearer "+token)
-		stopRecorder := httptest.NewRecorder()
-		server.Handler().ServeHTTP(stopRecorder, stopRequest)
-		time.Sleep(150 * time.Millisecond)
-	})
+	connectAgent(t, server, token, "mock-acp")
 
 	request = httptest.NewRequest(http.MethodGet, "/v1/agents", nil)
 	request.Header.Set("Authorization", "Bearer "+token)
@@ -976,10 +964,10 @@ func TestAgentsEndpointIncludesRuntimeState(t *testing.T) {
 
 	mockAgent = findAgentState(t, running.Agents, "mock-acp")
 	if !mockAgent.Running {
-		t.Fatal("mock-acp should be marked running after start")
+		t.Fatal("mock-acp should be marked running after connect")
 	}
 	if mockAgent.RuntimeID == "" {
-		t.Fatal("RuntimeID should not be empty after start")
+		t.Fatal("RuntimeID should not be empty after connect")
 	}
 	if mockAgent.RuntimeStatus != "running" {
 		t.Fatalf("RuntimeStatus = %q, want %q", mockAgent.RuntimeStatus, "running")
@@ -1000,34 +988,22 @@ func TestAgentsRejectsNonGetMethods(t *testing.T) {
 	}
 }
 
-func TestAgentsListsMultipleRuntimesAndStartNew(t *testing.T) {
+func TestAgentsListsMultipleRuntimesAndConnectNew(t *testing.T) {
 	baseDir := newHarnessBaseDir(t)
 	buildMockAgent(t, baseDir)
 	server := newTestServerWithBaseDir(baseDir)
+	attachTestSessionService(t, server)
 	token := pairDevice(t, server)
 
-	start := func() runtimeStartResponse {
+	start := func() runtimeConnectResponse {
 		t.Helper()
-		body, _ := json.Marshal(map[string]bool{"new": true})
-		req := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", bytes.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+token)
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		server.Handler().ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("start status = %d, body=%s", rec.Code, rec.Body.String())
-		}
-		var resp runtimeStartResponse
-		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("Unmarshal(start) error = %v", err)
-		}
-		return resp
+		return connectAgent(t, server, token, "mock-acp")
 	}
 
 	first := start()
 	second := start()
-	if first.Runtime.ID == second.Runtime.ID {
-		t.Fatalf("new:true must launch distinct runtimes, both = %q", first.Runtime.ID)
+	if first.RuntimeID == second.RuntimeID {
+		t.Fatalf("connecting twice must launch distinct runtimes, both = %q", first.RuntimeID)
 	}
 
 	t.Cleanup(func() {
@@ -1391,21 +1367,10 @@ func TestDiagnosticsExportIncludesGatewayLogsAndRuntimeLogs(t *testing.T) {
 		Discovery: discovery.New(logger),
 		Logs:      logSvc,
 	})
+	attachTestSessionService(t, server)
 	token := pairDevice(t, server)
 
-	startRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
-	startRequest.Header.Set("Authorization", "Bearer "+token)
-	startRecorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(startRecorder, startRequest)
-	if startRecorder.Code != http.StatusOK {
-		t.Fatalf("start status code = %d, want %d", startRecorder.Code, http.StatusOK)
-	}
-	t.Cleanup(func() {
-		stopRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/stop", nil)
-		stopRequest.Header.Set("Authorization", "Bearer "+token)
-		stopRecorder := httptest.NewRecorder()
-		server.Handler().ServeHTTP(stopRecorder, stopRequest)
-	})
+	connectAgent(t, server, token, "mock-acp")
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/diagnostics/export", nil)
 	request.Header.Set("Authorization", "Bearer "+token)
@@ -1483,24 +1448,31 @@ func TestRuntimeLifecycleEndpoints(t *testing.T) {
 	buildMockAgent(t, baseDir)
 
 	server := newTestServerWithBaseDir(baseDir)
+	attachTestSessionService(t, server)
 	token := pairDevice(t, server)
 
-	startRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
-	startRequest.Header.Set("Authorization", "Bearer "+token)
-	startRecorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(startRecorder, startRequest)
-
-	if startRecorder.Code != http.StatusOK {
-		t.Fatalf("start status code = %d, want %d", startRecorder.Code, http.StatusOK)
-	}
-
-	var startResponse runtimeStartResponse
-	if err := json.Unmarshal(startRecorder.Body.Bytes(), &startResponse); err != nil {
-		t.Fatalf("Unmarshal(start) error = %v", err)
-	}
-	if startResponse.Runtime.ID == "" {
+	// Connecting starts the agent and creates the resilient session in one step,
+	// returning the WebSocket descriptor plus the session credentials.
+	connectResponse := connectAgent(t, server, token, "mock-acp")
+	if connectResponse.RuntimeID == "" {
 		t.Fatal("Runtime ID should not be empty")
 	}
+	if connectResponse.SessionID == "" {
+		t.Fatal("Session ID should not be empty")
+	}
+	if connectResponse.AttachToken == "" {
+		t.Fatal("AttachToken should not be empty")
+	}
+	if connectResponse.WebSocketPath == "" {
+		t.Fatal("WebSocketPath should not be empty")
+	}
+	if connectResponse.Scheme != "ws" {
+		t.Fatalf("Scheme = %q, want %q", connectResponse.Scheme, "ws")
+	}
+	if !strings.Contains(connectResponse.WebSocketURL, connectResponse.WebSocketPath) {
+		t.Fatalf("WebSocketURL = %q does not contain path %q", connectResponse.WebSocketURL, connectResponse.WebSocketPath)
+	}
+	runtimeID := connectResponse.RuntimeID
 
 	listRequest := httptest.NewRequest(http.MethodGet, "/v1/runtimes", nil)
 	listRequest.Header.Set("Authorization", "Bearer "+token)
@@ -1537,7 +1509,7 @@ func TestRuntimeLifecycleEndpoints(t *testing.T) {
 	var logsResponse runtimeLogsResponse
 	foundStartupLog := false
 	for range 30 {
-		logsRequest := httptest.NewRequest(http.MethodGet, "/v1/runtimes/"+startResponse.Runtime.ID+"/logs", nil)
+		logsRequest := httptest.NewRequest(http.MethodGet, "/v1/runtimes/"+runtimeID+"/logs", nil)
 		logsRequest.Header.Set("Authorization", "Bearer "+token)
 		logsRecorder := httptest.NewRecorder()
 		server.Handler().ServeHTTP(logsRecorder, logsRequest)
@@ -1560,29 +1532,6 @@ func TestRuntimeLifecycleEndpoints(t *testing.T) {
 	}
 	if !foundStartupLog {
 		t.Fatal("expected startup log entry to be captured")
-	}
-
-	connectRequest := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+startResponse.Runtime.ID+"/connect", nil)
-	connectRequest.Header.Set("Authorization", "Bearer "+token)
-	connectRecorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(connectRecorder, connectRequest)
-
-	if connectRecorder.Code != http.StatusOK {
-		t.Fatalf("connect status code = %d, want %d", connectRecorder.Code, http.StatusOK)
-	}
-
-	var connectResponse runtimeConnectResponse
-	if err := json.Unmarshal(connectRecorder.Body.Bytes(), &connectResponse); err != nil {
-		t.Fatalf("Unmarshal(connect) error = %v", err)
-	}
-	if connectResponse.WebSocketPath == "" {
-		t.Fatal("WebSocketPath should not be empty")
-	}
-	if connectResponse.Scheme != "ws" {
-		t.Fatalf("Scheme = %q, want %q", connectResponse.Scheme, "ws")
-	}
-	if !strings.Contains(connectResponse.WebSocketURL, connectResponse.WebSocketPath) {
-		t.Fatalf("WebSocketURL = %q does not contain path %q", connectResponse.WebSocketURL, connectResponse.WebSocketPath)
 	}
 
 	stopRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/stop", nil)
@@ -1631,26 +1580,10 @@ func TestRuntimeRestartEndpointReturnsFreshConnectDescriptor(t *testing.T) {
 	buildMockAgent(t, baseDir)
 
 	server := newConfiguredTestServerWithBaseDir(baseDir, config.Config{ListenAddr: "127.0.0.1:0", AllowRuntimeRestartEnv: true})
+	attachTestSessionService(t, server)
 	token := pairDevice(t, server)
 
-	startRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
-	startRequest.Header.Set("Authorization", "Bearer "+token)
-	startRecorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(startRecorder, startRequest)
-	if startRecorder.Code != http.StatusOK {
-		t.Fatalf("start status code = %d, want %d", startRecorder.Code, http.StatusOK)
-	}
-	t.Cleanup(func() {
-		stopRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/stop", nil)
-		stopRequest.Header.Set("Authorization", "Bearer "+token)
-		stopRecorder := httptest.NewRecorder()
-		server.Handler().ServeHTTP(stopRecorder, stopRequest)
-	})
-
-	var startResponse runtimeStartResponse
-	if err := json.Unmarshal(startRecorder.Body.Bytes(), &startResponse); err != nil {
-		t.Fatalf("Unmarshal(start) error = %v", err)
-	}
+	startResponse := connectAgent(t, server, token, "mock-acp")
 
 	restartBody, err := json.Marshal(runtimeRestartRequest{
 		Env: map[string]string{"FERNGEIST_TEST_ENV": "restart-token"},
@@ -1658,7 +1591,7 @@ func TestRuntimeRestartEndpointReturnsFreshConnectDescriptor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal(restart) error = %v", err)
 	}
-	restartRequest := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+startResponse.Runtime.ID+"/restart", bytes.NewReader(restartBody))
+	restartRequest := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+startResponse.RuntimeID+"/restart", bytes.NewReader(restartBody))
 	restartRequest.Header.Set("Authorization", "Bearer "+token)
 	restartRecorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(restartRecorder, restartRequest)
@@ -1670,8 +1603,14 @@ func TestRuntimeRestartEndpointReturnsFreshConnectDescriptor(t *testing.T) {
 	if err := json.Unmarshal(restartRecorder.Body.Bytes(), &restartResponse); err != nil {
 		t.Fatalf("Unmarshal(restart) error = %v", err)
 	}
-	if restartResponse.RuntimeID == startResponse.Runtime.ID {
+	if restartResponse.RuntimeID == startResponse.RuntimeID {
 		t.Fatal("restart should hand back a new runtime id")
+	}
+	if restartResponse.SessionID == "" {
+		t.Fatal("restart should hand back the new session id")
+	}
+	if restartResponse.AttachToken == "" {
+		t.Fatal("restart should hand back an attach token")
 	}
 }
 
@@ -1689,37 +1628,24 @@ func TestRuntimeRestartWithEnvRequiresElevatedScopeByDefault(t *testing.T) {
 		Pairing:   pairing.NewService(logger, nil),
 		Discovery: discovery.New(logger),
 	})
+	attachTestSessionService(t, server)
 	var token string
 	t.Cleanup(func() {
 		stopRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/stop", nil)
 		stopRequest.Header.Set("Authorization", "Bearer "+token)
 		stopRecorder := httptest.NewRecorder()
 		server.Handler().ServeHTTP(stopRecorder, stopRequest)
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = runtimeSvc.Shutdown(ctx)
 		time.Sleep(150 * time.Millisecond)
 	})
 	token = pairDevice(t, server)
 
-	startRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
-	startRequest.Header.Set("Authorization", "Bearer "+token)
-	startRecorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(startRecorder, startRequest)
-	if startRecorder.Code != http.StatusOK {
-		t.Fatalf("start status code = %d, want %d", startRecorder.Code, http.StatusOK)
-	}
-
-	var startResponse runtimeStartResponse
-	if err := json.Unmarshal(startRecorder.Body.Bytes(), &startResponse); err != nil {
-		t.Fatalf("Unmarshal(start) error = %v", err)
-	}
+	startResponse := connectAgent(t, server, token, "mock-acp")
 
 	restartBody, err := json.Marshal(runtimeRestartRequest{Env: map[string]string{"FERNGEIST_TEST_ENV": "forbidden"}})
 	if err != nil {
 		t.Fatalf("Marshal(restart) error = %v", err)
 	}
-	restartRequest := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+startResponse.Runtime.ID+"/restart", bytes.NewReader(restartBody))
+	restartRequest := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+startResponse.RuntimeID+"/restart", bytes.NewReader(restartBody))
 	restartRequest.Header.Set("Authorization", "Bearer "+token)
 	restartRecorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(restartRecorder, restartRequest)
@@ -1756,38 +1682,18 @@ func TestExternalStdioRuntimeLifecycleEndpoints(t *testing.T) {
 			},
 		},
 	})
+	attachTestSessionService(t, server)
 	token := pairDevice(t, server)
 
-	startRequest := httptest.NewRequest(http.MethodPost, "/v1/agents/codex-acp/start", nil)
-	startRequest.Header.Set("Authorization", "Bearer "+token)
-	startRecorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(startRecorder, startRequest)
-
-	if startRecorder.Code != http.StatusOK {
-		t.Fatalf("start status code = %d, want %d", startRecorder.Code, http.StatusOK)
+	startResponse := connectAgent(t, server, token, "codex-acp")
+	info, err := server.runtime.Get(startResponse.RuntimeID)
+	if err != nil {
+		t.Fatalf("runtime.Get() error = %v", err)
 	}
-
-	var startResponse runtimeStartResponse
-	if err := json.Unmarshal(startRecorder.Body.Bytes(), &startResponse); err != nil {
-		t.Fatalf("Unmarshal(start) error = %v", err)
+	if info.LaunchMode != "external" {
+		t.Fatalf("LaunchMode = %q, want %q", info.LaunchMode, "external")
 	}
-	if startResponse.Runtime.LaunchMode != "external" {
-		t.Fatalf("LaunchMode = %q, want %q", startResponse.Runtime.LaunchMode, "external")
-	}
-
-	connectRequest := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+startResponse.Runtime.ID+"/connect", nil)
-	connectRequest.Header.Set("Authorization", "Bearer "+token)
-	connectRecorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(connectRecorder, connectRequest)
-	if connectRecorder.Code != http.StatusOK {
-		t.Fatalf("connect status code = %d, want %d", connectRecorder.Code, http.StatusOK)
-	}
-
-	var connectResponse runtimeConnectResponse
-	if err := json.Unmarshal(connectRecorder.Body.Bytes(), &connectResponse); err != nil {
-		t.Fatalf("Unmarshal(connect) error = %v", err)
-	}
-	if connectResponse.WebSocketPath == "" {
+	if startResponse.WebSocketPath == "" {
 		t.Fatal("WebSocketPath should not be empty")
 	}
 	t.Cleanup(func() {
@@ -2156,6 +2062,49 @@ func newHarnessBaseDir(t *testing.T) string {
 	return dir
 }
 
+// attachTestSessionService wires a real session service, backed by an ephemeral
+// store, onto a test server so the agent connect/stop/restart endpoints (which
+// launch and own the agent process) work. Shutdown stops every agent process the
+// service launched, so tests need no separate process cleanup.
+func attachTestSessionService(t *testing.T, server *Server) *session.RuntimeSession {
+	t.Helper()
+
+	store, err := storage.Open(filepath.Join(t.TempDir(), "sessions.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sessionSvc := session.NewRuntimeSession(logger, store, server.runtime, session.NewTokenService(logger), session.Config{
+		MaxDisconnected: 5 * time.Minute,
+		MaxPerDevice:    3,
+	})
+	server.sessionSvc = sessionSvc
+	t.Cleanup(sessionSvc.Shutdown)
+	return sessionSvc
+}
+
+// connectAgent POSTs the agent connect endpoint, which starts the agent and
+// creates its resilient session in one step, and returns the parsed response.
+func connectAgent(t *testing.T, server *Server, token, agentID string) runtimeConnectResponse {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/agents/"+agentID+"/connect", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("connect %s status = %d, body=%s", agentID, rec.Code, rec.Body.String())
+	}
+
+	var resp runtimeConnectResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal(connect) error = %v", err)
+	}
+	return resp
+}
+
 func newSessionTestHarness(t *testing.T) *sessionTestHarness {
 	t.Helper()
 
@@ -2226,46 +2175,30 @@ func newSessionTestHarness(t *testing.T) *sessionTestHarness {
 	if err := json.Unmarshal(completeRec.Body.Bytes(), &completeResp); err != nil {
 		t.Fatalf("Unmarshal(complete) error = %v", err)
 	}
-	deviceID := completeResp.DeviceID
-
-	startRuntimeReq := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
-	startRuntimeReq.Header.Set("Authorization", "Bearer "+completeResp.Token)
-	startRuntimeRec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(startRuntimeRec, startRuntimeReq)
-	if startRuntimeRec.Code != http.StatusOK {
-		t.Fatalf("agent start status = %d, body=%s", startRuntimeRec.Code, startRuntimeRec.Body.String())
-	}
-	var startRuntimeResp runtimeStartResponse
-	if err := json.Unmarshal(startRuntimeRec.Body.Bytes(), &startRuntimeResp); err != nil {
-		t.Fatalf("Unmarshal(start) error = %v", err)
-	}
-
-	// Stop the agent runtime directly and synchronously so the process is
-	// guaranteed dead before t.TempDir() removal runs. See
-	// newResilientTestHarness for why the HTTP stop is not used here.
-	t.Cleanup(func() {
-		if _, err := server.runtime.StopByRuntimeID(startRuntimeResp.Runtime.ID); err != nil {
-			t.Logf("cleanup stop runtime: %v", err)
-		}
-	})
-
 	return &sessionTestHarness{
-		t:         t,
-		server:    server,
-		token:     completeResp.Token,
-		deviceID:  deviceID,
-		runtimeID: startRuntimeResp.Runtime.ID,
-		tokenSvc:  tokenSvc,
+		t:        t,
+		server:   server,
+		token:    completeResp.Token,
+		deviceID: completeResp.DeviceID,
+		tokenSvc: tokenSvc,
 	}
 }
 
+// createSession launches the mock agent and creates its session directly
+// through the session service, recording the session's runtime id for the
+// WebSocket path used by the handler tests.
 func (h *sessionTestHarness) createSession() string {
 	h.t.Helper()
-	ctx := context.Background()
-	sess, _, err := h.server.sessionSvc.Create(ctx, h.runtimeID, h.deviceID, "mock-acp")
+
+	agent, err := h.server.catalog.Get("mock-acp")
+	if err != nil {
+		h.t.Fatalf("catalog.Get(mock-acp) error = %v", err)
+	}
+	sess, _, err := h.server.sessionSvc.Create(context.Background(), agent, h.deviceID, nil)
 	if err != nil {
 		h.t.Fatalf("session.Create() error = %v", err)
 	}
+	h.runtimeID = sess.RuntimeID
 	return sess.ID
 }
 
@@ -2415,7 +2348,9 @@ func TestSessionCloseHandler_NotFound(t *testing.T) {
 func TestSessionWebSocketRejectsInvalidAttachToken(t *testing.T) {
 	h := newSessionTestHarness(t)
 
-	request := httptest.NewRequest(http.MethodGet, "/v1/acp/"+h.runtimeID+"?sessionId=xxx&attachToken=yyy", nil)
+	// The invalid attach token is rejected before the runtime path is checked,
+	// so any non-empty runtime id reaches the 401 branch.
+	request := httptest.NewRequest(http.MethodGet, "/v1/acp/runtime-id?sessionId=xxx&attachToken=yyy", nil)
 	recorder := httptest.NewRecorder()
 	h.server.Handler().ServeHTTP(recorder, request)
 
@@ -2429,7 +2364,7 @@ func TestSessionWebSocketHandler_SessionNotFound(t *testing.T) {
 
 	attachToken, _ := h.tokenSvc.Mint("nonexistent", h.deviceID, 5*time.Minute)
 
-	request := httptest.NewRequest(http.MethodGet, "/v1/acp/"+h.runtimeID+"?sessionId=nonexistent&attachToken="+attachToken, nil)
+	request := httptest.NewRequest(http.MethodGet, "/v1/acp/runtime-id?sessionId=nonexistent&attachToken="+attachToken, nil)
 	recorder := httptest.NewRecorder()
 	h.server.Handler().ServeHTTP(recorder, request)
 
@@ -2542,61 +2477,17 @@ func TestSessionWebSocketReconnect(t *testing.T) {
 	_ = conn.CloseNow()
 }
 
-func TestRuntimeConnectResilientReturnsSessionIDAndAttachToken(t *testing.T) {
+func TestAgentConnectReturnsSessionIDAndAttachToken(t *testing.T) {
 	baseDir := newHarnessBaseDir(t)
 	buildMockAgent(t, baseDir)
 
-	store, err := storage.Open(filepath.Join(baseDir, "test.db"))
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	t.Cleanup(func() { store.Close() })
-
-	server := newTestServerWithStore(baseDir, store)
+	server := newTestServerWithBaseDir(baseDir)
+	attachTestSessionService(t, server)
 	bearerToken := pairDevice(t, server)
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tokenSvc := session.NewTokenService(logger)
-	sessionSvc := session.NewRuntimeSession(logger, store, server.runtime, tokenSvc, session.Config{
-		MaxDisconnected: 5 * time.Minute,
-		MaxPerDevice:    3,
-	})
-	server.sessionSvc = sessionSvc
-	t.Cleanup(sessionSvc.Shutdown)
-
-	startReq := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
-	startReq.Header.Set("Authorization", "Bearer "+bearerToken)
-	startRec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(startRec, startReq)
-	if startRec.Code != http.StatusOK {
-		t.Fatalf("start status = %d, want %d", startRec.Code, http.StatusOK)
-	}
-	t.Cleanup(func() {
-		stopReq := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/stop", nil)
-		stopReq.Header.Set("Authorization", "Bearer "+bearerToken)
-		stopRec := httptest.NewRecorder()
-		server.Handler().ServeHTTP(stopRec, stopReq)
-	})
-
-	var startResp runtimeStartResponse
-	if err := json.Unmarshal(startRec.Body.Bytes(), &startResp); err != nil {
-		t.Fatalf("Unmarshal(start) error = %v", err)
-	}
-
-	connectBody, _ := json.Marshal(map[string]string{"sessionMode": "resilient"})
-	connectReq := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+startResp.Runtime.ID+"/connect", bytes.NewReader(connectBody))
-	connectReq.Header.Set("Authorization", "Bearer "+bearerToken)
-	connectReq.Header.Set("Content-Type", "application/json")
-	connectRec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(connectRec, connectReq)
-
-	if connectRec.Code != http.StatusOK {
-		t.Fatalf("connect status = %d, want %d, body=%s", connectRec.Code, http.StatusOK, connectRec.Body.String())
-	}
-
-	var connectResp runtimeConnectResponse
-	if err := json.Unmarshal(connectRec.Body.Bytes(), &connectResp); err != nil {
-		t.Fatalf("Unmarshal(connect) error = %v", err)
+	connectResp := connectAgent(t, server, bearerToken, "mock-acp")
+	if connectResp.RuntimeID == "" {
+		t.Fatal("RuntimeID should not be empty")
 	}
 	if len(connectResp.SessionID) != 32 {
 		t.Fatalf("SessionID = %q, want 32-char hex string", connectResp.SessionID)
@@ -2606,133 +2497,33 @@ func TestRuntimeConnectResilientReturnsSessionIDAndAttachToken(t *testing.T) {
 	}
 }
 
-func TestRuntimeConnectResilientLeaseHeldReturnsConflict(t *testing.T) {
-	baseDir := newHarnessBaseDir(t)
-	buildMockAgent(t, baseDir)
-
-	store, err := storage.Open(filepath.Join(baseDir, "test.db"))
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	t.Cleanup(func() { store.Close() })
-
-	server := newTestServerWithStore(baseDir, store)
-	tokenA := pairDevice(t, server)
-	tokenB := pairDevice(t, server)
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tokenSvc := session.NewTokenService(logger)
-	sessionSvc := session.NewRuntimeSession(logger, store, server.runtime, tokenSvc, session.Config{
-		MaxDisconnected: 5 * time.Minute,
-		MaxPerDevice:    3,
-	})
-	server.sessionSvc = sessionSvc
-	t.Cleanup(sessionSvc.Shutdown)
-
-	// Device A starts the agent and takes the runtime lease via resilient connect.
-	startReq := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
-	startReq.Header.Set("Authorization", "Bearer "+tokenA)
-	startRec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(startRec, startReq)
-	if startRec.Code != http.StatusOK {
-		t.Fatalf("start status = %d, want %d", startRec.Code, http.StatusOK)
-	}
-	t.Cleanup(func() {
-		stopReq := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/stop", nil)
-		stopReq.Header.Set("Authorization", "Bearer "+tokenA)
-		stopRec := httptest.NewRecorder()
-		server.Handler().ServeHTTP(stopRec, stopReq)
-	})
-
-	var startResp runtimeStartResponse
-	if err := json.Unmarshal(startRec.Body.Bytes(), &startResp); err != nil {
-		t.Fatalf("Unmarshal(start) error = %v", err)
-	}
-
-	connectResilient := func(token string) *httptest.ResponseRecorder {
-		body, _ := json.Marshal(map[string]string{"sessionMode": "resilient"})
-		req := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+startResp.Runtime.ID+"/connect", bytes.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+token)
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		server.Handler().ServeHTTP(rec, req)
-		return rec
-	}
-
-	first := connectResilient(tokenA)
-	if first.Code != http.StatusOK {
-		t.Fatalf("first-device connect status = %d, want %d, body=%s", first.Code, http.StatusOK, first.Body.String())
-	}
-	var firstResp runtimeConnectResponse
-	if err := json.Unmarshal(first.Body.Bytes(), &firstResp); err != nil {
-		t.Fatalf("Unmarshal(first connect) error = %v", err)
-	}
-	if firstResp.SessionID == "" {
-		t.Fatalf("first-device connect returned empty SessionID: %+v", firstResp)
-	}
-
-	// Device B targets the same runtime: the lease is held by device A's
-	// session, so connect must fail loudly (409) instead of returning 200
-	// with empty session credentials.
-	second := connectResilient(tokenB)
-	if second.Code != http.StatusConflict {
-		t.Fatalf("second-device connect status = %d, want %d, body=%s", second.Code, http.StatusConflict, second.Body.String())
-	}
-	var errResp errorResponse
-	if err := json.Unmarshal(second.Body.Bytes(), &errResp); err != nil {
-		t.Fatalf("Unmarshal(second connect) error = %v", err)
-	}
-	if errResp.Error != "runtime_lease_held" {
-		t.Fatalf("second-device connect error = %q, want %q", errResp.Error, "runtime_lease_held")
-	}
-}
-
-func TestRuntimeConnectResilientDegradesGracefullyWithoutSessionSvc(t *testing.T) {
+// Agent control endpoints that need the session service must fail loudly (503)
+// when the server was built without one, instead of silently doing nothing.
+func TestAgentControlEndpointsReturnServiceUnavailableWithoutSessionSvc(t *testing.T) {
 	baseDir := newHarnessBaseDir(t)
 	buildMockAgent(t, baseDir)
 
 	server := newTestServerWithBaseDir(baseDir)
 	token := pairDevice(t, server)
 
-	startReq := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
-	startReq.Header.Set("Authorization", "Bearer "+token)
-	startRec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(startRec, startReq)
-	if startRec.Code != http.StatusOK {
-		t.Fatalf("start status = %d, want %d", startRec.Code, http.StatusOK)
-	}
-	t.Cleanup(func() {
-		stopReq := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/stop", nil)
-		stopReq.Header.Set("Authorization", "Bearer "+token)
-		stopRec := httptest.NewRecorder()
-		server.Handler().ServeHTTP(stopRec, stopReq)
-	})
-
-	var startResp runtimeStartResponse
-	if err := json.Unmarshal(startRec.Body.Bytes(), &startResp); err != nil {
-		t.Fatalf("Unmarshal(start) error = %v", err)
-	}
-
-	connectBody, _ := json.Marshal(map[string]string{"sessionMode": "resilient"})
-	connectReq := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+startResp.Runtime.ID+"/connect", bytes.NewReader(connectBody))
-	connectReq.Header.Set("Authorization", "Bearer "+token)
-	connectReq.Header.Set("Content-Type", "application/json")
-	connectRec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(connectRec, connectReq)
-
-	if connectRec.Code != http.StatusOK {
-		t.Fatalf("connect status = %d, want %d", connectRec.Code, http.StatusOK)
-	}
-
-	var connectResp runtimeConnectResponse
-	if err := json.Unmarshal(connectRec.Body.Bytes(), &connectResp); err != nil {
-		t.Fatalf("Unmarshal(connect) error = %v", err)
-	}
-	if connectResp.SessionID != "" {
-		t.Fatalf("SessionID = %q, want empty (no session service)", connectResp.SessionID)
-	}
-	if connectResp.AttachToken != "" {
-		t.Fatalf("AttachToken = %q, want empty (no session service)", connectResp.AttachToken)
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{"Connect", http.MethodPost, "/v1/agents/mock-acp/connect"},
+		{"Stop", http.MethodPost, "/v1/agents/mock-acp/stop"},
+		{"Restart", http.MethodPost, "/v1/runtimes/some-runtime/restart"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			rec := httptest.NewRecorder()
+			server.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+			}
+		})
 	}
 }
 

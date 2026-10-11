@@ -1,6 +1,9 @@
-// Package runtime provides lifecycle management for agent processes, including
-// launching, monitoring, restarting, and graceful shutdown. It maintains runtime
-// state, captures logs, and handles failure recovery with circuit breaker patterns.
+// Package runtime launches gateway-managed agent processes and keeps a
+// diagnostic record for each one: its identity and status, a bounded in-memory
+// log ring, and persisted failure records. A launched process is owned by its
+// caller (the session layer), which drains its stdout, writes its stdin, and
+// reports the exit back with RecordExit. The supervisor never restarts a
+// process.
 package runtime
 
 import (
@@ -54,62 +57,39 @@ var (
 	// ErrRuntimeNotRunning is returned when attempting to operate on a runtime
 	// that is not in the "running" state.
 	ErrRuntimeNotRunning = errors.New("runtime is not running")
-
-	// ErrRuntimeNotConnectable is returned when a runtime has no stdio pipes
-	// available for a connection (e.g. the process handle is already gone).
-	ErrRuntimeNotConnectable = errors.New("runtime is not connectable")
-
-	// ErrRuntimeAlreadyAttached is returned when attempting to attach stdio to
-	// a runtime that already has an active ACP session connection.
-	ErrRuntimeAlreadyAttached = errors.New("runtime is already attached to an ACP session")
-
-	// ErrRuntimeLeaseHeld is returned when attempting to acquire a lease on a
-	// runtime that already has an active lease from a different leaseholder.
-	ErrRuntimeLeaseHeld = errors.New("runtime lease is held by another session")
-
-	// ErrSupervisorShutdown is returned when a launch is refused because the
-	// supervisor has already been shut down.
-	ErrSupervisorShutdown = errors.New("supervisor is shut down")
 )
 
 // Status constants represent the possible lifecycle states of a runtime.
 const (
 	// StatusStarting indicates the runtime process has been launched but has not
-	// yet passed readiness and health checks.
+	// yet been recorded as running.
 	StatusStarting = "starting"
 
 	// StatusRunning indicates the runtime is active and ready to accept connections.
 	StatusRunning = "running"
 
-	// StatusStopping indicates a graceful shutdown is in progress.
-	StatusStopping = "stopping"
-
 	// StatusStopped indicates the runtime has terminated successfully or was
 	// intentionally stopped. This state is retained for pruning.
 	StatusStopped = "stopped"
 
-	// StatusFailed indicates the runtime terminated unexpectedly or failed to
-	// start. May trigger restart logic depending on circuit breaker state.
+	// StatusFailed indicates the runtime terminated unexpectedly.
 	StatusFailed = "failed"
 )
 
 // Runtime is the gateway-owned view of a launched agent process plus the
 // metadata needed to hand an ACP session back to Ferngeist.
 type Runtime struct {
-	ID              string    `json:"id"`
-	AgentID         string    `json:"agentId"`
-	AgentName       string    `json:"agentName"`
-	Status          string    `json:"status"`
-	CreatedAt       time.Time `json:"createdAt"`
-	PID             int       `json:"pid"`
-	Command         string    `json:"command"`
-	LastError       string    `json:"lastError,omitempty"`
-	Detected        bool      `json:"detected"`
-	LaunchMode      string    `json:"launchMode"`
-	RestartAttempts int       `json:"restartAttempts"`
-	FailureStreak   int       `json:"failureStreak"`
-	CircuitOpen     bool      `json:"circuitOpen"`
-	LastFailureAt   time.Time `json:"lastFailureAt,omitempty"`
+	ID            string    `json:"id"`
+	AgentID       string    `json:"agentId"`
+	AgentName     string    `json:"agentName"`
+	Status        string    `json:"status"`
+	CreatedAt     time.Time `json:"createdAt"`
+	PID           int       `json:"pid"`
+	Command       string    `json:"command"`
+	LastError     string    `json:"lastError,omitempty"`
+	Detected      bool      `json:"detected"`
+	LaunchMode    string    `json:"launchMode"`
+	LastFailureAt time.Time `json:"lastFailureAt,omitempty"`
 	// StoppedAt marks when a runtime entered the terminal stopped state so the
 	// supervisor can prune it after a short retention window.
 	StoppedAt time.Time `json:"stoppedAt,omitempty"`
@@ -140,17 +120,11 @@ type Summary struct {
 	// Running is the count of runtimes actively serving ACP sessions.
 	Running int `json:"running"`
 
-	// Stopping is the count of runtimes in graceful shutdown.
-	Stopping int `json:"stopping"`
-
 	// Stopped is the count of intentionally terminated runtimes still in retention.
 	Stopped int `json:"stopped"`
 
 	// Failed is the count of runtimes that crashed or failed to start.
 	Failed int `json:"failed"`
-
-	// CircuitOpen is the count of runtimes with restart circuit breaker tripped.
-	CircuitOpen int `json:"circuitOpen"`
 
 	// RecentFailures contains the most recent failure summaries, sorted by time.
 	RecentFailures []FailureSummary `json:"recentFailures"`
@@ -202,13 +176,81 @@ type ConnectDescriptor struct {
 	WebSocketPath string `json:"websocketPath"`
 }
 
-// Supervisor owns the full runtime lifecycle for gateway-managed agents. It is
-// intentionally the single place that knows how manifests turn into processes,
-// readiness checks, restart behavior, and diagnostic state.
-//
-// The supervisor manages process launching, monitoring, automatic restart with
-// circuit breaker patterns, log capture, and graceful shutdown. All runtime
-// state is protected by a mutex for concurrent safety.
+// Process is a launched agent process. The caller that launched it owns it: it
+// drains Stdout, writes Stdin, and calls Supervisor.RecordExit once Done is
+// closed. Stop is the graceful-termination path used on session close.
+type Process struct {
+	// Runtime is the diagnostic record for this process.
+	Runtime Runtime
+
+	// Cmd is the underlying OS process.
+	Cmd *exec.Cmd
+
+	// Stdin is the process's standard input pipe for ACP communication.
+	Stdin io.WriteCloser
+
+	// Stdout is the process's standard output pipe for ACP communication.
+	Stdout io.ReadCloser
+
+	done chan struct{}
+	err  error
+}
+
+// Done is closed when the process has exited.
+func (p *Process) Done() <-chan struct{} { return p.done }
+
+// Err returns the error from waiting on the process. It is valid only after
+// Done is closed (a nil error means a clean exit).
+func (p *Process) Err() error { return p.err }
+
+// Stop terminates the process, waiting up to timeout for a graceful exit before
+// escalating to a kill. It never calls Wait itself — the owner's wait goroutine
+// closes Done.
+func (p *Process) Stop(timeout time.Duration) error {
+	if p == nil || p.Cmd == nil || p.Cmd.Process == nil {
+		return nil
+	}
+	select {
+	case <-p.done:
+		return nil
+	default:
+	}
+
+	// Stage 1: close stdin to signal EOF to the process.
+	if p.Stdin != nil {
+		_ = p.Stdin.Close()
+	}
+
+	// Stage 2: send SIGINT for a graceful shutdown, escalating immediately when
+	// the platform cannot deliver it (e.g. Windows).
+	if err := p.Cmd.Process.Signal(os.Interrupt); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		if killErr := p.Cmd.Process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+			return killErr
+		}
+	}
+
+	// Stage 3: wait for the graceful exit or the timeout.
+	select {
+	case <-p.done:
+		return nil
+	case <-time.After(timeout):
+	}
+
+	// Stage 4: force kill and wait briefly for it to take effect.
+	if err := p.Cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	select {
+	case <-p.done:
+		return nil
+	case <-time.After(250 * time.Millisecond):
+		return context.DeadlineExceeded
+	}
+}
+
+// Supervisor owns the launch of gateway-managed agent processes and the
+// diagnostic state that outlives them: a runtime record per launch, a bounded
+// log ring, and persisted failure records. All state is guarded by one mutex.
 type Supervisor struct {
 	// logger is the structured logger with component context pre-applied.
 	logger *slog.Logger
@@ -222,12 +264,6 @@ type Supervisor struct {
 	// runtimes maps runtime ID to its current state and metadata.
 	runtimes map[string]Runtime
 
-	// runtimeByAgent maps agent ID to the set of runtime IDs currently tracked for it.
-	runtimeByAgent map[string]map[string]struct{}
-
-	// processes holds active process handles for running runtimes.
-	processes map[string]*processHandle
-
 	// logs stores bounded in-memory log buffers per runtime.
 	logs map[string][]LogEntry
 
@@ -239,138 +275,32 @@ type Supervisor struct {
 
 	// installer handles automatic agent acquisition if not present.
 	installer *acquire.Installer
-
-	// onExitCallbacks maps runtime ID to a callback invoked when the process exits.
-	onExitCallbacks map[string]func(string, bool)
-
-	// shutdown is set when Shutdown drains the supervisor; no new processes
-	// may launch afterwards (notably pending restart backoffs).
-	shutdown bool
-
-	// shutdownCh is closed when Shutdown drains the supervisor so pending
-	// restart backoffs wake immediately instead of sleeping out the delay.
-	shutdownCh chan struct{}
-}
-
-// processHandle holds the OS process and lifecycle state for a running runtime.
-// It tracks stdin/stdout pipes for stdio transport, leaseholder for
-// exclusive ACP sessions, and restart configuration.
-type processHandle struct {
-	// cmd is the underlying OS process being managed.
-	cmd *exec.Cmd
-
-	// done is closed when the process exits, signaling waiters.
-	done chan struct{}
-
-	// waitErr captures the error from cmd.Wait() after process exit.
-	waitErr error
-
-	// stdin is the process's standard input pipe for ACP communication.
-	stdin io.WriteCloser
-
-	// stdout is the process's standard output pipe for ACP communication.
-	stdout io.ReadCloser
-
-	// leaseholder identifies the current lease owner: empty = unleased,
-	// session ID = leased by that session.
-	leaseholder string
-
-	// stopping indicates an intentional shutdown is in progress.
-	stopping bool
-
-	// agent is the catalog agent configuration for this process.
-	agent catalog.Agent
-
-	// envOverrides contains environment variables applied at launch.
-	envOverrides map[string]string
-
-	// restartAttempt tracks how many times this runtime has been restarted.
-	restartAttempt int
-}
-
-// shutdownTarget pairs a runtime with its process handle for coordinated shutdown.
-// It's used during supervisor shutdown to track which runtimes need to be stopped.
-type shutdownTarget struct {
-	runtime Runtime
-	process *processHandle
 }
 
 // NewSupervisor creates a supervisor rooted at baseDir with optional SQLite
 // persistence and an optional installer for automatic agent acquisition.
 func NewSupervisor(logger *slog.Logger, baseDir string, store *storage.SQLiteStore, installer *acquire.Installer) *Supervisor {
 	return &Supervisor{
-		logger:          logger.With("component", "runtime"),
-		now:             time.Now,
-		runtimes:        make(map[string]Runtime),
-		processes:       make(map[string]*processHandle),
-		runtimeByAgent:  make(map[string]map[string]struct{}),
-		logs:            make(map[string][]LogEntry),
-		baseDir:         baseDir,
-		store:           store,
-		installer:       installer,
-		onExitCallbacks: make(map[string]func(string, bool)),
-		shutdownCh:      make(chan struct{}),
+		logger:    logger.With("component", "runtime"),
+		now:       time.Now,
+		runtimes:  make(map[string]Runtime),
+		logs:      make(map[string][]LogEntry),
+		baseDir:   baseDir,
+		store:     store,
+		installer: installer,
 	}
 }
 
-// Start launches a new agent runtime process after validating prerequisites.
-// It checks that the agent is detected, allows remote start, and has a supported
-// launch mode. If an installer is available and the agent is not detected, it
-// attempts automatic acquisition first.
-//
-// If a runtime for this agent already exists and is unleased, it is returned
-// as-is; a session-leased one is reused rather than replaced so the owning
-// session is never orphaned.
-//
-// Returns the Runtime descriptor on success, or an error if validation or
-// launch fails.
-func (s *Supervisor) Start(agent catalog.Agent) (Runtime, error) {
-	// Classify the agent's tracked runtimes under lock to prevent race conditions.
-	s.mu.Lock()
-	s.pruneStoppedRuntimesLocked(s.now().UTC())
-
-	var (
-		reuse  *Runtime // unleased — preferred reuse target
-		leased *Runtime // session-leased — last-resort reuse
-	)
-	for _, runtimeID := range s.runtimeIDsForAgentLocked(agent.ID) {
-		existing, exists := s.runtimes[runtimeID]
-		if !exists {
-			continue
-		}
-		// A session-leased runtime must be protected: killing it would orphan a
-		// resilient session, so it is reused rather than replaced.
-		handle := s.processes[runtimeID]
-		switch {
-		case handle == nil:
-			// No process (e.g. restart backoff, status starting): nothing to reuse.
-		case handle.leaseholder == "" && existing.Status == StatusRunning:
-			if reuse == nil {
-				e := existing
-				reuse = &e
-			}
-		default:
-			if leased == nil {
-				e := existing
-				leased = &e
-			}
-		}
-	}
-	s.mu.Unlock()
-
-	if reuse != nil {
-		return *reuse, nil
-	}
-
-	if leased != nil {
-		return *leased, nil
-	}
-
+// Launch validates the agent, resolves its executable, starts a fresh process,
+// and records it as running. Every call produces a distinct runtime; the caller
+// owns the returned process. envOverrides are merged over the daemon
+// environment.
+func (s *Supervisor) Launch(agent catalog.Agent, envOverrides map[string]string) (*Process, error) {
 	prepared, err := s.prepareAgent(agent)
 	if err != nil {
-		return Runtime{}, err
+		return nil, err
 	}
-	return s.launchRuntime(prepared, nil, nil)
+	return s.launchProcess(prepared, envOverrides)
 }
 
 // prepareAgent applies auto-acquisition and validates launch prerequisites,
@@ -400,35 +330,14 @@ func (s *Supervisor) prepareAgent(agent catalog.Agent) (catalog.Agent, error) {
 	return agent, nil
 }
 
-// StartNew launches a fresh agent process unconditionally, bypassing the reuse
-// logic in Start. Every call produces a distinct runtime, enabling parallel
-// sessions for the same agent. Validation and auto-install are shared with
-// Start via prepareAgent.
-func (s *Supervisor) StartNew(agent catalog.Agent) (Runtime, error) {
-	prepared, err := s.prepareAgent(agent)
-	if err != nil {
-		return Runtime{}, err
-	}
-	return s.launchRuntime(prepared, nil, nil)
-}
-
-// launchRuntime is the core transition from a validated catalog agent to a
-// tracked runtime. It resolves the launch target, starts the child process, and
-// records it for diagnostics before exposing it as running.
-func (s *Supervisor) launchRuntime(agent catalog.Agent, previous *Runtime, envOverrides map[string]string) (Runtime, error) {
-	// Refuse to spawn once Shutdown has drained the supervisor; without this
-	// a restart racing Shutdown would leave an orphan process behind.
-	if s.isShutdown() {
-		return Runtime{}, ErrSupervisorShutdown
-	}
-
-	// Resolve the executable path and working directory from the launch config
+// launchProcess is the core transition from a validated catalog agent to a
+// tracked, running process.
+func (s *Supervisor) launchProcess(agent catalog.Agent, envOverrides map[string]string) (*Process, error) {
 	commandPath, workingDir, err := s.resolveLaunch(agent.Launch)
 	if err != nil {
-		return Runtime{}, err
+		return nil, err
 	}
 
-	// Create a new runtime descriptor with fresh identity
 	runtimeInfo := Runtime{
 		ID:         randomToken(18),
 		AgentID:    agent.ID,
@@ -438,318 +347,113 @@ func (s *Supervisor) launchRuntime(agent catalog.Agent, previous *Runtime, envOv
 		Command:    commandPath,
 		Detected:   agent.Detected,
 		LaunchMode: agent.Launch.Mode,
-		StoppedAt:  time.Time{},
 	}
 
-	// If this is a restart, preserve the original runtime identity for diagnostic continuity
-	if previous != nil {
-		runtimeInfo = *previous
-		runtimeInfo.Status = StatusStarting
-		runtimeInfo.Command = commandPath
-		runtimeInfo.Detected = agent.Detected
-		runtimeInfo.LaunchMode = agent.Launch.Mode
-		runtimeInfo.LastError = ""
-		runtimeInfo.PID = 0
-		runtimeInfo.CircuitOpen = false
-		runtimeInfo.StoppedAt = time.Time{}
-	}
-
-	// Set up the OS process with piped stdio for ACP communication
 	cmd := exec.Command(commandPath, agent.Launch.Args...)
 	cmd.Dir = workingDir
 	cmd.Env = mergeProcessEnv(envOverrides)
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
-		return Runtime{}, err
+		return nil, err
 	}
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return Runtime{}, err
+		return nil, err
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return Runtime{}, err
+		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
-		return Runtime{}, err
+		return nil, err
 	}
-
 	runtimeInfo.PID = cmd.Process.Pid
 
-	// Create the process handle and start waiting for exit in a goroutine
-	handle := &processHandle{
-		cmd:            cmd,
-		done:           make(chan struct{}),
-		stdin:          stdinPipe,
-		stdout:         stdoutPipe,
-		agent:          agent,
-		envOverrides:   cloneStringMap(envOverrides),
-		restartAttempt: runtimeInfo.RestartAttempts,
+	proc := &Process{
+		Runtime: runtimeInfo,
+		Cmd:     cmd,
+		Stdin:   stdinPipe,
+		Stdout:  stdoutPipe,
+		done:    make(chan struct{}),
 	}
+	// The wait goroutine reaps the process and signals Done. The owner calls
+	// RecordExit when Done fires; nothing else waits on the process.
 	go func() {
-		// Block until process exits, then capture error and signal waiters
-		handle.waitErr = cmd.Wait()
-		close(handle.done)
+		proc.err = cmd.Wait()
+		close(proc.done)
 	}()
 
-	// Register the runtime in the supervisor's maps while holding the lock.
-	// Re-check shutdown under the same lock: Shutdown may have run between the
-	// pre-spawn check and here, in which case the just-started process is
-	// killed instead of being registered as an orphan.
 	s.mu.Lock()
-	if s.shutdown {
-		s.mu.Unlock()
-		_ = cmd.Process.Kill()
-		<-handle.done
-		return Runtime{}, ErrSupervisorShutdown
-	}
-	s.addRuntimeByAgentLocked(agent.ID, runtimeInfo.ID)
 	s.runtimes[runtimeInfo.ID] = runtimeInfo
-	s.processes[runtimeInfo.ID] = handle
 	s.mu.Unlock()
 	s.persistRuntime(runtimeInfo)
 
-	// Start background goroutines for log capture and process monitoring
 	go s.captureLogs(runtimeInfo.ID, "stderr", stderrPipe, os.Stderr)
-	go s.watchProcess(runtimeInfo.ID, agent.ID, handle)
 
-	// Transition to running state only after the process is started
 	s.mu.Lock()
 	runtimeInfo = s.runtimes[runtimeInfo.ID]
 	runtimeInfo.Status = StatusRunning
-	runtimeInfo.CircuitOpen = false
 	s.runtimes[runtimeInfo.ID] = runtimeInfo
 	s.mu.Unlock()
 	s.persistRuntime(runtimeInfo)
-	return runtimeInfo, nil
+	proc.Runtime = runtimeInfo
+	return proc, nil
 }
 
-// Restart stops and relaunches a running runtime with updated environment variables.
-// It performs a graceful stop of the existing process, persists the stopped state,
-// then launches a new instance with the merged environment overrides.
-//
-// The runtimeID must refer to a currently running runtime, otherwise
-// ErrRuntimeNotFound or ErrRuntimeNotRunning is returned.
-//
-// Returns the new Runtime descriptor on success.
-func (s *Supervisor) Restart(runtimeID string, envVars map[string]string) (Runtime, error) {
+// RecordExit normalizes a process exit into the runtime record: an intentional
+// stop lands in StatusStopped, a clean exit is recorded and persisted for
+// diagnostics, and an unexpected exit lands in StatusFailed with a persisted
+// failure record. The process's owner calls this exactly once per launch.
+func (s *Supervisor) RecordExit(runtimeID string, waitErr error, intentional bool) {
 	s.mu.Lock()
-	s.pruneStoppedRuntimesLocked(s.now().UTC())
-
-	// Validate runtime exists and is running
 	runtimeInfo, ok := s.runtimes[runtimeID]
 	if !ok {
 		s.mu.Unlock()
-		return Runtime{}, ErrRuntimeNotFound
+		return
 	}
-	if runtimeInfo.Status != StatusRunning {
+
+	switch {
+	case intentional:
+		runtimeInfo.Status = StatusStopped
+		runtimeInfo.PID = 0
+		runtimeInfo.StoppedAt = s.now().UTC()
+		s.runtimes[runtimeID] = runtimeInfo
 		s.mu.Unlock()
-		return Runtime{}, ErrRuntimeNotRunning
-	}
-	handle, ok := s.processes[runtimeID]
-	if !ok || handle == nil {
+		s.persistRuntime(runtimeInfo)
+
+	case waitErr != nil:
+		runtimeInfo.Status = StatusFailed
+		runtimeInfo.LastError = waitErr.Error()
+		runtimeInfo.PID = 0
+		runtimeInfo.StoppedAt = time.Time{}
+		runtimeInfo.LastFailureAt = s.now().UTC()
+		s.runtimes[runtimeID] = runtimeInfo
 		s.mu.Unlock()
-		return Runtime{}, ErrRuntimeNotRunning
-	}
-
-	// Capture agent config and merge environment overrides before stopping
-	agent := handle.agent
-	mergedEnv := mergeEnvOverrides(handle.envOverrides, envVars)
-
-	// Mark as stopping and remove from active maps immediately
-	// This prevents concurrent reconnects to the old runtime
-	handle.stopping = true
-	runtimeInfo.Status = StatusStopping
-	runtimeInfo.StoppedAt = time.Time{}
-	s.runtimes[runtimeID] = runtimeInfo
-	s.deleteRuntimeByAgentIfMatchesLocked(runtimeInfo.AgentID, runtimeID)
-	delete(s.processes, runtimeID)
-	s.mu.Unlock()
-	s.persistRuntime(runtimeInfo)
-
-	// Stop the old process - force kill if graceful shutdown fails
-	if err := s.stopProcess(handle, 2*time.Second); err != nil {
-		s.logger.Warn("runtime restart required forced termination", "runtime_id", runtimeID, "error", err)
-	}
-
-	// Update runtime to stopped state after process termination
-	s.mu.Lock()
-	if existing, exists := s.runtimes[runtimeID]; exists {
-		existing.Status = StatusStopped
-		existing.PID = 0
-		existing.StoppedAt = s.now().UTC()
-		s.runtimes[runtimeID] = existing
-		runtimeInfo = existing
-	}
-	s.mu.Unlock()
-	s.persistRuntime(runtimeInfo)
-
-	// Launch the new runtime with merged environment
-	restarted, err := s.launchRuntime(agent, nil, mergedEnv)
-	if err != nil {
-		return Runtime{}, err
-	}
-
-	// Log the successful restart for diagnostics
-	s.appendLog(restarted.ID, LogEntry{
-		Timestamp: s.now().UTC(),
-		Stream:    "gateway",
-		Message:   fmt.Sprintf("runtime restarted from %s with updated environment", runtimeID),
-	})
-	return restarted, nil
-}
-
-// StopByAgentID stops every runtime tracked for the agent, removing each from
-// the active maps before waiting on process termination so a concurrent
-// reconnect cannot attach to a runtime that is already stopping.
-//
-// The API's agent-stop handler does not call this: it walks List() itself so it
-// can revoke each runtime's gateway token before stopping it, and reports the
-// agent's newest runtime in the response. Use this method when the whole
-// agent is being torn down and no per-runtime bookkeeping is needed.
-//
-// The returned Runtime is whichever target finished last (iteration order is
-// unspecified); callers that need a specific runtime stopped should use
-// StopByRuntimeID.
-func (s *Supervisor) StopByAgentID(agentID string) (Runtime, error) {
-	type target struct {
-		runtime Runtime
-		process *processHandle
-	}
-	var targets []target
-
-	s.mu.Lock()
-	ids := s.runtimeIDsForAgentLocked(agentID)
-	if len(ids) == 0 {
-		s.mu.Unlock()
-		return Runtime{}, ErrRuntimeNotFound
-	}
-	for _, runtimeID := range ids {
-		runtime, ok := s.runtimes[runtimeID]
-		if !ok {
-			// Clean up orphaned mapping
-			s.deleteRuntimeByAgentIfMatchesLocked(agentID, runtimeID)
-			continue
-		}
-		// Already stopped - keep for the return value, nothing to stop
-		if runtime.Status == StatusStopped {
-			targets = append(targets, target{runtime: runtime})
-			continue
-		}
-		// Mark process as stopping to prevent restart on exit
-		process := s.processes[runtimeID]
-		if process != nil {
-			process.stopping = true
-		}
-		// Transition to stopping state and remove from active maps
-		runtime.Status = StatusStopping
-		runtime.StoppedAt = time.Time{}
-		s.runtimes[runtimeID] = runtime
-		s.deleteRuntimeByAgentIfMatchesLocked(agentID, runtimeID)
-		delete(s.processes, runtimeID)
-		targets = append(targets, target{runtime: runtime, process: process})
-	}
-	s.mu.Unlock()
-
-	if len(targets) == 0 {
-		return Runtime{}, ErrRuntimeNotFound
-	}
-
-	for _, t := range targets {
-		if t.process == nil {
-			// Already stopped - nothing to terminate or persist.
-			continue
-		}
-		s.persistRuntime(t.runtime)
-
-		// Stop the process outside the lock - this may involve I/O and timeouts.
-		if t.process != nil {
-			if err := s.stopProcess(t.process, 2*time.Second); err != nil {
-				s.logger.Warn("runtime stop required forced termination", "runtime_id", t.runtime.ID, "error", err)
-			}
-		}
-
-		// Update final stopped state after process has terminated
-		s.mu.Lock()
-		final := s.runtimes[t.runtime.ID]
-		s.mu.Unlock()
-		final.Status = StatusStopped
-		final.PID = 0
-		final.StoppedAt = s.now().UTC()
-		s.mu.Lock()
-		s.runtimes[t.runtime.ID] = final
-		s.mu.Unlock()
-		s.persistRuntime(final)
-	}
-
-	return targets[len(targets)-1].runtime, nil
-}
-
-func (s *Supervisor) watchProcess(runtimeID, agentID string, handle *processHandle) {
-	<-handle.done
-	s.handleProcessExit(runtimeID, agentID, handle)
-}
-
-// Shutdown drains all active runtimes best-effort during daemon shutdown. Each
-// runtime is first marked stopping in persisted state so diagnostics still show
-// an intentional shutdown rather than an unexplained disappearance.
-func (s *Supervisor) Shutdown(ctx context.Context) error {
-	s.mu.Lock()
-
-	// Flag shutdown first so pending restart backoffs abort instead of
-	// relaunching into maps being drained here.
-	if !s.shutdown {
-		s.shutdown = true
-		close(s.shutdownCh)
-	}
-
-	// Snapshot all runtimes under lock, then clear the maps immediately
-	targets := make([]shutdownTarget, 0, len(s.runtimes))
-	for runtimeID, runtime := range s.runtimes {
-		targets = append(targets, shutdownTarget{
-			runtime: runtime,
-			process: s.processes[runtimeID],
+		s.persistRuntime(runtimeInfo)
+		s.logger.Error("agent process exited unexpectedly",
+			"runtime_id", runtimeID, "agent_id", runtimeInfo.AgentID,
+			"error", waitErr.Error())
+		s.appendLog(runtimeID, LogEntry{
+			Timestamp: s.now().UTC(),
+			Stream:    "gateway",
+			Message:   fmt.Sprintf("agent process exited unexpectedly: %s", waitErr.Error()),
 		})
-		// Remove from maps so no new connections can be established
-		delete(s.processes, runtimeID)
-		s.deleteRuntimeByAgentIfMatchesLocked(runtime.AgentID, runtimeID)
-		delete(s.runtimes, runtimeID)
-		delete(s.logs, runtimeID)
-		delete(s.onExitCallbacks, runtimeID)
+		s.persistFailure(runtimeID, runtimeInfo, s.recentLogs(runtimeID, 5), runtimeInfo.LastFailureAt)
+
+	default:
+		runtimeInfo.Status = StatusStopped
+		runtimeInfo.PID = 0
+		runtimeInfo.StoppedAt = s.now().UTC()
+		s.runtimes[runtimeID] = runtimeInfo
+		s.mu.Unlock()
+		s.persistRuntime(runtimeInfo)
+		s.appendLog(runtimeID, LogEntry{
+			Timestamp: s.now().UTC(),
+			Stream:    "gateway",
+			Message:   "agent process exited cleanly (exit code 0)",
+		})
+		s.persistCleanExit(runtimeID, runtimeInfo, s.recentLogs(runtimeID, 5), runtimeInfo.StoppedAt)
 	}
-	s.mu.Unlock()
-
-	// Stop all runtimes concurrently (best-effort, no goroutines to keep it simple)
-	var failures []string
-	for _, target := range targets {
-		// Persist stopping state first for diagnostic visibility
-		target.runtime.Status = StatusStopping
-		s.persistRuntime(target.runtime)
-
-		// Attempt graceful stop with context timeout
-		if err := stopProcessWithContext(ctx, target.process); err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", target.runtime.ID, err))
-		}
-
-		// Mark as stopped regardless of outcome
-		target.runtime.Status = StatusStopped
-		target.runtime.PID = 0
-		target.runtime.StoppedAt = s.now().UTC()
-		s.persistRuntime(target.runtime)
-	}
-
-	// Return aggregated errors if any occurred
-	if len(failures) > 0 {
-		return fmt.Errorf("runtime shutdown failed: %s", strings.Join(failures, "; "))
-	}
-	return nil
-}
-
-// isShutdown reports whether Shutdown has drained the supervisor.
-func (s *Supervisor) isShutdown() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.shutdown
 }
 
 // List returns all runtimes currently managed by the supervisor, sorted by
@@ -761,8 +465,8 @@ func (s *Supervisor) List() []Runtime {
 	s.pruneStoppedRuntimesLocked(s.now().UTC())
 
 	out := make([]Runtime, 0, len(s.runtimes))
-	for _, runtime := range s.runtimes {
-		out = append(out, runtime)
+	for _, runtimeInfo := range s.runtimes {
+		out = append(out, runtimeInfo)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
@@ -771,6 +475,21 @@ func (s *Supervisor) List() []Runtime {
 		return out[i].CreatedAt.After(out[j].CreatedAt)
 	})
 	return out
+}
+
+// Get returns the current record for a runtime.
+//
+// Returns ErrRuntimeNotFound if the runtime is not tracked.
+func (s *Supervisor) Get(runtimeID string) (Runtime, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneStoppedRuntimesLocked(s.now().UTC())
+
+	runtimeInfo, ok := s.runtimes[runtimeID]
+	if !ok {
+		return Runtime{}, ErrRuntimeNotFound
+	}
+	return runtimeInfo, nil
 }
 
 // Connect builds a connection descriptor for a running runtime. The descriptor
@@ -784,19 +503,19 @@ func (s *Supervisor) Connect(runtimeID string) (ConnectDescriptor, error) {
 	defer s.mu.Unlock()
 	s.pruneStoppedRuntimesLocked(s.now().UTC())
 
-	runtime, ok := s.runtimes[runtimeID]
+	runtimeInfo, ok := s.runtimes[runtimeID]
 	if !ok {
 		return ConnectDescriptor{}, ErrRuntimeNotFound
 	}
-	if runtime.Status != StatusRunning {
+	if runtimeInfo.Status != StatusRunning {
 		return ConnectDescriptor{}, ErrRuntimeNotRunning
 	}
 
 	return ConnectDescriptor{
-		RuntimeID:     runtime.ID,
-		AgentID:       runtime.AgentID,
+		RuntimeID:     runtimeInfo.ID,
+		AgentID:       runtimeInfo.AgentID,
 		Protocol:      "acp",
-		WebSocketPath: fmt.Sprintf("/v1/acp/%s", runtime.ID),
+		WebSocketPath: fmt.Sprintf("/v1/acp/%s", runtimeInfo.ID),
 	}, nil
 }
 
@@ -851,35 +570,26 @@ func (s *Supervisor) Summary() Summary {
 	// Use a map to deduplicate failures by runtime ID
 	failuresByRuntimeID := make(map[string]FailureSummary)
 
-	// Count runtimes by status and collect in-memory failures
-	for runtimeID, runtime := range s.runtimes {
+	for runtimeID, runtimeInfo := range s.runtimes {
 		summary.Total++
-		switch runtime.Status {
+		switch runtimeInfo.Status {
 		case StatusStarting:
 			summary.Starting++
 		case StatusRunning:
 			summary.Running++
-		case StatusStopping:
-			summary.Stopping++
 		case StatusFailed:
 			summary.Failed++
-			if runtime.CircuitOpen {
-				summary.CircuitOpen++
-			}
-			// Capture failure summary from in-memory state
 			failuresByRuntimeID[runtimeID] = FailureSummary{
 				RuntimeID:      runtimeID,
-				AgentID:        runtime.AgentID,
-				AgentName:      runtime.AgentName,
-				LastError:      runtime.LastError,
-				CreatedAt:      runtime.CreatedAt,
-				FailedAt:       runtime.CreatedAt,
+				AgentID:        runtimeInfo.AgentID,
+				AgentName:      runtimeInfo.AgentName,
+				LastError:      runtimeInfo.LastError,
+				CreatedAt:      runtimeInfo.CreatedAt,
+				FailedAt:       runtimeInfo.CreatedAt,
 				RecentLogLines: lastLogEntries(s.logs[runtimeID], 5),
 			}
-		case StatusStopped:
-			summary.Stopped++
 		default:
-			// Unknown states treated as stopped
+			// Stopped (or any unknown state) is a terminal, non-failure state.
 			summary.Stopped++
 		}
 	}
@@ -966,200 +676,24 @@ func (s *Supervisor) resolveLaunch(launch catalog.LaunchConfig) (string, string,
 	}
 }
 
-// StopByRuntimeID stops a runtime by its unique runtime ID. It transitions the
-// runtime to stopping state, removes it from active maps, gracefully terminates
-// the process, and persists the final stopped state.
-//
-// Returns the final Runtime state, or ErrRuntimeNotFound if the ID is invalid.
-func (s *Supervisor) StopByRuntimeID(runtimeID string) (Runtime, error) {
-	s.mu.Lock()
-	runtime, ok := s.runtimes[runtimeID]
-	if !ok {
-		s.mu.Unlock()
-		return Runtime{}, ErrRuntimeNotFound
-	}
-	if runtime.Status == StatusStopped {
-		s.mu.Unlock()
-		return runtime, nil
-	}
-	process := s.processes[runtimeID]
-	if process != nil {
-		process.stopping = true
-	}
-	runtime.Status = StatusStopping
-	s.runtimes[runtimeID] = runtime
-	s.deleteRuntimeByAgentIfMatchesLocked(runtime.AgentID, runtimeID)
-	delete(s.processes, runtimeID)
-	s.mu.Unlock()
-	s.persistRuntime(runtime)
-
-	if err := s.stopProcess(process, 2*time.Second); err != nil {
-		s.logger.Warn("runtime stop required forced termination", "runtime_id", runtimeID, "error", err)
-	}
-
-	s.mu.Lock()
-	runtime = s.runtimes[runtimeID]
-	s.mu.Unlock()
-	runtime.Status = StatusStopped
-	runtime.PID = 0
-	runtime.StoppedAt = s.now().UTC()
-	s.mu.Lock()
-	s.runtimes[runtimeID] = runtime
-	s.mu.Unlock()
-	s.persistRuntime(runtime)
-	return runtime, nil
-}
-
-// handleProcessExit is where crash behavior is normalized. The process watcher
-// always funnels through here so restart policy, circuit-open state, and
-// failure persistence are applied consistently whether the process exits during
-// startup or long after a client connected.
-func (s *Supervisor) handleProcessExit(runtimeID, agentID string, handle *processHandle) {
-	s.mu.Lock()
-	runtime, ok := s.runtimes[runtimeID]
-	if !ok {
-		// Runtime was already removed (e.g., during intentional stop)
-		s.mu.Unlock()
-		return
-	}
-
-	// Remove process handle immediately - it's no longer valid
-	delete(s.processes, runtimeID)
-
-	// Save and remove any exit callback for notification outside the lock.
-	exitCallback := s.onExitCallbacks[runtimeID]
-	delete(s.onExitCallbacks, runtimeID)
-	// handle.stopping is read here, under s.mu, which guards its writers; the
-	// callback uses it to tell an intentional stop or restart from a crash.
-	intentional := handle.stopping
-
-	// Check if we should attempt automatic restart:
-	// 1. Process exited with error
-	// 2. Restart policy allows it (on_failure mode)
-	// 3. Haven't exceeded max retry count
-	// 4. Not an intentional stop (handle.stopping or runtime status)
-	// 5. Not held by a resilient session. A session-leased runtime has its own
-	//    recovery path: the exitCallback below reclaims the crashed session and
-	//    notifies the client, which reconnects and gets a fresh session. Restarting
-	//    in place instead would orphan the session (its pump is cancelled and its
-	//    lease released by the callback) and leave the new process with no client
-	//    and no stdout drain — so the two recovery mechanisms are mutually exclusive.
-	if handle.waitErr != nil && s.shouldRestart(handle.agent.Launch.Restart, runtime.RestartAttempts) && !handle.stopping && runtime.Status != StatusStopping && !sessionLeased(handle) {
-		// Transition to starting state for restart
-		runtime.Status = StatusStarting
-		runtime.LastError = handle.waitErr.Error()
-		runtime.PID = 0
-		runtime.StoppedAt = time.Time{}
-		runtime.RestartAttempts++
-		runtime.FailureStreak++
-		runtime.LastFailureAt = s.now().UTC()
-		s.runtimes[runtimeID] = runtime
-		s.mu.Unlock()
-		if exitCallback != nil {
-			exitCallback(runtimeID, intentional)
-		}
-		s.persistRuntime(runtime)
-		s.logger.Error("agent process exited unexpectedly; restart scheduled",
-			"runtime_id", runtimeID, "agent_id", agentID,
-			"error", handle.waitErr.Error(),
-			"restart_mode", handle.agent.Launch.Restart.Mode,
-			"attempt", runtime.RestartAttempts)
-		s.appendLog(runtimeID, LogEntry{
-			Timestamp: s.now().UTC(),
-			Stream:    "gateway",
-			Message:   fmt.Sprintf("restart scheduled after failure: %s", handle.waitErr.Error()),
-		})
-		// Restart in background with backoff delay
-		go s.restartAfterBackoff(runtime, handle.agent, handle.envOverrides)
-		return
-	}
-
-	// No restart - clean up agent mapping and determine final state
-	s.deleteRuntimeByAgentIfMatchesLocked(agentID, runtimeID)
-	// handle.stopping means an intentional stop/restart killed the process, so a
-	// non-nil waitErr is the expected result of that kill — not a failure. Treat
-	// it as a clean stop; otherwise this branch races the stop path's StatusStopped
-	// write (flaking status to "failed") and would spuriously trip the circuit
-	// breaker.
-	if handle.waitErr != nil && !handle.stopping {
-		// Process failed - mark as failed and check circuit breaker
-		runtime.Status = StatusFailed
-		runtime.LastError = handle.waitErr.Error()
-		runtime.PID = 0
-		runtime.StoppedAt = time.Time{}
-		runtime.FailureStreak++
-		runtime.LastFailureAt = s.now().UTC()
-		// Open circuit breaker if restart mode is on_failure and this wasn't intentional
-		runtime.CircuitOpen = restartMode(handle.agent.Launch.Restart) == "on_failure" && !handle.stopping
-		s.runtimes[runtimeID] = runtime
-		s.mu.Unlock()
-		if exitCallback != nil {
-			exitCallback(runtimeID, intentional)
-		}
-		s.persistRuntime(runtime)
-		// Log the unexpected death at ERROR so it is visible in the daemon log
-		// (not just persisted to the failure table), with the exit reason.
-		s.logger.Error("agent process exited unexpectedly",
-			"runtime_id", runtimeID, "agent_id", agentID,
-			"error", handle.waitErr.Error(),
-			"restart_mode", handle.agent.Launch.Restart.Mode, "attempts", runtime.RestartAttempts)
-		s.appendLog(runtimeID, LogEntry{
-			Timestamp: s.now().UTC(),
-			Stream:    "gateway",
-			Message:   fmt.Sprintf("agent process exited unexpectedly: %s", handle.waitErr.Error()),
-		})
-		if runtime.CircuitOpen {
-			s.appendLog(runtimeID, LogEntry{
-				Timestamp: s.now().UTC(),
-				Stream:    "gateway",
-				Message:   "restart limit reached; circuit opened",
-			})
-		}
-		// Persist failure for post-mortem diagnostics
-		s.persistFailure(runtimeID, runtime, s.recentLogs(runtimeID, 5), s.now().UTC())
-		return
-	}
-
-	// Clean exit (no error) - mark as stopped. Persist the exit so it leaves a
-	// diagnostic trace: before this, clean agent exits (the silent-death case)
-	// produced no record at all. The persisted record is flagged clean so the
-	// failure view does not treat it as a crash.
-	runtime.Status = StatusStopped
-	runtime.PID = 0
-	runtime.StoppedAt = s.now().UTC()
-	s.runtimes[runtimeID] = runtime
-	s.mu.Unlock()
-	if exitCallback != nil {
-		exitCallback(runtimeID, intentional)
-	}
-	s.persistRuntime(runtime)
-	s.persistCleanExit(runtimeID, runtime, s.recentLogs(runtimeID, 5), runtime.StoppedAt)
-	s.appendLog(runtimeID, LogEntry{
-		Timestamp: s.now().UTC(),
-		Stream:    "gateway",
-		Message:   "agent process exited cleanly (exit code 0)",
-	})
-}
-
 // pruneStoppedRuntimesLocked removes terminal runtimes after the retention
 // window so live runtime listings do not grow without bound. Both clean stops
 // and failures are pruned: failure diagnostics survive in the persisted store
 // (merged into Summary), so there is no need to keep them in memory forever.
 // Failed entries are aged by LastFailureAt (falling back to CreatedAt when the
-// failure timestamp is missing); each eviction also drops its log ring,
-// process handle, agent index, and exit callback.
+// failure timestamp is missing); each eviction also drops its log ring.
 func (s *Supervisor) pruneStoppedRuntimesLocked(now time.Time) {
 	cutoff := now.Add(-stoppedRuntimeRetention)
-	for runtimeID, runtime := range s.runtimes {
-		switch runtime.Status {
+	for runtimeID, runtimeInfo := range s.runtimes {
+		switch runtimeInfo.Status {
 		case StatusStopped:
-			if runtime.StoppedAt.IsZero() || runtime.StoppedAt.After(cutoff) {
+			if runtimeInfo.StoppedAt.IsZero() || runtimeInfo.StoppedAt.After(cutoff) {
 				continue
 			}
 		case StatusFailed:
-			failedAt := runtime.LastFailureAt
+			failedAt := runtimeInfo.LastFailureAt
 			if failedAt.IsZero() {
-				failedAt = runtime.CreatedAt
+				failedAt = runtimeInfo.CreatedAt
 			}
 			if failedAt.IsZero() || failedAt.After(cutoff) {
 				continue
@@ -1169,74 +703,7 @@ func (s *Supervisor) pruneStoppedRuntimesLocked(now time.Time) {
 		}
 		delete(s.runtimes, runtimeID)
 		delete(s.logs, runtimeID)
-		delete(s.processes, runtimeID)
-		delete(s.onExitCallbacks, runtimeID)
-		s.deleteRuntimeByAgentIfMatchesLocked(runtime.AgentID, runtimeID)
 	}
-}
-
-// restartAfterBackoff preserves the existing runtime identity while retrying
-// the launch. That keeps diagnostics stable across a short crash loop.
-func (s *Supervisor) restartAfterBackoff(runtimeInfo Runtime, agent catalog.Agent, envOverrides map[string]string) {
-	// Wait for configured backoff duration before retrying, waking early when
-	// the supervisor shuts down. Sleeping through Shutdown and relaunching
-	// afterwards would spawn an orphan process into maps Shutdown just
-	// drained, with no owner and no stdout drain.
-	if backoff := restartBackoff(agent.Launch.Restart); backoff > 0 {
-		select {
-		case <-s.shutdownCh:
-			return
-		case <-time.After(backoff):
-		}
-	}
-	// The runtime may have been stopped, pruned, or shut down while waiting;
-	// relaunching anyway would resurrect it with nobody owning it.
-	s.mu.Lock()
-	_, alive := s.runtimes[runtimeInfo.ID]
-	shut := s.shutdown
-	s.mu.Unlock()
-	if shut || !alive {
-		return
-	}
-
-	// Attempt to relaunch using the same runtime ID for diagnostic continuity
-	restarted, err := s.launchRuntime(agent, &runtimeInfo, envOverrides)
-	if err == nil {
-		s.appendLog(restarted.ID, LogEntry{
-			Timestamp: s.now().UTC(),
-			Stream:    "gateway",
-			Message:   fmt.Sprintf("runtime restarted successfully (attempt %d)", restarted.RestartAttempts),
-		})
-		return
-	}
-
-	// Restart failed - update runtime state and persist failure
-	s.mu.Lock()
-	runtimeInfo, ok := s.runtimes[runtimeInfo.ID]
-	if !ok {
-		// Runtime was removed while we were trying to restart
-		s.mu.Unlock()
-		return
-	}
-	s.deleteRuntimeByAgentIfMatchesLocked(runtimeInfo.AgentID, runtimeInfo.ID)
-	delete(s.processes, runtimeInfo.ID)
-	runtimeInfo.Status = StatusFailed
-	runtimeInfo.LastError = err.Error()
-	runtimeInfo.PID = 0
-	s.runtimes[runtimeInfo.ID] = runtimeInfo
-	s.mu.Unlock()
-
-	s.persistRuntime(runtimeInfo)
-	s.persistFailure(runtimeInfo.ID, runtimeInfo, s.recentLogs(runtimeInfo.ID, 5), s.now().UTC())
-	s.logger.Error("runtime restart failed",
-		"runtime_id", runtimeInfo.ID, "agent_id", runtimeInfo.AgentID,
-		"error", err.Error(),
-		"attempts", runtimeInfo.RestartAttempts)
-	s.appendLog(runtimeInfo.ID, LogEntry{
-		Timestamp: s.now().UTC(),
-		Stream:    "gateway",
-		Message:   fmt.Sprintf("runtime restart failed: %s", err.Error()),
-	})
 }
 
 // captureLogs copies process output into the in-memory ring buffer while also
@@ -1291,76 +758,11 @@ func (s *Supervisor) appendLog(runtimeID string, entry LogEntry) {
 // recentLogs returns a copy of the last `limit` log entries for a runtime,
 // taking s.mu so it is safe to call from paths that have already released the
 // lock. lastLogEntries copies the tail, so the returned slice never aliases the
-// live buffer. Use this instead of a bare lastLogEntries(s.logs[id], n) read,
-// which races with the concurrent writes in appendLog.
+// live buffer.
 func (s *Supervisor) recentLogs(runtimeID string, limit int) []LogEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return lastLogEntries(s.logs[runtimeID], limit)
-}
-
-// addRuntimeByAgentLocked records runtimeID under agentID. Caller holds s.mu.
-func (s *Supervisor) addRuntimeByAgentLocked(agentID, runtimeID string) {
-	set := s.runtimeByAgent[agentID]
-	if set == nil {
-		set = make(map[string]struct{})
-		s.runtimeByAgent[agentID] = set
-	}
-	set[runtimeID] = struct{}{}
-}
-
-// runtimeIDsForAgentLocked returns the tracked runtime IDs for agentID.
-// Caller holds s.mu. Order is unspecified.
-func (s *Supervisor) runtimeIDsForAgentLocked(agentID string) []string {
-	set := s.runtimeByAgent[agentID]
-	ids := make([]string, 0, len(set))
-	for id := range set {
-		ids = append(ids, id)
-	}
-	return ids
-}
-
-// deleteRuntimeByAgentIfMatchesLocked removes the agent-to-runtime mapping only
-// if it points to the specified runtime ID. This prevents accidentally deleting
-// a mapping that has been updated to point to a different runtime.
-func (s *Supervisor) deleteRuntimeByAgentIfMatchesLocked(agentID, runtimeID string) {
-	set, ok := s.runtimeByAgent[agentID]
-	if !ok {
-		return
-	}
-	delete(set, runtimeID)
-	if len(set) == 0 {
-		delete(s.runtimeByAgent, agentID)
-	}
-}
-
-// cloneStringMap creates a shallow copy of a string map to avoid mutations
-// of shared state. Returns nil for empty maps.
-func cloneStringMap(values map[string]string) map[string]string {
-	if len(values) == 0 {
-		return nil
-	}
-	cloned := make(map[string]string, len(values))
-	for key, value := range values {
-		cloned[key] = value
-	}
-	return cloned
-}
-
-// mergeEnvOverrides combines current environment overrides with new updates.
-// New values overwrite existing keys. Returns nil if both inputs are empty.
-func mergeEnvOverrides(current map[string]string, updates map[string]string) map[string]string {
-	if len(current) == 0 && len(updates) == 0 {
-		return nil
-	}
-	if len(current) == 0 {
-		return cloneStringMap(updates)
-	}
-	merged := cloneStringMap(current)
-	for key, value := range updates {
-		merged[key] = value
-	}
-	return merged
 }
 
 // mergeProcessEnv merges environment variable overrides with the current
@@ -1452,7 +854,7 @@ func failureSummaryFromRecord(record storage.RuntimeFailureRecord) FailureSummar
 // persistFailure stores a small failure summary instead of raw transcript or
 // full logs. That keeps the gateway useful for debugging without turning SQLite
 // into a session store.
-func (s *Supervisor) persistFailure(runtimeID string, runtime Runtime, logLines []LogEntry, failedAt time.Time) {
+func (s *Supervisor) persistFailure(runtimeID string, runtimeInfo Runtime, logLines []LogEntry, failedAt time.Time) {
 	if s.store == nil {
 		return
 	}
@@ -1467,10 +869,10 @@ func (s *Supervisor) persistFailure(runtimeID string, runtime Runtime, logLines 
 	// Store failure record in SQLite (best-effort)
 	if err := s.store.SaveRuntimeFailure(context.Background(), storage.RuntimeFailureRecord{
 		RuntimeID:  runtimeID,
-		AgentID:    runtime.AgentID,
-		AgentName:  runtime.AgentName,
-		LastError:  runtime.LastError,
-		CreatedAt:  runtime.CreatedAt,
+		AgentID:    runtimeInfo.AgentID,
+		AgentName:  runtimeInfo.AgentName,
+		LastError:  runtimeInfo.LastError,
+		CreatedAt:  runtimeInfo.CreatedAt,
 		FailedAt:   failedAt,
 		LogPreview: string(logPreview),
 	}); err != nil {
@@ -1484,7 +886,7 @@ func (s *Supervisor) persistFailure(runtimeID string, runtime Runtime, logLines 
 // can filter it out. "Clean" here means the supervisor saw no wait error —
 // the process may still have been killed externally in a way Windows reports
 // as a normal exit.
-func (s *Supervisor) persistCleanExit(runtimeID string, runtime Runtime, logLines []LogEntry, exitedAt time.Time) {
+func (s *Supervisor) persistCleanExit(runtimeID string, runtimeInfo Runtime, logLines []LogEntry, exitedAt time.Time) {
 	if s.store == nil {
 		return
 	}
@@ -1497,72 +899,15 @@ func (s *Supervisor) persistCleanExit(runtimeID string, runtime Runtime, logLine
 
 	if err := s.store.SaveRuntimeFailure(context.Background(), storage.RuntimeFailureRecord{
 		RuntimeID:  runtimeID,
-		AgentID:    runtime.AgentID,
-		AgentName:  runtime.AgentName,
+		AgentID:    runtimeInfo.AgentID,
+		AgentName:  runtimeInfo.AgentName,
 		LastError:  "exit status 0 (clean)",
-		CreatedAt:  runtime.CreatedAt,
+		CreatedAt:  runtimeInfo.CreatedAt,
 		FailedAt:   exitedAt,
 		LogPreview: string(logPreview),
 		CleanExit:  true,
 	}); err != nil {
 		s.logger.Error("persist runtime clean exit failed", "runtime_id", runtimeID, "error", err)
-	}
-}
-
-func (s *Supervisor) stopProcess(handle *processHandle, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	return stopProcessWithContext(ctx, handle)
-}
-
-// stopProcessWithContext gracefully terminates a process with context-based timeout.
-// It follows a multi-stage shutdown sequence:
-// 1. Close stdin to signal EOF to the process
-// 2. Send SIGINT for graceful shutdown
-// 3. If timeout expires, send SIGKILL as last resort
-// 4. Wait briefly for SIGKILL to take effect
-func stopProcessWithContext(ctx context.Context, handle *processHandle) error {
-	if handle == nil || handle.cmd == nil || handle.cmd.Process == nil {
-		return nil
-	}
-
-	// Check if process already exited
-	select {
-	case <-handle.done:
-		return nil
-	default:
-	}
-
-	// Stage 1: Close stdin to signal EOF to the process.
-	if handle.stdin != nil {
-		_ = handle.stdin.Close()
-	}
-
-	// Stage 2: Send SIGINT for graceful shutdown
-	if err := handle.cmd.Process.Signal(os.Interrupt); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		// SIGINT failed - escalate to SIGKILL immediately
-		if killErr := handle.cmd.Process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
-			return killErr
-		}
-	}
-
-	// Stage 3: Wait for graceful shutdown or timeout
-	select {
-	case <-handle.done:
-		return nil
-	case <-ctx.Done():
-		// Timeout expired - force kill
-		if err := handle.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			return err
-		}
-
-		// Stage 4: Brief wait for SIGKILL to take effect
-		select {
-		case <-handle.done:
-			return nil
-		case <-time.After(250 * time.Millisecond):
-			return ctx.Err()
-		}
 	}
 }
 
@@ -1577,75 +922,24 @@ func randomToken(byteLen int) string {
 	return base64.RawURLEncoding.EncodeToString(buf)
 }
 
-// sessionLeased reports whether the runtime's process handle is held by a
-// resilient session (leaseholder is a session ID) rather than being unleased.
-// Session-leased runtimes are excluded from supervisor auto-restart so the
-// session's own crash-reclamation path is the sole recovery mechanism.
-func sessionLeased(handle *processHandle) bool {
-	if handle == nil {
-		return false
-	}
-	return handle.leaseholder != ""
-}
-
-// shouldRestart determines whether a failed runtime should be automatically
-// restarted based on the restart mode and retry count.
-func (s *Supervisor) shouldRestart(restart catalog.RestartConfig, attempts int) bool {
-	mode := restartMode(restart)
-	if mode != "on_failure" {
-		return false
-	}
-	if attempts >= restartMaxRetries(restart) {
-		return false
-	}
-	return true
-}
-
-// restartMode returns the restart mode from config, defaulting to "never" if
-// not specified.
-func restartMode(restart catalog.RestartConfig) string {
-	if restart.Mode == "" {
-		return "never"
-	}
-	return restart.Mode
-}
-
-// restartMaxRetries returns the maximum number of restart attempts allowed.
-// Negative values are treated as 0 to prevent infinite loops.
-func restartMaxRetries(restart catalog.RestartConfig) int {
-	if restart.MaxRetries < 0 {
-		return 0
-	}
-	return restart.MaxRetries
-}
-
-// restartBackoff returns the delay duration before attempting a restart.
-// Non-positive values result in zero delay (immediate restart).
-func restartBackoff(restart catalog.RestartConfig) time.Duration {
-	if restart.BackoffSeconds <= 0 {
-		return 0
-	}
-	return time.Duration(restart.BackoffSeconds) * time.Second
-}
-
 // persistRuntime saves the current runtime state to the SQLite store if one
 // is configured. Errors are logged but not propagated to callers since
 // persistence is best-effort for diagnostics.
-func (s *Supervisor) persistRuntime(runtime Runtime) {
+func (s *Supervisor) persistRuntime(runtimeInfo Runtime) {
 	if s.store == nil {
 		return
 	}
 
 	if err := s.store.SaveRuntime(context.Background(), storage.RuntimeRecord{
-		RuntimeID: runtime.ID,
-		AgentID:   runtime.AgentID,
-		AgentName: runtime.AgentName,
-		Status:    runtime.Status,
-		Command:   runtime.Command,
-		PID:       runtime.PID,
-		LastError: runtime.LastError,
-		CreatedAt: runtime.CreatedAt,
+		RuntimeID: runtimeInfo.ID,
+		AgentID:   runtimeInfo.AgentID,
+		AgentName: runtimeInfo.AgentName,
+		Status:    runtimeInfo.Status,
+		Command:   runtimeInfo.Command,
+		PID:       runtimeInfo.PID,
+		LastError: runtimeInfo.LastError,
+		CreatedAt: runtimeInfo.CreatedAt,
 	}); err != nil {
-		s.logger.Error("persist runtime failed", "runtime_id", runtime.ID, "error", err)
+		s.logger.Error("persist runtime failed", "runtime_id", runtimeInfo.ID, "error", err)
 	}
 }

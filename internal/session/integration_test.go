@@ -1,10 +1,10 @@
 // Package session provides end-to-end integration tests for RuntimeSession
-// and its collaboration with SQLite store, ProcessManager, and TokenService.
+// and its collaboration with the SQLite store, a real runtime supervisor
+// (launching the mock agent), and TokenService.
 //
-// These tests use real (temporary) SQLite databases and clock-based timing
-// for the reaper, exercising the full code path through storage without mocking
-// the database layer. Mocks are only used for runtime process management and
-// token minting/validation.
+// These tests use real (temporary) SQLite databases, real agent processes, and
+// clock-based timing for the reaper, exercising the full code path through
+// storage without mocking the database layer.
 package session
 
 import (
@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arafatamim/ferngeist-acp-gateway/internal/runtime"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
 )
 
@@ -24,8 +25,8 @@ import (
 // behaves correctly when composed sequentially.
 //
 // Flow: Create → AttachClient → DetachClient → Resume → AttachClient (reconnect)
-// → Close. After Close, the session is removed from the store, the runtime process
-// is stopped, and the runtime lease is released.
+// → Close. After Close, the session is removed from the store and the agent
+// process it owned is stopped.
 func TestIntegration_SessionLifecycle(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "integration_test.db")
 	store, err := storage.Open(dbPath)
@@ -35,7 +36,7 @@ func TestIntegration_SessionLifecycle(t *testing.T) {
 	defer store.Close()
 
 	ctx := context.Background()
-	mockPM := newMockPM()
+	logger := slog.Default()
 	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	cfg := Config{
@@ -43,19 +44,20 @@ func TestIntegration_SessionLifecycle(t *testing.T) {
 		MaxPerDevice:    3,
 	}
 
-	rs := NewRuntimeSession(slog.Default(), store, mockPM, tokenSvc, cfg)
+	rs := NewRuntimeSession(logger, store, runtime.NewSupervisor(logger, t.TempDir(), nil, nil), tokenSvc, cfg)
 	defer rs.Shutdown()
 
-	runtimeID := "rt_integration_001"
 	deviceID := "dev_integration_001"
-	agentID := "agent_mock"
 
-	sess, attachToken, err := rs.Create(ctx, runtimeID, deviceID, agentID)
+	sess, attachToken, err := rs.Create(ctx, mockAgent(t), deviceID, nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if sess == nil || sess.ID == "" {
 		t.Fatal("expected non-nil session with ID")
+	}
+	if sess.RuntimeID == "" {
+		t.Error("expected a generated runtime id")
 	}
 	if sess.Status != StatusDisconnected {
 		t.Errorf("expected status disconnected, got %s", sess.Status)
@@ -119,17 +121,11 @@ func TestIntegration_SessionLifecycle(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
+	waitProcessStopped(t, sess)
+
 	_, err = store.GetSession(ctx, sess.ID)
 	if err == nil {
 		t.Error("expected session to be deleted from store after close")
-	}
-
-	if !mockPM.stopped[runtimeID] {
-		t.Error("expected runtime to be stopped after session close")
-	}
-
-	if mockPM.leases[runtimeID] != "" {
-		t.Errorf("expected lease to be released, got %q", mockPM.leases[runtimeID])
 	}
 }
 
@@ -145,7 +141,7 @@ func TestIntegration_DeviceLimit(t *testing.T) {
 	defer store.Close()
 
 	ctx := context.Background()
-	mockPM := newMockPM()
+	logger := slog.Default()
 	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	cfg := Config{
@@ -153,23 +149,21 @@ func TestIntegration_DeviceLimit(t *testing.T) {
 		MaxPerDevice:    2,
 	}
 
-	rs := NewRuntimeSession(slog.Default(), store, mockPM, tokenSvc, cfg)
+	rs := NewRuntimeSession(logger, store, runtime.NewSupervisor(logger, t.TempDir(), nil, nil), tokenSvc, cfg)
 	defer rs.Shutdown()
 
 	deviceID := "dev_limit_test"
+	agent := mockAgent(t)
 
-	_, _, err = rs.Create(ctx, "rt_1", deviceID, "agent_1")
-	if err != nil {
+	if _, _, err = rs.Create(ctx, agent, deviceID, nil); err != nil {
 		t.Fatalf("Create 1: %v", err)
 	}
 
-	_, _, err = rs.Create(ctx, "rt_2", deviceID, "agent_2")
-	if err != nil {
+	if _, _, err = rs.Create(ctx, agent, deviceID, nil); err != nil {
 		t.Fatalf("Create 2: %v", err)
 	}
 
-	_, _, err = rs.Create(ctx, "rt_3", deviceID, "agent_3")
-	if err != ErrSessionLimitReached {
+	if _, _, err = rs.Create(ctx, agent, deviceID, nil); err != ErrSessionLimitReached {
 		t.Errorf("expected ErrSessionLimitReached, got %v", err)
 	}
 }
@@ -186,13 +180,13 @@ func TestIntegration_DeviceMismatch(t *testing.T) {
 	defer store.Close()
 
 	ctx := context.Background()
-	mockPM := newMockPM()
+	logger := slog.Default()
 	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	rs := NewRuntimeSession(slog.Default(), store, mockPM, tokenSvc, Config{})
+	rs := NewRuntimeSession(logger, store, runtime.NewSupervisor(logger, t.TempDir(), nil, nil), tokenSvc, Config{})
 	defer rs.Shutdown()
 
-	sess, _, err := rs.Create(ctx, "rt_mm", "dev_a", "agent_x")
+	sess, _, err := rs.Create(ctx, mockAgent(t), "dev_a", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -208,11 +202,10 @@ func TestIntegration_DeviceMismatch(t *testing.T) {
 	}
 }
 
-// TestIntegration_ProcessExitCallback verifies that when the underlying agent
-// process exits (triggered via the ProcessManager exit callback), the crashed
-// session is fully reclaimed — its store record deleted and its runtime lease
-// released — so the dead session cannot block future sessions on that runtime.
-func TestIntegration_ProcessExitCallback(t *testing.T) {
+// TestIntegration_ProcessExitReclaims verifies that when the underlying agent
+// process exits unexpectedly, the crashed session is fully reclaimed — its store
+// record deleted — so the dead session cannot linger.
+func TestIntegration_ProcessExitReclaims(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "exit_cb_test.db")
 	store, err := storage.Open(dbPath)
 	if err != nil {
@@ -221,29 +214,35 @@ func TestIntegration_ProcessExitCallback(t *testing.T) {
 	defer store.Close()
 
 	ctx := context.Background()
-	mockPM := newMockPM()
+	logger := slog.Default()
 	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	rs := NewRuntimeSession(slog.Default(), store, mockPM, tokenSvc, Config{})
+	rs := NewRuntimeSession(logger, store, runtime.NewSupervisor(logger, t.TempDir(), nil, nil), tokenSvc, Config{})
 	defer rs.Shutdown()
 
-	runtimeID := "rt_exit_cb"
-	sess, _, err := rs.Create(ctx, runtimeID, "dev_cb", "agent_cb")
+	sess, _, err := rs.Create(ctx, mockAgent(t), "dev_cb", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
-	mockPM.triggerExit(runtimeID)
+	// Kill the agent out from under the session: an unexpected exit.
+	_ = sess.proc.Cmd.Process.Kill()
 
-	time.Sleep(10 * time.Millisecond)
-
-	if _, err := store.GetSession(ctx, sess.ID); err == nil {
-		t.Errorf("expected crashed session record to be deleted from store")
+	// The crash is reclaimed asynchronously by the session's exit watcher.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := store.GetSession(ctx, sess.ID); err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expected crashed session record to be deleted from store")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 
-	// The released lease lets a fresh session reuse the same runtime.
-	if _, _, err := rs.Create(ctx, runtimeID, "dev_cb", "agent_cb2"); err != nil {
-		t.Errorf("expected Create on reclaimed runtime to succeed, got %v", err)
+	// A fresh session launches a new runtime and succeeds.
+	if _, _, err := rs.Create(ctx, mockAgent(t), "dev_cb", nil); err != nil {
+		t.Errorf("expected a fresh Create to succeed, got %v", err)
 	}
 }
 
@@ -264,7 +263,7 @@ func TestIntegration_ReaperExpiresDisconnectedSessions(t *testing.T) {
 	defer store.Close()
 
 	ctx := context.Background()
-	mockPM := newMockPM()
+	logger := slog.Default()
 	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	cfg := Config{
@@ -272,10 +271,10 @@ func TestIntegration_ReaperExpiresDisconnectedSessions(t *testing.T) {
 		MaxPerDevice:    5,
 	}
 
-	rs := NewRuntimeSession(slog.Default(), store, mockPM, tokenSvc, cfg)
+	rs := NewRuntimeSession(logger, store, runtime.NewSupervisor(logger, t.TempDir(), nil, nil), tokenSvc, cfg)
 	defer rs.Shutdown()
 
-	sess, _, err := rs.Create(ctx, "rt_reaper", "dev_reaper", "agent_reaper")
+	sess, _, err := rs.Create(ctx, mockAgent(t), "dev_reaper", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

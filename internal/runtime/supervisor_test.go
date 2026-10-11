@@ -1,8 +1,9 @@
-// Package runtime_test contains unit and integration tests for the runtime supervisor.
-// Tests cover the full lifecycle: starting, connecting, restarting, stopping, and
-// pruning runtimes; lease acquisition and release; process exit handling and circuit
-// breakers; log capture and overflow; summary reporting; and persistence via the
-// storage backend. Most tests use a compiled mock stdio agent launched as a subprocess.
+// Package runtime contains unit and integration tests for the runtime
+// supervisor. The supervisor launches agent processes, owns their diagnostic
+// log ring, and records their exits; these tests cover launching, connect
+// descriptors, exit recording, log capture, summary reporting, pruning, and
+// persistence via the storage backend. Most tests use a compiled mock stdio
+// agent launched as a subprocess.
 package runtime
 
 import (
@@ -27,16 +28,10 @@ import (
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
 )
 
-// --- Start / Connect / Restart lifecycle ---
+// --- Launch / Connect lifecycle ---
 
-func TestStartIsIdempotentPerAgent(t *testing.T) { // TestStartIsIdempotentPerAgent verifies that calling Start twice for the same agent returns the same runtime ID.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
+func mockAgent() catalog.Agent {
+	return catalog.Agent{
 		ID:          "mock-acp",
 		DisplayName: "Mock ACP",
 		Detected:    true,
@@ -46,363 +41,543 @@ func TestStartIsIdempotentPerAgent(t *testing.T) { // TestStartIsIdempotentPerAg
 			Command: filepath.Join("bin", mockAgentBinaryName()),
 		},
 	}
-
-	first, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	second, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() second error = %v", err)
-	}
-
-	if first.ID != second.ID {
-		t.Fatalf("runtime IDs differ: %q vs %q", first.ID, second.ID)
-	}
-
-	_, _ = supervisor.StopByAgentID(agent.ID)
 }
 
-func TestStartNewLaunchesSeparateRuntime(t *testing.T) {
+// launchMock launches the mock agent and registers cleanup that stops it.
+func launchMock(t *testing.T, supervisor *Supervisor) *Process {
+	t.Helper()
+	proc, err := supervisor.Launch(mockAgent(), nil)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	t.Cleanup(func() { _ = proc.Stop(2 * time.Second) })
+	return proc
+}
+
+func TestLaunchRecordsRunningRuntime(t *testing.T) {
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
 	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
 
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
+	proc := launchMock(t, supervisor)
+	if proc.Runtime.Status != StatusRunning {
+		t.Fatalf("Status = %q, want %q", proc.Runtime.Status, StatusRunning)
+	}
+	if proc.Runtime.PID == 0 {
+		t.Fatal("PID = 0, want the launched process pid")
 	}
 
-	first, err := supervisor.StartNew(agent)
-	if err != nil {
-		t.Fatalf("StartNew() first error = %v", err)
+	runtimes := supervisor.List()
+	if len(runtimes) != 1 || runtimes[0].ID != proc.Runtime.ID {
+		t.Fatalf("List() = %+v, want the launched runtime", runtimes)
 	}
-	second, err := supervisor.StartNew(agent)
-	if err != nil {
-		t.Fatalf("StartNew() second error = %v", err)
-	}
-	if first.ID == second.ID {
-		t.Fatalf("StartNew must launch distinct runtimes, both = %q", first.ID)
-	}
-
-	// Both tracked under the same agent.
-	ids := supervisor.runtimeIDsForAgentLocked(agent.ID)
-	if len(ids) != 2 {
-		t.Fatalf("expected 2 runtimes for agent, got %d", len(ids))
-	}
-
-	_, _ = supervisor.StopByRuntimeID(first.ID)
-	_, _ = supervisor.StopByRuntimeID(second.ID)
-}
-
-func TestStartPrefersUnleasedRuntime(t *testing.T) { // TestStartPrefersUnleasedRuntime verifies Start deterministically reuses an unleased runtime even when map iteration order surfaces leased siblings first.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-	supervisor.now = func() time.Time { return now }
-
-	seed := func(id, leaseholder string) {
-		supervisor.runtimes[id] = Runtime{
-			ID: id, AgentID: "agent-x", AgentName: "Agent X",
-			Status: StatusRunning, CreatedAt: now,
-		}
-		supervisor.processes[id] = &processHandle{leaseholder: leaseholder}
-		supervisor.addRuntimeByAgentLocked("agent-x", id)
-	}
-
-	// Several session-leased runtimes plus one free runtime: Start must
-	// reuse the free one, never a leased sibling.
-	seed("rt-s1", "session-1")
-	seed("rt-s2", "session-2")
-	seed("rt-s3", "session-3")
-	seed("rt-free", "")
-
-	rt, err := supervisor.Start(catalog.Agent{ID: "agent-x"})
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	if rt.ID != "rt-free" {
-		t.Fatalf("Start reused %q, want unleased \"rt-free\"", rt.ID)
-	}
-
-	// A free runtime also beats replacing a legacy-leased one.
-	supervisor2 := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	supervisor2.now = func() time.Time { return now }
-	seed2 := func(id, leaseholder string) {
-		supervisor2.runtimes[id] = Runtime{
-			ID: id, AgentID: "agent-x", AgentName: "Agent X",
-			Status: StatusRunning, CreatedAt: now,
-		}
-		supervisor2.processes[id] = &processHandle{leaseholder: leaseholder}
-		supervisor2.addRuntimeByAgentLocked("agent-x", id)
-	}
-	seed2("rt-legacy", "legacy")
-	seed2("rt-free2", "")
-
-	rt2, err := supervisor2.Start(catalog.Agent{ID: "agent-x"})
-	if err != nil {
-		t.Fatalf("Start() second error = %v", err)
-	}
-	if rt2.ID != "rt-free2" {
-		t.Fatalf("Start reused %q, want unleased \"rt-free2\"", rt2.ID)
+	if got, err := supervisor.Get(proc.Runtime.ID); err != nil || got.ID != proc.Runtime.ID {
+		t.Fatalf("Get() = %+v, %v; want the launched runtime", got, err)
 	}
 }
 
-func TestStopByAgentIDStopsAllRuntimes(t *testing.T) {
+func TestLaunchProducesDistinctRuntimes(t *testing.T) {
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
 	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
+	first := launchMock(t, supervisor)
+	second := launchMock(t, supervisor)
 
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
+	if first.Runtime.ID == second.Runtime.ID {
+		t.Fatalf("Launch must produce distinct runtimes, both = %q", first.Runtime.ID)
 	}
-
-	a, err := supervisor.StartNew(agent)
-	if err != nil {
-		t.Fatalf("StartNew a: %v", err)
-	}
-	b, err := supervisor.StartNew(agent)
-	if err != nil {
-		t.Fatalf("StartNew b: %v", err)
-	}
-
-	if _, err := supervisor.StopByAgentID(agent.ID); err != nil {
-		t.Fatalf("StopByAgentID: %v", err)
-	}
-
-	for _, id := range []string{a.ID, b.ID} {
-		rt, err := supervisor.StopByRuntimeID(id)
-		if err != nil {
-			continue // already removed is fine
-		}
-		if rt.Status != StatusStopped {
-			t.Errorf("runtime %s status = %q, want stopped", id, rt.Status)
-		}
-	}
-	if len(supervisor.runtimeIDsForAgentLocked(agent.ID)) != 0 {
-		t.Errorf("expected agent mapping cleared, got %v", supervisor.runtimeIDsForAgentLocked(agent.ID))
+	if got := len(supervisor.List()); got != 2 {
+		t.Fatalf("len(List()) = %d, want 2", got)
 	}
 }
 
-func TestConnectReturnsDescriptorForRunningRuntime(t *testing.T) { // TestConnectReturnsDescriptorForRunningRuntime verifies that Connect returns a WebSocket path for a running runtime.
+func TestConnectReturnsDescriptorForRunningRuntime(t *testing.T) {
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
 	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
+	proc := launchMock(t, supervisor)
 
-	runtime, err := supervisor.Start(catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	})
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	descriptor, err := supervisor.Connect(runtime.ID)
+	descriptor, err := supervisor.Connect(proc.Runtime.ID)
 	if err != nil {
 		t.Fatalf("Connect() error = %v", err)
 	}
-
-	if descriptor.WebSocketPath == "" {
-		t.Fatal("WebSocketPath should not be empty")
+	if descriptor.Protocol != "acp" {
+		t.Fatalf("Protocol = %q, want %q", descriptor.Protocol, "acp")
+	}
+	if descriptor.WebSocketPath != "/v1/acp/"+proc.Runtime.ID {
+		t.Fatalf("WebSocketPath = %q", descriptor.WebSocketPath)
 	}
 	if descriptor.AgentID != "mock-acp" {
 		t.Fatalf("AgentID = %q, want %q", descriptor.AgentID, "mock-acp")
 	}
-
-	_, _ = supervisor.StopByAgentID("mock-acp")
 }
 
-func TestRestartLaunchesNewRuntimeWithMergedEnv(t *testing.T) { // TestRestartLaunchesNewRuntimeWithMergedEnv verifies that Restart creates a new runtime ID and passes merged environment variables to the agent.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
+func TestRecordExitCleanMarksStopped(t *testing.T) {
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	supervisor.now = func() time.Time { return now }
+	supervisor.runtimes["run-1"] = Runtime{
+		ID: "run-1", AgentID: "mock-acp", AgentName: "Mock", Status: StatusRunning, PID: 99, CreatedAt: now,
+	}
 
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	runtimeInfo, err := supervisor.Start(catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	})
+	supervisor.RecordExit("run-1", nil, false)
+
+	got := supervisor.runtimes["run-1"]
+	if got.Status != StatusStopped {
+		t.Fatalf("Status = %q, want %q", got.Status, StatusStopped)
+	}
+	if got.PID != 0 {
+		t.Fatalf("PID = %d, want 0", got.PID)
+	}
+	if got.StoppedAt.IsZero() {
+		t.Fatal("StoppedAt is zero, want the exit time")
+	}
+}
+
+func TestRecordExitCrashMarksFailedAndPersists(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatalf("Start() error = %v", err)
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", store, nil)
+	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	supervisor.now = func() time.Time { return now }
+	supervisor.runtimes["run-1"] = Runtime{
+		ID: "run-1", AgentID: "mock-acp", AgentName: "Mock", Status: StatusRunning, CreatedAt: now,
 	}
 
-	restarted, err := supervisor.Restart(runtimeInfo.ID, map[string]string{"FERNGEIST_TEST_ENV": "after-restart"})
+	supervisor.RecordExit("run-1", errors.New("exit status 1"), false)
+
+	got := supervisor.runtimes["run-1"]
+	if got.Status != StatusFailed {
+		t.Fatalf("Status = %q, want %q", got.Status, StatusFailed)
+	}
+	if got.LastError != "exit status 1" {
+		t.Fatalf("LastError = %q", got.LastError)
+	}
+	failures, err := store.ListRecentRuntimeFailures(context.Background(), 5)
 	if err != nil {
-		t.Fatalf("Restart() error = %v", err)
+		t.Fatalf("ListRecentRuntimeFailures() error = %v", err)
 	}
-	if restarted.ID == runtimeInfo.ID {
-		t.Fatal("Restart() should create a new runtime id")
-	}
-
-	rawPipes, err := supervisor.AcquireLease(restarted.ID, "legacy")
-	if err != nil {
-		t.Fatalf("AcquireLease() error = %v", err)
-	}
-	lp := rawPipes.(*LeasedPipes)
-	stdin := lp.Stdin
-	stdout := lp.Stdout
-	defer func() { _ = lp.Release() }()
-	defer stdin.Close()
-
-	if _, err := io.WriteString(stdin, "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"0\"}}}\n"); err != nil {
-		t.Fatalf("WriteString() error = %v", err)
-	}
-
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	if !scanner.Scan() {
-		t.Fatalf("expected JSON-RPC initialize response: %v", scanner.Err())
-	}
-	var initResp struct {
-		Result struct {
-			AgentInfo struct {
-				Env string `json:"env"`
-			} `json:"agentInfo"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal([]byte(scanner.Text()), &initResp); err != nil {
-		t.Fatalf("unmarshal initialize response: %v", err)
-	}
-	if initResp.Result.AgentInfo.Env != "after-restart" {
-		t.Fatalf("agentInfo.env = %q, want %q", initResp.Result.AgentInfo.Env, "after-restart")
-	}
-
-	runtimes := supervisor.List()
-	oldStatus := ""
-	for _, listed := range runtimes {
-		if listed.ID == runtimeInfo.ID {
-			oldStatus = listed.Status
-			break
+	found := false
+	for _, f := range failures {
+		if f.RuntimeID == "run-1" && f.LastError == "exit status 1" {
+			found = true
 		}
 	}
-	if oldStatus != StatusStopped {
-		t.Fatalf("old runtime status = %q, want %q", oldStatus, StatusStopped)
+	if !found {
+		t.Fatal("crash record not persisted")
 	}
-
-	_, _ = supervisor.StopByRuntimeID(restarted.ID)
 }
 
-// --- Stop lifecycle ---
-
-func TestStoppedRuntimeAppearsInList(t *testing.T) { // TestStoppedRuntimeAppearsInList verifies that a stopped runtime remains in List and cannot be connected to.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	runtimeInfo, err := supervisor.Start(catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	})
+func TestRecordExitIntentionalMarksStoppedWithoutFailure(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatalf("Start() error = %v", err)
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", store, nil)
+	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	supervisor.now = func() time.Time { return now }
+	supervisor.runtimes["run-1"] = Runtime{
+		ID: "run-1", AgentID: "mock-acp", AgentName: "Mock", Status: StatusRunning, CreatedAt: now,
 	}
 
-	stopped, err := supervisor.StopByRuntimeID(runtimeInfo.ID)
+	// A killed process reports a non-nil wait error; an intentional stop must
+	// still land in StatusStopped and persist no failure record.
+	supervisor.RecordExit("run-1", errors.New("signal: killed"), true)
+
+	got := supervisor.runtimes["run-1"]
+	if got.Status != StatusStopped {
+		t.Fatalf("Status = %q, want %q", got.Status, StatusStopped)
+	}
+	failures, err := store.ListRecentRuntimeFailures(context.Background(), 5)
 	if err != nil {
-		t.Fatalf("StopByRuntimeID() error = %v", err)
+		t.Fatalf("ListRecentRuntimeFailures() error = %v", err)
 	}
-	if stopped.Status != StatusStopped {
-		t.Fatalf("stopped.Status = %q, want %q", stopped.Status, StatusStopped)
+	if len(failures) != 0 {
+		t.Fatalf("len(failures) = %d, want 0 for an intentional exit", len(failures))
 	}
+}
 
-	runtimes := supervisor.List()
-	if len(runtimes) != 1 {
-		t.Fatalf("len(List()) = %d, want 1", len(runtimes))
+func TestRecordExitUnknownRuntimeNoop(t *testing.T) {
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	supervisor.RecordExit("nope", errors.New("boom"), false)
+	if len(supervisor.runtimes) != 0 {
+		t.Fatalf("runtimes = %d, want 0", len(supervisor.runtimes))
 	}
-	if runtimes[0].ID != runtimeInfo.ID {
-		t.Fatalf("List()[0].ID = %q, want %q", runtimes[0].ID, runtimeInfo.ID)
+}
+
+func TestConnectNotRunningAfterExit(t *testing.T) {
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	runtimeInfo := Runtime{
+		ID: "run-1", AgentID: "mock-acp", AgentName: "Mock", Status: StatusStopped, CreatedAt: time.Now(),
 	}
-	if runtimes[0].Status != StatusStopped {
-		t.Fatalf("List()[0].Status = %q, want %q", runtimes[0].Status, StatusStopped)
-	}
+	supervisor.runtimes[runtimeInfo.ID] = runtimeInfo
 
 	if _, err := supervisor.Connect(runtimeInfo.ID); err != ErrRuntimeNotRunning {
 		t.Fatalf("Connect() error = %v, want %v", err, ErrRuntimeNotRunning)
 	}
 }
 
-func TestStoppedRuntimeCountedInSummary(t *testing.T) { // TestStoppedRuntimeCountedInSummary verifies that Summary includes stopped runtimes in the count.
+// --- Input validation ---
+
+func TestLaunchRejectsUndetectedAgent(t *testing.T) {
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+
+	_, err := supervisor.Launch(catalog.Agent{
+		ID:          "codex-acp",
+		DisplayName: "Codex ACP",
+		Detected:    false,
+		Launch:      catalog.LaunchConfig{Mode: "external"},
+	}, nil)
+	if err != ErrAgentNotDetected {
+		t.Fatalf("Launch() error = %v, want %v", err, ErrAgentNotDetected)
+	}
+}
+
+func TestLaunchRejectsUnsupportedLaunch(t *testing.T) {
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+
+	_, err := supervisor.Launch(catalog.Agent{
+		ID:          "container-agent",
+		DisplayName: "Container Agent",
+		Detected:    true,
+		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
+		Launch:      catalog.LaunchConfig{Mode: "container"},
+	}, nil)
+	if err != ErrUnsupportedLaunch {
+		t.Fatalf("Launch() error = %v, want %v", err, ErrUnsupportedLaunch)
+	}
+}
+
+func TestLaunchRejectsRemoteStartDisabled(t *testing.T) {
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+
+	_, err := supervisor.Launch(catalog.Agent{
+		ID:          "no-remote",
+		DisplayName: "No Remote",
+		Detected:    true,
+		Security:    catalog.SecurityConfig{AllowsRemoteStart: false},
+		Launch:      catalog.LaunchConfig{Mode: "process"},
+	}, nil)
+	if err != ErrRemoteStartNotAllowed {
+		t.Fatalf("Launch() error = %v, want %v", err, ErrRemoteStartNotAllowed)
+	}
+}
+
+func TestLaunchDoesNotPanicWithEmptyAgent(t *testing.T) {
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+
+	if _, err := supervisor.Launch(catalog.Agent{}, nil); err == nil {
+		t.Fatal("expected error for empty agent")
+	}
+}
+
+func TestLaunchSupportsExternalStdioRuntime(t *testing.T) {
+	baseDir := t.TempDir()
+	binDir := filepath.Join(baseDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	buildMockStdioAgent(t, filepath.Join(binDir, namedBinary("codex-acp")))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
+	proc, err := supervisor.Launch(catalog.Agent{
+		ID:          "codex-acp",
+		DisplayName: "Codex ACP",
+		Detected:    true,
+		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
+		Launch: catalog.LaunchConfig{
+			Mode:    "external",
+			Command: "codex-acp",
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer func() { _ = proc.Stop(2 * time.Second) }()
+
+	if proc.Runtime.LaunchMode != "external" {
+		t.Fatalf("LaunchMode = %q, want %q", proc.Runtime.LaunchMode, "external")
+	}
+
+	scanner := bufio.NewScanner(proc.Stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	if _, err := io.WriteString(proc.Stdin, "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"0\"}}}\n"); err != nil {
+		t.Fatalf("WriteString() error = %v", err)
+	}
+	if !scanner.Scan() {
+		t.Fatal("expected JSON-RPC response from stdio runtime")
+	}
+	var resp map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(scanner.Text()), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if _, ok := resp["result"]; !ok {
+		t.Fatal("expected result field in JSON-RPC response")
+	}
+}
+
+func TestLaunchAutoAcquiresMissingExternalBinary(t *testing.T) {
+	sourceDir := t.TempDir()
+	sourcePath := filepath.Join(sourceDir, namedBinary("mock-stdio-agent"))
+	buildMockStdioAgent(t, sourcePath)
+
+	server := httptest.NewServer(http.FileServer(http.Dir(sourceDir)))
+	defer server.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	installer := acquire.New(logger, t.TempDir(), nil)
+	supervisor := NewSupervisor(logger, t.TempDir(), nil, installer)
+
+	proc, err := supervisor.Launch(catalog.Agent{
+		ID:          "codex-acp",
+		DisplayName: "Codex ACP",
+		Detected:    false,
+		Protocol:    "acp",
+		Security:    catalog.SecurityConfig{CuratedLaunch: true, AllowsRemoteStart: true},
+		Launch: catalog.LaunchConfig{
+			Mode:    "external",
+			Command: "codex-acp",
+		},
+		Registry: catalog.RegistryInfo{
+			CurrentBinaryPath:       namedBinary("mock-stdio-agent"),
+			CurrentBinaryArchiveURL: server.URL + "/" + namedBinary("mock-stdio-agent"),
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer func() { _ = proc.Stop(2 * time.Second) }()
+
+	if proc.Runtime.Status != StatusRunning {
+		t.Fatalf("Status = %q, want %q", proc.Runtime.Status, StatusRunning)
+	}
+}
+
+// --- Process.Stop ---
+
+func TestProcessStopTerminatesLiveProcess(t *testing.T) {
 	baseDir := t.TempDir()
 	buildMockAgent(t, baseDir)
 
 	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	runtimeInfo, err := supervisor.Start(catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	})
+	proc, err := supervisor.Launch(mockAgent(), nil)
 	if err != nil {
-		t.Fatalf("Start() error = %v", err)
+		t.Fatalf("Launch() error = %v", err)
 	}
 
-	stopped, err := supervisor.StopByRuntimeID(runtimeInfo.ID)
-	if err != nil {
-		t.Fatalf("StopByRuntimeID() error = %v", err)
-	}
-	if stopped.Status != StatusStopped {
-		t.Fatalf("stopped.Status = %q, want %q", stopped.Status, StatusStopped)
+	select {
+	case <-proc.Done():
+		t.Fatal("process exited before Stop")
+	default:
 	}
 
-	summary := supervisor.Summary()
-	if summary.Stopped != 1 {
-		t.Fatalf("Summary().Stopped = %d, want 1", summary.Stopped)
+	if err := proc.Stop(2 * time.Second); err != nil {
+		t.Fatalf("Stop() error = %v", err)
 	}
-	if summary.Total != 1 {
-		t.Fatalf("Summary().Total = %d, want 1", summary.Total)
+	select {
+	case <-proc.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Done not closed after Stop")
+	}
+	// Idempotent: stopping an already-exited process succeeds.
+	if err := proc.Stop(time.Second); err != nil {
+		t.Fatalf("second Stop() error = %v", err)
 	}
 }
 
-func TestStoppedRuntimeIsPrunedAfterRetentionWindow(t *testing.T) { // TestStoppedRuntimeIsPrunedAfterRetentionWindow verifies that stopped runtimes are removed from List, Logs, and Summary after the retention period.
+func TestProcessStopNilSafe(t *testing.T) {
+	var proc *Process
+	if err := proc.Stop(time.Second); err != nil {
+		t.Fatalf("Stop() on nil process = %v, want nil", err)
+	}
+}
+
+// --- Logs ---
+
+func TestAppendLog(t *testing.T) {
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
+	supervisor.runtimes["rt-1"] = Runtime{ID: "rt-1", AgentID: "mock-acp", Status: StatusRunning, CreatedAt: time.Now()}
+
+	supervisor.AppendLog("rt-1", "gateway", "hello")
+
+	entries, err := supervisor.Logs("rt-1")
+	if err != nil {
+		t.Fatalf("Logs() error = %v", err)
+	}
+	if len(entries) != 1 || entries[0].Message != "hello" || entries[0].Stream != "gateway" {
+		t.Fatalf("Logs() = %+v", entries)
+	}
+}
+
+func TestAppendLogEmptyID(t *testing.T) {
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	supervisor.AppendLog("", "gateway", "ignored")
+	if len(supervisor.logs) != 0 {
+		t.Fatalf("logs = %d entries, want 0", len(supervisor.logs))
+	}
+}
+
+func TestAppendLogOverflow(t *testing.T) {
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	supervisor.now = func() time.Time { return now }
+
+	for i := range 250 {
+		supervisor.appendLog("test-id", LogEntry{
+			Timestamp: now,
+			Stream:    "stdout",
+			Message:   fmt.Sprintf("line %d", i),
+		})
+	}
+
+	entries, err := supervisor.Logs("test-id")
+	if err != nil {
+		t.Fatalf("Logs() error = %v", err)
+	}
+	if len(entries) != 200 {
+		t.Fatalf("len(Logs) = %d, want 200", len(entries))
+	}
+	if entries[0].Message != "line 50" {
+		t.Fatalf("first entry message = %q, want %q", entries[0].Message, "line 50")
+	}
+}
+
+func TestLogsEmptyForExistingRuntime(t *testing.T) {
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	supervisor.runtimes["rt-1"] = Runtime{ID: "rt-1", AgentID: "mock-acp", Status: StatusRunning, CreatedAt: time.Now()}
+
+	entries, err := supervisor.Logs("rt-1")
+	if err != nil {
+		t.Fatalf("Logs() error = %v", err)
+	}
+	if entries != nil {
+		t.Fatalf("Logs() = %v, want nil", entries)
+	}
+}
+
+func TestLogsNotFound(t *testing.T) {
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	if _, err := supervisor.Logs("nonexistent"); err != ErrRuntimeNotFound {
+		t.Fatalf("Logs() error = %v, want %v", err, ErrRuntimeNotFound)
+	}
+	if _, err := supervisor.Get("nonexistent"); err != ErrRuntimeNotFound {
+		t.Fatalf("Get() error = %v, want %v", err, ErrRuntimeNotFound)
+	}
+}
+
+type errorReader struct{ err error }
+
+func (r *errorReader) Read(p []byte) (int, error) { return 0, r.err }
+
+func TestCaptureLogsScannerError(t *testing.T) {
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
+
+	supervisor.captureLogs("test-id", "stderr", &errorReader{err: fmt.Errorf("simulated read failure")}, io.Discard)
+
+	entries, err := supervisor.Logs("test-id")
+	if err != nil {
+		t.Fatalf("Logs() error = %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("expected at least one log entry from scanner error")
+	}
+	if !strings.Contains(entries[0].Message, "simulated read failure") {
+		t.Fatalf("Message = %q, want it to contain 'simulated read failure'", entries[0].Message)
+	}
+}
+
+// --- Summary / pruning ---
+
+func TestSummaryIncludesRecentFailures(t *testing.T) {
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	supervisor.now = func() time.Time { return now }
+
+	supervisor.runtimes["run-failed"] = Runtime{
+		ID: "run-failed", AgentID: "mock-acp", AgentName: "Mock ACP",
+		Status: StatusFailed, LastError: "process exited with status 1", CreatedAt: now, LastFailureAt: now,
+	}
+	supervisor.runtimes["run-running"] = Runtime{
+		ID: "run-running", AgentID: "mock-acp", AgentName: "Mock ACP",
+		Status: StatusRunning, CreatedAt: now.Add(-time.Minute),
+	}
+	supervisor.logs["run-failed"] = []LogEntry{
+		{Timestamp: now, Stream: "stderr", Message: "boom"},
+		{Timestamp: now.Add(time.Second), Stream: "stderr", Message: "crash"},
+	}
+
+	summary := supervisor.Summary()
+	if summary.Total != 2 || summary.Running != 1 || summary.Failed != 1 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if len(summary.RecentFailures) != 1 {
+		t.Fatalf("len(RecentFailures) = %d, want 1", len(summary.RecentFailures))
+	}
+	if summary.RecentFailures[0].LastError != "process exited with status 1" {
+		t.Fatalf("LastError = %q", summary.RecentFailures[0].LastError)
+	}
+	if len(summary.RecentFailures[0].RecentLogLines) != 2 {
+		t.Fatalf("len(RecentLogLines) = %d, want 2", len(summary.RecentFailures[0].RecentLogLines))
+	}
+}
+
+func TestSummaryCountsLifecycleTransitions(t *testing.T) {
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	supervisor.now = func() time.Time { return now }
+
+	supervisor.runtimes["run-starting"] = Runtime{ID: "run-starting", AgentID: "a", AgentName: "A", Status: StatusStarting, CreatedAt: now}
+	supervisor.runtimes["run-running"] = Runtime{ID: "run-running", AgentID: "b", AgentName: "B", Status: StatusRunning, CreatedAt: now}
+	supervisor.runtimes["run-stopped"] = Runtime{ID: "run-stopped", AgentID: "d", AgentName: "D", Status: StatusStopped, CreatedAt: now, StoppedAt: now}
+	supervisor.runtimes["run-failed"] = Runtime{ID: "run-failed", AgentID: "e", AgentName: "E", Status: StatusFailed, LastError: "boom", CreatedAt: now, LastFailureAt: now}
+
+	summary := supervisor.Summary()
+	if summary.Total != 4 {
+		t.Fatalf("Total = %d, want 4", summary.Total)
+	}
+	if summary.Starting != 1 || summary.Running != 1 || summary.Stopped != 1 || summary.Failed != 1 {
+		t.Fatalf("summary = %+v", summary)
+	}
+}
+
+func TestStoppedRuntimeCountedInSummary(t *testing.T) {
+	baseDir := t.TempDir()
+	buildMockAgent(t, baseDir)
+
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
+	proc := launchMock(t, supervisor)
+
+	// A clean exit lands the runtime in StatusStopped.
+	supervisor.RecordExit(proc.Runtime.ID, nil, false)
+
+	summary := supervisor.Summary()
+	if summary.Stopped != 1 || summary.Total != 1 {
+		t.Fatalf("summary = %+v", summary)
+	}
+}
+
+func TestStoppedRuntimeIsPrunedAfterRetentionWindow(t *testing.T) {
 	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 	supervisor.now = func() time.Time { return now }
 
 	runtimeInfo := Runtime{
-		ID:        "run-stopped",
-		AgentID:   "mock-acp",
-		AgentName: "Mock ACP",
-		Status:    StatusStopped,
-		CreatedAt: now.Add(-time.Hour),
+		ID: "run-stopped", AgentID: "mock-acp", AgentName: "Mock ACP",
+		Status: StatusStopped, CreatedAt: now.Add(-time.Hour),
 		StoppedAt: now.Add(-stoppedRuntimeRetention).Add(-time.Second),
 	}
 	supervisor.runtimes[runtimeInfo.ID] = runtimeInfo
@@ -419,528 +594,200 @@ func TestStoppedRuntimeIsPrunedAfterRetentionWindow(t *testing.T) { // TestStopp
 	}
 }
 
-// --- Input validation ---
-
-func TestStartRejectsUndetectedAgent(t *testing.T) { // TestStartRejectsUndetectedAgent verifies that Start returns ErrAgentNotDetected for agents not marked as detected.
+func TestFailedRuntimesPrunedAfterRetention(t *testing.T) {
 	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	now := time.Now().UTC()
+	supervisor.now = func() time.Time { return now }
 
-	_, err := supervisor.Start(catalog.Agent{
-		ID:          "codex-acp",
-		DisplayName: "Codex ACP",
-		Detected:    false,
-		Launch:      catalog.LaunchConfig{Mode: "external"},
-	})
-	if err != ErrAgentNotDetected {
-		t.Fatalf("Start() error = %v, want %v", err, ErrAgentNotDetected)
-	}
-}
-
-func TestStartSupportsExternalStdioRuntime(t *testing.T) { // TestStartSupportsExternalStdioRuntime verifies that Start launches an external stdio agent from PATH and supports JSON-RPC over stdin/stdout.
-	baseDir := t.TempDir()
-	binDir := filepath.Join(baseDir, "bin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll() error = %v", err)
-	}
-	buildMockStdioAgent(t, filepath.Join(binDir, namedBinary("codex-acp")))
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	runtimeInfo, err := supervisor.Start(catalog.Agent{
-		ID:          "codex-acp",
-		DisplayName: "Codex ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "external",
-			Command: "codex-acp",
-			Args:    []string{},
-			Restart: catalog.RestartConfig{
-				Mode: "never",
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	if runtimeInfo.LaunchMode != "external" {
-		t.Fatalf("LaunchMode = %q, want %q", runtimeInfo.LaunchMode, "external")
-	}
-
-	rawPipes, err := supervisor.AcquireLease(runtimeInfo.ID, "legacy")
-	if err != nil {
-		t.Fatalf("AcquireLease() error = %v", err)
-	}
-	lp := rawPipes.(*LeasedPipes)
-	stdin := lp.Stdin
-	stdout := lp.Stdout
-	defer func() { _ = lp.Release() }()
-
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	if _, err := io.WriteString(stdin, "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"0\"}}}\n"); err != nil {
-		t.Fatalf("WriteString() error = %v", err)
-	}
-	if !scanner.Scan() {
-		t.Fatal("expected JSON-RPC response from stdio runtime")
-	}
-	var resp map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(scanner.Text()), &resp); err != nil {
-		t.Fatalf("unmarshal response: %v", err)
-	}
-	if _, ok := resp["result"]; !ok {
-		t.Fatal("expected result field in JSON-RPC response")
-	}
-
-	_, _ = supervisor.StopByRuntimeID(runtimeInfo.ID)
-}
-
-// --- Restart / Circuit breaker ---
-
-func TestRuntimeRestartsAfterFailureWhenPolicyEnabled(t *testing.T) { // TestRuntimeRestartsAfterFailureWhenPolicyEnabled verifies that a process started with on_failure restart policy is automatically restarted after crash, keeping the same runtime ID.
-	baseDir := t.TempDir()
-	binDir := filepath.Join(baseDir, "bin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll() error = %v", err)
-	}
-
-	stateFile := filepath.Join(baseDir, "restart-state.txt")
-	flakySource := filepath.Join(baseDir, "flaky.go")
-	source := fmt.Sprintf(`package main
-import (
-	"os"
-	"time"
-)
-func main() {
-	stateFile := %q
-	if _, err := os.Stat(stateFile); err != nil {
-		_ = os.WriteFile(stateFile, []byte("1"), 0o644)
-		time.Sleep(100 * time.Millisecond)
-		os.Exit(1)
-	}
-	for {
-		time.Sleep(time.Hour)
-	}
-}
-`, stateFile)
-	if err := os.WriteFile(flakySource, []byte(source), 0o644); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
-
-	outputPath := filepath.Join(binDir, namedBinary("flaky-acp-agent"))
-	command := exec.Command("go", "build", "-o", outputPath, flakySource)
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	if err := command.Run(); err != nil {
-		t.Fatalf("go build flaky agent error = %v", err)
-	}
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	runtimeInfo, err := supervisor.Start(catalog.Agent{
-		ID:          "flaky-acp",
-		DisplayName: "Flaky ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", namedBinary("flaky-acp-agent")),
-			Args:    []string{},
-			Restart: catalog.RestartConfig{
-				Mode:       "on_failure",
-				MaxRetries: 1,
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = supervisor.StopByRuntimeID(runtimeInfo.ID)
-	})
-
-	var restarted Runtime
-	found := false
-	for range 40 {
-		runtimes := supervisor.List()
-		if len(runtimes) == 1 && runtimes[0].Status == StatusRunning && runtimes[0].RestartAttempts == 1 {
-			restarted = runtimes[0]
-			found = true
-			break
+	seed := func(id, status string, lastFailure, stoppedAt time.Time) {
+		supervisor.runtimes[id] = Runtime{
+			ID: id, AgentID: "mock-acp", AgentName: "Mock",
+			Status: status, CreatedAt: now.Add(-2 * time.Hour),
+			LastFailureAt: lastFailure, StoppedAt: stoppedAt,
 		}
-		time.Sleep(50 * time.Millisecond)
+		supervisor.logs[id] = []LogEntry{{Timestamp: now, Stream: "stderr", Message: "boom"}}
 	}
-	if !found {
-		t.Fatal("expected runtime to restart and return to running state")
-	}
-	if restarted.ID != runtimeInfo.ID {
-		t.Fatalf("runtime ID changed across restart: %q vs %q", restarted.ID, runtimeInfo.ID)
-	}
-	if restarted.CircuitOpen {
-		t.Fatal("CircuitOpen should be false after successful restart")
-	}
-}
+	seed("rt-old-failed", StatusFailed, now.Add(-time.Hour), time.Time{})
+	seed("rt-fresh-failed", StatusFailed, now, time.Time{})
+	seed("rt-old-stopped", StatusStopped, time.Time{}, now.Add(-time.Hour))
 
-func TestRuntimeOpensCircuitAfterRestartLimitExceeded(t *testing.T) { // TestRuntimeOpensCircuitAfterRestartLimitExceeded verifies that after exhausting MaxRetries, the runtime enters StatusFailed with CircuitOpen set.
-	baseDir := t.TempDir()
-	binDir := filepath.Join(baseDir, "bin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll() error = %v", err)
-	}
-
-	flakySource := filepath.Join(baseDir, "always-fail.go")
-	source := `package main
-import (
-	"time"
-)
-func main() {
-	time.Sleep(100 * time.Millisecond)
-	panic("boom")
-}
-`
-	if err := os.WriteFile(flakySource, []byte(source), 0o644); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
-
-	outputPath := filepath.Join(binDir, namedBinary("always-fail-acp-agent"))
-	command := exec.Command("go", "build", "-o", outputPath, flakySource)
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	if err := command.Run(); err != nil {
-		t.Fatalf("go build always-fail agent error = %v", err)
-	}
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	runtimeInfo, err := supervisor.Start(catalog.Agent{
-		ID:          "always-fail-acp",
-		DisplayName: "Always Fail ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", namedBinary("always-fail-acp-agent")),
-			Restart: catalog.RestartConfig{
-				Mode:       "on_failure",
-				MaxRetries: 1,
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = supervisor.StopByRuntimeID(runtimeInfo.ID)
-	})
-
-	var failed Runtime
-	found := false
-	for range 50 {
-		runtimes := supervisor.List()
-		if len(runtimes) == 1 && runtimes[0].Status == StatusFailed && runtimes[0].CircuitOpen {
-			failed = runtimes[0]
-			found = true
-			break
+	got := supervisor.List()
+	if len(got) != 1 || got[0].ID != "rt-fresh-failed" {
+		ids := make([]string, 0, len(got))
+		for _, r := range got {
+			ids = append(ids, r.ID)
 		}
-		time.Sleep(50 * time.Millisecond)
+		t.Fatalf("List() = %v, want [rt-fresh-failed]", ids)
 	}
-	if !found {
-		t.Fatal("expected runtime to fail with circuit open after restart limit")
-	}
-	if failed.RestartAttempts != 1 {
-		t.Fatalf("RestartAttempts = %d, want 1", failed.RestartAttempts)
-	}
-	if failed.FailureStreak < 2 {
-		t.Fatalf("FailureStreak = %d, want at least 2", failed.FailureStreak)
-	}
-}
-
-func TestSessionLeasedRuntimeNotAutoRestarted(t *testing.T) { // TestSessionLeasedRuntimeNotAutoRestarted verifies that a runtime held by a resilient session (session-ID leaseholder) is NOT auto-restarted on crash, even with restart mode on_failure — the session's own crash-reclamation path is the sole recovery mechanism.
-	baseDir := t.TempDir()
-	binDir := filepath.Join(baseDir, "bin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll() error = %v", err)
-	}
-
-	// A long-lived agent that stays alive until stdin closes or it is killed, so
-	// the lease can be acquired deterministically before the simulated crash.
-	longLivedSource := filepath.Join(baseDir, "long-lived.go")
-	source := `package main
-import (
-	"bufio"
-	"os"
-)
-func main() {
-	r := bufio.NewReader(os.Stdin)
-	for {
-		if _, err := r.ReadString('\n'); err != nil {
-			return
+	for _, id := range []string{"rt-old-failed", "rt-old-stopped"} {
+		if _, ok := supervisor.logs[id]; ok {
+			t.Errorf("logs[%q] survives prune, want evicted", id)
 		}
 	}
-}
-`
-	if err := os.WriteFile(longLivedSource, []byte(source), 0o644); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
-
-	outputPath := filepath.Join(binDir, namedBinary("long-lived-acp-agent"))
-	command := exec.Command("go", "build", "-o", outputPath, longLivedSource)
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	if err := command.Run(); err != nil {
-		t.Fatalf("go build long-lived agent error = %v", err)
-	}
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	rt, err := supervisor.Start(catalog.Agent{
-		ID:          "long-lived-acp",
-		DisplayName: "Long Lived ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", namedBinary("long-lived-acp-agent")),
-			Restart: catalog.RestartConfig{
-				Mode:       "on_failure",
-				MaxRetries: 3,
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = supervisor.StopByRuntimeID(rt.ID)
-	})
-
-	// Acquire a session lease (leaseholder is a session ID, not "legacy"), which
-	// marks the runtime as owned by a resilient session.
-	if _, err := supervisor.AcquireLease(rt.ID, "sess-protected"); err != nil {
-		t.Fatalf("AcquireLease() error = %v", err)
-	}
-
-	exitCh := make(chan string, 1)
-	supervisor.OnProcessExit(rt.ID, func(id string, intentional bool) {
-		if intentional {
-			t.Error("crash reported as intentional exit")
-		}
-		exitCh <- id
-	})
-
-	// Simulate an unexpected crash: kill the OS process directly rather than via
-	// StopByRuntimeID, so handle.stopping stays false and waitErr is non-nil —
-	// the exact shape of a genuine agent death.
-	supervisor.mu.Lock()
-	handle := supervisor.processes[rt.ID]
-	supervisor.mu.Unlock()
-	if handle == nil || handle.cmd == nil || handle.cmd.Process == nil {
-		t.Fatal("expected a running process handle")
-	}
-	if err := handle.cmd.Process.Kill(); err != nil {
-		t.Fatalf("kill process error = %v", err)
-	}
-
-	// The crash-reclamation path fires the exit callback.
-	select {
-	case <-exitCh:
-	case <-time.After(5 * time.Second):
-		t.Fatal("OnProcessExit callback not fired after crash")
-	}
-
-	// The runtime must land in StatusFailed with no restart attempt — a
-	// session-leased runtime is never auto-restarted in place.
-	var got Runtime
-	found := false
-	for range 50 {
-		supervisor.mu.Lock()
-		rtNow, ok := supervisor.runtimes[rt.ID]
-		supervisor.mu.Unlock()
-		if ok && rtNow.Status == StatusFailed {
-			got = rtNow
-			found = true
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if !found {
-		t.Fatal("expected session-leased runtime to end in StatusFailed, not restart")
-	}
-	if got.RestartAttempts != 0 {
-		t.Fatalf("RestartAttempts = %d, want 0 (no auto-restart for session-leased runtime)", got.RestartAttempts)
-	}
-
-	// Give any erroneous restart goroutine time to relaunch, then confirm it did not.
-	time.Sleep(300 * time.Millisecond)
-	supervisor.mu.Lock()
-	rtFinal, ok := supervisor.runtimes[rt.ID]
-	supervisor.mu.Unlock()
-	if !ok {
-		t.Fatal("runtime should still exist after crash")
-	}
-	if rtFinal.Status == StatusRunning || rtFinal.Status == StatusStarting {
-		t.Fatalf("runtime was auto-restarted (status %q); session-leased runtimes must not restart", rtFinal.Status)
+	if _, ok := supervisor.logs["rt-fresh-failed"]; !ok {
+		t.Error("logs[rt-fresh-failed] pruned too early, want retained")
 	}
 }
 
-// --- Smoke test ---
-
-func TestOptionalInstalledOpenCodeACPSmoke(t *testing.T) { // TestOptionalInstalledOpenCodeACPSmoke is a smoke test (opt-in via FERNGEIST_RUN_REAL_AGENT_TESTS=1) that launches the installed opencode binary over ACP.
-	if os.Getenv("FERNGEIST_RUN_REAL_AGENT_TESTS") != "1" {
-		t.Skip("set FERNGEIST_RUN_REAL_AGENT_TESTS=1 to run installed-agent smoke tests")
-	}
-	if _, err := exec.LookPath("opencode"); err != nil {
-		t.Skip("opencode is not installed on PATH")
-	}
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(), nil, nil)
-	runtimeInfo, err := supervisor.Start(catalog.Agent{
-		ID:          "opencode",
-		DisplayName: "OpenCode",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "external",
-			Command: "opencode",
-			Args:    []string{"acp"},
-			Restart: catalog.RestartConfig{
-				Mode: "never",
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = supervisor.StopByRuntimeID(runtimeInfo.ID)
-	})
-
-	rawPipes, err := supervisor.AcquireLease(runtimeInfo.ID, "legacy")
-	if err != nil {
-		t.Fatalf("AcquireLease() error = %v", err)
-	}
-	lp := rawPipes.(*LeasedPipes)
-	stdin := lp.Stdin
-	stdout := lp.Stdout
-	defer func() { _ = lp.Release() }()
-
-	request := "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"capabilities\":{},\"clientInfo\":{\"name\":\"ferngeist-smoke\",\"version\":\"dev\"}}}\n"
-	if _, err := io.WriteString(stdin, request); err != nil {
-		t.Fatalf("WriteString() error = %v", err)
-	}
-
-	type result struct {
-		line string
-		err  error
-	}
-	done := make(chan result, 1)
-	go func() {
-		scanner := bufio.NewScanner(stdout)
-		if scanner.Scan() {
-			done <- result{line: scanner.Text()}
-			return
-		}
-		done <- result{err: scanner.Err()}
-	}()
-
-	select {
-	case res := <-done:
-		if res.err != nil {
-			t.Fatalf("scanner error = %v", res.err)
-		}
-		if strings.TrimSpace(res.line) == "" {
-			t.Fatal("expected non-empty ACP response line from installed opencode")
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for ACP response from installed opencode")
-	}
-}
-
-// --- Summary ---
-
-func TestSummaryIncludesRecentFailures(t *testing.T) { // TestSummaryIncludesRecentFailures verifies that Summary exposes RecentFailures with LastError and log lines for failed runtimes.
+func TestListSortsByCreatedAtThenID(t *testing.T) {
 	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+
+	supervisor.runtimes["b"] = Runtime{ID: "b", AgentID: "b", AgentName: "B", Status: StatusRunning, CreatedAt: now}
+	supervisor.runtimes["a"] = Runtime{ID: "a", AgentID: "a", AgentName: "A", Status: StatusRunning, CreatedAt: now}
+
+	runtimes := supervisor.List()
+	if len(runtimes) != 2 {
+		t.Fatalf("len = %d, want 2", len(runtimes))
+	}
+	if runtimes[0].ID != "a" || runtimes[1].ID != "b" {
+		t.Fatalf("order = %s, %s; want a, b", runtimes[0].ID, runtimes[1].ID)
+	}
+}
+
+// --- Persistence ---
+
+func TestLaunchPersistsRuntimeWithStore(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+
+	baseDir := t.TempDir()
+	buildMockAgent(t, baseDir)
+
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, store, nil)
+	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
+	proc := launchMock(t, supervisor)
+
+	// The runtime record is written to the configured store on launch and on
+	// exit; persisting must not fail (the store has no runtime reader).
+	supervisor.RecordExit(proc.Runtime.ID, nil, false)
+	if got, err := supervisor.Get(proc.Runtime.ID); err != nil || got.Status != StatusStopped {
+		t.Fatalf("Get() = %+v, %v; want stopped", got, err)
+	}
+}
+
+func TestPersistFailureWithStore(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	supervisor.store = store
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 	supervisor.now = func() time.Time { return now }
 
-	supervisor.runtimes["run-failed"] = Runtime{
-		ID:            "run-failed",
-		AgentID:       "mock-acp",
-		AgentName:     "Mock ACP",
-		Status:        StatusFailed,
-		LastError:     "process exited with status 1",
-		CreatedAt:     now,
-		LastFailureAt: now,
+	runtimeInfo := Runtime{
+		ID: "run-failed", AgentID: "mock-acp", AgentName: "Mock ACP",
+		Status: StatusFailed, LastError: "process exited with status 1", CreatedAt: now,
 	}
-	supervisor.runtimes["run-running"] = Runtime{
-		ID:        "run-running",
-		AgentID:   "mock-acp",
-		AgentName: "Mock ACP",
-		Status:    StatusRunning,
-		CreatedAt: now.Add(-time.Minute),
-	}
-	supervisor.logs["run-failed"] = []LogEntry{
-		{Timestamp: now, Stream: "stderr", Message: "boom"},
-		{Timestamp: now.Add(time.Second), Stream: "stderr", Message: "crash"},
-	}
+	supervisor.runtimes[runtimeInfo.ID] = runtimeInfo
 
-	summary := supervisor.Summary()
-	if summary.Total != 2 {
-		t.Fatalf("Total = %d, want 2", summary.Total)
+	supervisor.persistFailure(runtimeInfo.ID, runtimeInfo, []LogEntry{
+		{Timestamp: now, Stream: "stderr", Message: "boom"},
+	}, now)
+
+	failures, err := store.ListRecentRuntimeFailures(context.Background(), 5)
+	if err != nil {
+		t.Fatalf("ListRecentRuntimeFailures() error = %v", err)
 	}
-	if summary.Running != 1 {
-		t.Fatalf("Running = %d, want 1", summary.Running)
+	found := false
+	for _, f := range failures {
+		if f.RuntimeID == runtimeInfo.ID {
+			found = true
+			if f.LastError != "process exited with status 1" {
+				t.Fatalf("LastError = %q", f.LastError)
+			}
+		}
 	}
-	if summary.Failed != 1 {
-		t.Fatalf("Failed = %d, want 1", summary.Failed)
-	}
-	if summary.CircuitOpen != 0 {
-		t.Fatalf("CircuitOpen = %d, want 0", summary.CircuitOpen)
-	}
-	if len(summary.RecentFailures) != 1 {
-		t.Fatalf("len(RecentFailures) = %d, want 1", len(summary.RecentFailures))
-	}
-	if summary.RecentFailures[0].LastError != "process exited with status 1" {
-		t.Fatalf("LastError = %q", summary.RecentFailures[0].LastError)
-	}
-	if len(summary.RecentFailures[0].RecentLogLines) != 2 {
-		t.Fatalf("len(RecentLogLines) = %d, want 2", len(summary.RecentFailures[0].RecentLogLines))
+	if !found {
+		t.Fatal("failure record not found in persisted store")
 	}
 }
 
-func TestSummaryCountsLifecycleTransitions(t *testing.T) { // TestSummaryCountsLifecycleTransitions verifies that Summary counts each lifecycle status (Starting, Running, Stopping, Stopped, Failed, CircuitOpen) correctly.
+func TestPersistCleanExitWithStore(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+
 	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	supervisor.store = store
+	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	supervisor.now = func() time.Time { return now }
+
+	runtimeInfo := Runtime{
+		ID: "run-clean", AgentID: "mock-acp", AgentName: "Mock ACP", Status: StatusStopped, CreatedAt: now,
+	}
+	supervisor.runtimes[runtimeInfo.ID] = runtimeInfo
+
+	supervisor.persistCleanExit(runtimeInfo.ID, runtimeInfo, []LogEntry{
+		{Timestamp: now, Stream: "stderr", Message: "bye"},
+	}, now)
+
+	records, err := store.ListRuntimeFailureRecords(context.Background(), 5)
+	if err != nil {
+		t.Fatalf("ListRuntimeFailureRecords() error = %v", err)
+	}
+	found := false
+	for _, f := range records {
+		if f.RuntimeID == runtimeInfo.ID {
+			found = true
+			if !f.CleanExit {
+				t.Fatal("CleanExit = false, want true")
+			}
+			if f.LastError != "exit status 0 (clean)" {
+				t.Fatalf("LastError = %q", f.LastError)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("clean-exit record not found in persisted store")
+	}
+}
+
+func TestPersistRuntimeWithClosedStore(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	store.Close()
+
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	supervisor.store = store
+	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
+
+	supervisor.persistRuntime(Runtime{
+		ID: "test-id", AgentID: "test-agent", AgentName: "Test Agent", Status: StatusRunning, CreatedAt: time.Now(),
+	}) // must not panic on closed store
+}
+
+func TestPersistFailureWithClosedStore(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	store.Close()
+
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
+	supervisor.store = store
 	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
 
-	supervisor.runtimes["run-starting"] = Runtime{ID: "run-starting", AgentID: "a", AgentName: "A", Status: StatusStarting, CreatedAt: now}
-	supervisor.runtimes["run-running"] = Runtime{ID: "run-running", AgentID: "b", AgentName: "B", Status: StatusRunning, CreatedAt: now}
-	supervisor.runtimes["run-stopping"] = Runtime{ID: "run-stopping", AgentID: "c", AgentName: "C", Status: StatusStopping, CreatedAt: now}
-	supervisor.runtimes["run-stopped"] = Runtime{ID: "run-stopped", AgentID: "d", AgentName: "D", Status: StatusStopped, CreatedAt: now}
-	supervisor.runtimes["run-failed"] = Runtime{ID: "run-failed", AgentID: "e", AgentName: "E", Status: StatusFailed, LastError: "boom", CreatedAt: now, LastFailureAt: time.Now().UTC()}
-	supervisor.runtimes["run-open"] = Runtime{ID: "run-open", AgentID: "f", AgentName: "F", Status: StatusFailed, LastError: "loop", CircuitOpen: true, CreatedAt: now, LastFailureAt: time.Now().UTC()}
+	supervisor.persistFailure("test-id", Runtime{
+		ID: "test-id", AgentID: "test-agent", AgentName: "Test Agent", Status: StatusFailed, LastError: "boom", CreatedAt: now,
+	}, []LogEntry{{Timestamp: now, Stream: "stderr", Message: "error"}}, now)
 
-	summary := supervisor.Summary()
-	if summary.Total != 6 {
-		t.Fatalf("Total = %d, want 6", summary.Total)
-	}
-	if summary.Starting != 1 {
-		t.Fatalf("Starting = %d, want 1", summary.Starting)
-	}
-	if summary.Running != 1 {
-		t.Fatalf("Running = %d, want 1", summary.Running)
-	}
-	if summary.Stopping != 1 {
-		t.Fatalf("Stopping = %d, want 1", summary.Stopping)
-	}
-	if summary.Stopped != 1 {
-		t.Fatalf("Stopped = %d, want 1", summary.Stopped)
-	}
-	if summary.Failed != 2 {
-		t.Fatalf("Failed = %d, want 2", summary.Failed)
-	}
-	if summary.CircuitOpen != 1 {
-		t.Fatalf("CircuitOpen = %d, want 1", summary.CircuitOpen)
+	if _, err := store.ListRecentRuntimeFailures(context.Background(), 5); err == nil {
+		t.Fatal("expected error querying closed store")
 	}
 }
 
-func TestSummaryIncludesPersistedFailures(t *testing.T) { // TestSummaryIncludesPersistedFailures verifies that Summary includes failures persisted in the storage backend.
+func TestSummaryIncludesPersistedFailures(t *testing.T) {
 	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
@@ -974,864 +821,7 @@ func TestSummaryIncludesPersistedFailures(t *testing.T) { // TestSummaryIncludes
 	}
 }
 
-// --- Shutdown ---
-
-func TestShutdownStopsRunningProcess(t *testing.T) { // TestShutdownStopsRunningProcess verifies that Shutdown stops all running processes and removes them from the runtime list.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	runtimeInfo, err := supervisor.Start(catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	})
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	if err := supervisor.Shutdown(context.Background()); err != nil {
-		t.Fatalf("Shutdown() error = %v", err)
-	}
-	if got := len(supervisor.List()); got != 0 {
-		t.Fatalf("len(List()) = %d, want 0", got)
-	}
-	if _, err := supervisor.Connect(runtimeInfo.ID); err != ErrRuntimeNotFound {
-		t.Fatalf("Connect() error = %v, want %v", err, ErrRuntimeNotFound)
-	}
-}
-
-// --- Auto-acquire ---
-
-func TestStartAutoAcquiresMissingExternalBinary(t *testing.T) { // TestStartAutoAcquiresMissingExternalBinary verifies that Start downloads a missing external binary via the acquire system when CuratedLaunch is enabled.
-	sourceDir := t.TempDir()
-	sourcePath := filepath.Join(sourceDir, namedBinary("mock-stdio-agent"))
-	buildMockStdioAgent(t, sourcePath)
-
-	server := httptest.NewServer(http.FileServer(http.Dir(sourceDir)))
-	defer server.Close()
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	installer := acquire.New(logger, t.TempDir(), nil)
-	supervisor := NewSupervisor(logger, t.TempDir(), nil, installer)
-
-	runtimeInfo, err := supervisor.Start(catalog.Agent{
-		ID:          "codex-acp",
-		DisplayName: "Codex ACP",
-		Detected:    false,
-		Protocol:    "acp",
-		Security:    catalog.SecurityConfig{CuratedLaunch: true, AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "external",
-			Command: "codex-acp",
-			Restart: catalog.RestartConfig{Mode: "never"},
-		},
-		Registry: catalog.RegistryInfo{
-			CurrentBinaryPath:       namedBinary("mock-stdio-agent"),
-			CurrentBinaryArchiveURL: server.URL + "/" + namedBinary("mock-stdio-agent"),
-		},
-	})
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	if runtimeInfo.Status != StatusRunning {
-		t.Fatalf("Status = %q, want %q", runtimeInfo.Status, StatusRunning)
-	}
-	if legacyPipes, err := supervisor.AcquireLease(runtimeInfo.ID, "legacy"); err != nil {
-		t.Fatalf("AcquireLease() error = %v", err)
-	} else {
-		_ = legacyPipes.Release()
-	}
-	if _, err := supervisor.StopByRuntimeID(runtimeInfo.ID); err != nil {
-		t.Fatalf("StopByRuntimeID() error = %v", err)
-	}
-}
-
-// --- Lease lifecycle ---
-
-func TestAcquireLeaseReturnsPipesRunningRuntime(t *testing.T) { // TestAcquireLeaseReturnsPipesRunningRuntime verifies that AcquireLease returns valid pipes for a running runtime.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	}
-
-	rt, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	pipes, err := supervisor.AcquireLease(rt.ID, "my-session-id")
-	if err != nil {
-		t.Fatalf("AcquireLease() error = %v", err)
-	}
-	if pipes == nil {
-		t.Fatal("AcquireLease() returned nil pipes")
-	}
-	_ = pipes.Release()
-
-	_, _ = supervisor.StopByAgentID(agent.ID)
-}
-
-func TestReleaseLeaseFreesLeaseForReAcquire(t *testing.T) { // TestReleaseLeaseFreesLeaseForReAcquire verifies that ReleaseLease clears the leaseholder, allowing a different session to acquire the lease.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	}
-
-	rt, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	pipes, err := supervisor.AcquireLease(rt.ID, "my-session-id")
-	if err != nil {
-		t.Fatalf("AcquireLease() error = %v", err)
-	}
-	if pipes == nil {
-		t.Fatal("AcquireLease() returned nil pipes")
-	}
-
-	if err := supervisor.ReleaseLease(rt.ID, "my-session-id"); err != nil {
-		t.Fatalf("ReleaseLease() error = %v", err)
-	}
-
-	pipes2, err := supervisor.AcquireLease(rt.ID, "my-session-id-2")
-	if err != nil {
-		t.Fatalf("AcquireLease() after ReleaseLease error = %v", err)
-	}
-	if pipes2 == nil {
-		t.Fatal("AcquireLease() after ReleaseLease returned nil pipes")
-	}
-	_ = pipes2.Release()
-
-	_, _ = supervisor.StopByAgentID(agent.ID)
-}
-
-func TestAcquireLeaseDoubleAcquireError(t *testing.T) { // TestAcquireLeaseDoubleAcquireError verifies that a second AcquireLease on the same runtime returns ErrRuntimeLeaseHeld.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	}
-
-	rt, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	pipes, err := supervisor.AcquireLease(rt.ID, "session-A")
-	if err != nil {
-		t.Fatalf("First AcquireLease() error = %v", err)
-	}
-	defer func() { _ = pipes.Release() }()
-
-	_, err = supervisor.AcquireLease(rt.ID, "session-B")
-	if err != ErrRuntimeLeaseHeld {
-		t.Fatalf("Second AcquireLease() error = %v, want %v", err, ErrRuntimeLeaseHeld)
-	}
-
-	_, _ = supervisor.StopByAgentID(agent.ID)
-}
-
-func TestReleaseLeaseWrongLeaseholder(t *testing.T) { // TestReleaseLeaseWrongLeaseholder verifies that ReleaseLease returns ErrRuntimeLeaseHeld when called with a leaseholder that does not match.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	}
-
-	rt, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	pipes, err := supervisor.AcquireLease(rt.ID, "session-A")
-	if err != nil {
-		t.Fatalf("AcquireLease() error = %v", err)
-	}
-	defer func() { _ = pipes.Release() }()
-
-	err = supervisor.ReleaseLease(rt.ID, "session-B")
-	if err != ErrRuntimeLeaseHeld {
-		t.Fatalf("ReleaseLease() with wrong holder error = %v, want %v", err, ErrRuntimeLeaseHeld)
-	}
-
-	_, _ = supervisor.StopByAgentID(agent.ID)
-}
-
-// --- OnProcessExit ---
-
-func TestOnProcessExitCallback(t *testing.T) { // TestOnProcessExitCallback verifies that OnProcessExit fires the registered callback with the correct runtime ID when a process stops.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	}
-
-	rt, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	callbackCh := make(chan string, 1)
-	intentionalCh := make(chan bool, 1)
-	supervisor.OnProcessExit(rt.ID, func(runtimeID string, intentional bool) {
-		intentionalCh <- intentional
-		callbackCh <- runtimeID
-	})
-
-	_, err = supervisor.StopByRuntimeID(rt.ID)
-	if err != nil {
-		t.Fatalf("StopByRuntimeID() error = %v", err)
-	}
-
-	select {
-	case got := <-callbackCh:
-		if got != rt.ID {
-			t.Fatalf("callback received runtimeID = %q, want %q", got, rt.ID)
-		}
-		if !<-intentionalCh {
-			t.Fatal("StopByRuntimeID exit reported as a crash, want intentional")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for OnProcessExit callback")
-	}
-}
-
-// --- AppendLog ---
-
-func TestAppendLog(t *testing.T) { // TestAppendLog verifies that AppendLog writes an entry retrievable via Logs.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	}
-
-	rt, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	supervisor.AppendLog(rt.ID, "gateway", "test log message")
-
-	entries, err := supervisor.Logs(rt.ID)
-	if err != nil {
-		t.Fatalf("Logs() error = %v", err)
-	}
-	found := false
-	for _, entry := range entries {
-		if entry.Stream == "gateway" && entry.Message == "test log message" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatal("AppendLog entry not found in Logs()")
-	}
-
-	_, _ = supervisor.StopByAgentID(agent.ID)
-}
-
-// --- WriteToAgent / LeasedPipes ---
-
-func TestWriteToAgent(t *testing.T) { // TestWriteToAgent verifies that WriteToAgent sends data to the agent's stdin through an acquired lease.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	}
-
-	rt, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	pipes, err := supervisor.AcquireLease(rt.ID, "test-writer")
-	if err != nil {
-		t.Fatalf("AcquireLease() error = %v", err)
-	}
-	defer func() { _ = pipes.Release() }()
-
-	if err := pipes.WriteToAgent([]byte(`{"jsonrpc":"2.0","id":"1","method":"initialize","params":{}}`)); err != nil {
-		t.Fatalf("WriteToAgent() error = %v", err)
-	}
-
-	_, _ = supervisor.StopByAgentID(agent.ID)
-}
-
-// --- Start with session lease ---
-
-func TestStartDoesNotKillSessionLeasedRuntime(t *testing.T) { // TestStartDoesNotKillSessionLeasedRuntime verifies that Start returns the same runtime ID when a session lease is held (unlike legacy attach where it replaces the runtime).
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	}
-
-	first, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("First Start() error = %v", err)
-	}
-
-	pipes, err := supervisor.AcquireLease(first.ID, "my-session-id")
-	if err != nil {
-		t.Fatalf("AcquireLease() error = %v", err)
-	}
-	defer func() { _ = pipes.Release() }()
-
-	second, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Second Start() error = %v", err)
-	}
-
-	if first.ID != second.ID {
-		t.Fatalf("runtime IDs differ after re-Start with session lease: %q vs %q", first.ID, second.ID)
-	}
-
-	_, _ = supervisor.StopByAgentID(agent.ID)
-}
-
-// --- StopByRuntimeID edge cases ---
-
-func TestStopByRuntimeID_ReleasesPipes(t *testing.T) { // TestStopByRuntimeID_ReleasesPipes verifies that StopByRuntimeID releases the process pipes, making AcquireLease return ErrRuntimeNotRunning.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	}
-
-	rt, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	_, err = supervisor.StopByRuntimeID(rt.ID)
-	if err != nil {
-		t.Fatalf("StopByRuntimeID() error = %v", err)
-	}
-
-	runtimes := supervisor.List()
-	if len(runtimes) != 1 {
-		t.Fatalf("len(runtimes) = %d, want 1", len(runtimes))
-	}
-	if runtimes[0].Status != StatusStopped {
-		t.Fatalf("runtime status = %q, want %q", runtimes[0].Status, StatusStopped)
-	}
-
-	_, err = supervisor.AcquireLease(rt.ID, "post-stop")
-	if err != ErrRuntimeNotRunning {
-		t.Fatalf("AcquireLease() after StopByRuntimeID error = %v, want %v (lease should be released)", err, ErrRuntimeNotRunning)
-	}
-}
-
-// --- LeasedPipes Release behavior ---
-
-func TestLeasedPipesRelease_SessionLease(t *testing.T) { // TestLeasedPipesRelease_SessionLease verifies that a session lease Release does not close stdin and allows subsequent writes and re-acquire.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	}
-
-	rt, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	pipes, err := supervisor.AcquireLease(rt.ID, "sess_abc123")
-	if err != nil {
-		t.Fatalf("AcquireLease() error = %v", err)
-	}
-
-	if err := pipes.Release(); err != nil {
-		t.Fatalf("Release() error = %v", err)
-	}
-
-	if err := pipes.WriteToAgent([]byte("test")); err != nil {
-		t.Fatalf("WriteToAgent() after session Release() should succeed, got: %v", err)
-	}
-
-	pipes2, err := supervisor.AcquireLease(rt.ID, "sess_xyz789")
-	if err != nil {
-		t.Fatalf("AcquireLease() after session Release() error = %v", err)
-	}
-	_ = pipes2.Release()
-
-	_, _ = supervisor.StopByAgentID(agent.ID)
-}
-
-// --- More input validation ---
-
-func TestStartRejectsUnsupportedLaunch(t *testing.T) { // TestStartRejectsUnsupportedLaunch verifies that Start returns ErrUnsupportedLaunch for an unknown launch mode.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-
-	_, err := supervisor.Start(catalog.Agent{
-		ID:          "bad-agent",
-		DisplayName: "Bad Agent",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode: "unsupported",
-		},
-	})
-	if err != ErrUnsupportedLaunch {
-		t.Fatalf("Start() error = %v, want %v", err, ErrUnsupportedLaunch)
-	}
-}
-
-func TestStartRejectsNotDetectedNoInstaller(t *testing.T) { // TestStartRejectsNotDetectedNoInstaller verifies that Start returns ErrAgentNotDetected for undetected agents without an installer.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-
-	_, err := supervisor.Start(catalog.Agent{
-		ID:          "missing-agent",
-		DisplayName: "Missing Agent",
-		Detected:    false,
-		Launch: catalog.LaunchConfig{
-			Mode: "process",
-		},
-	})
-	if err != ErrAgentNotDetected {
-		t.Fatalf("Start() error = %v, want %v", err, ErrAgentNotDetected)
-	}
-}
-
-// --- Logging edge cases ---
-
-func TestAppendLogEmptyID(t *testing.T) { // TestAppendLogEmptyID verifies that AppendLog with an empty runtime ID does not create log entries.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	supervisor.AppendLog("", "gateway", "test")
-
-	_, err := supervisor.Logs("")
-	if err != ErrRuntimeNotFound {
-		t.Fatalf("Logs(\"\") error = %v, want %v", err, ErrRuntimeNotFound)
-	}
-}
-
-func TestLogsNotFound(t *testing.T) { // TestLogsNotFound verifies that Logs returns ErrRuntimeNotFound for a nonexistent ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	_, err := supervisor.Logs("nonexistent")
-	if err != ErrRuntimeNotFound {
-		t.Fatalf("Logs() error = %v, want %v", err, ErrRuntimeNotFound)
-	}
-}
-
-// --- Helper function tests ---
-
-func TestRestartMaxRetriesNegative(t *testing.T) { // TestRestartMaxRetriesNegative verifies that restartMaxRetries clamps negative values to zero.
-	if n := restartMaxRetries(catalog.RestartConfig{MaxRetries: -1}); n != 0 {
-		t.Fatalf("restartMaxRetries(-1) = %d, want 0", n)
-	}
-	if n := restartMaxRetries(catalog.RestartConfig{MaxRetries: 3}); n != 3 {
-		t.Fatalf("restartMaxRetries(3) = %d, want 3", n)
-	}
-}
-
-func TestRestartBackoffConfig(t *testing.T) { // TestRestartBackoffConfig verifies that restartBackoff returns the correct duration for zero, negative, and positive BackoffSeconds.
-	if d := restartBackoff(catalog.RestartConfig{BackoffSeconds: 0}); d != 0 {
-		t.Fatalf("restartBackoff(0) = %v, want 0", d)
-	}
-	if d := restartBackoff(catalog.RestartConfig{BackoffSeconds: -1}); d != 0 {
-		t.Fatalf("restartBackoff(-1) = %v, want 0", d)
-	}
-	if d := restartBackoff(catalog.RestartConfig{BackoffSeconds: 5}); d != 5*time.Second {
-		t.Fatalf("restartBackoff(5) = %v, want 5s", d)
-	}
-}
-
-// --- Health check ---
-
-// --- resolveLaunch ---
-
-func TestResolveCommandPath(t *testing.T) { // TestResolveCommandPath verifies that resolveCommandPath returns absolute paths unchanged and resolves relative paths against baseDir.
-	baseDir := t.TempDir()
-	s := &Supervisor{baseDir: baseDir}
-
-	absPath := filepath.Join(baseDir, "some", "binary")
-	if got := s.resolveCommandPath(absPath); got != absPath {
-		t.Fatalf("resolveCommandPath(abs) = %q, want %q", got, absPath)
-	}
-
-	relPath := filepath.Join("bin", "agent")
-	got := s.resolveCommandPath(relPath)
-	expected, _ := filepath.Abs(filepath.Join(baseDir, relPath))
-	if got != expected {
-		t.Fatalf("resolveCommandPath(rel) = %q, want %q", got, expected)
-	}
-}
-
-// --- Failure helpers ---
-
-func TestFailureSortTime(t *testing.T) { // TestFailureSortTime verifies that failureSortTime prefers FailedAt over CreatedAt.
-	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-
-	f1 := FailureSummary{FailedAt: now, CreatedAt: now.Add(-time.Hour)}
-	if got := failureSortTime(f1); got != now {
-		t.Fatalf("failureSortTime(with FailedAt) = %v, want %v", got, now)
-	}
-
-	f2 := FailureSummary{CreatedAt: now}
-	if got := failureSortTime(f2); got != now {
-		t.Fatalf("failureSortTime(zero FailedAt) = %v, want %v", got, now)
-	}
-}
-
-func TestFailureSummaryFromRecord(t *testing.T) { // TestFailureSummaryFromRecord verifies that failureSummaryFromRecord correctly converts a storage record, handling empty and invalid LogPreview.
-	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-
-	record := storage.RuntimeFailureRecord{
-		RuntimeID:  "test-id",
-		AgentID:    "test-agent",
-		AgentName:  "Test Agent",
-		LastError:  "boom",
-		CreatedAt:  now,
-		FailedAt:   now,
-		LogPreview: "",
-	}
-	fs := failureSummaryFromRecord(record)
-	if fs.RuntimeID != "test-id" {
-		t.Fatalf("RuntimeID = %q, want %q", fs.RuntimeID, "test-id")
-	}
-	if len(fs.RecentLogLines) != 0 {
-		t.Fatalf("RecentLogLines = %d, want 0 for empty preview", len(fs.RecentLogLines))
-	}
-
-	record.LogPreview = "{invalid json}"
-	fs = failureSummaryFromRecord(record)
-	if len(fs.RecentLogLines) != 1 {
-		t.Fatalf("RecentLogLines = %d, want 1 for invalid preview", len(fs.RecentLogLines))
-	}
-	if fs.RecentLogLines[0].Message != "failed to decode persisted log preview" {
-		t.Fatalf("Message = %q, want %q", fs.RecentLogLines[0].Message, "failed to decode persisted log preview")
-	}
-}
-
-func TestShouldRestartEdgeCases(t *testing.T) { // TestShouldRestartEdgeCases verifies that shouldRestart returns false for "never" mode, exceeded retries, and true for valid restart config.
-	s := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-
-	if s.shouldRestart(catalog.RestartConfig{Mode: "never"}, 0) {
-		t.Fatal("shouldRestart(never) should be false")
-	}
-	if s.shouldRestart(catalog.RestartConfig{Mode: "on_failure", MaxRetries: 1}, 1) {
-		t.Fatal("shouldRestart(exceeded) should be false")
-	}
-	if !s.shouldRestart(catalog.RestartConfig{Mode: "on_failure", MaxRetries: 3}, 0) {
-		t.Fatal("shouldRestart(valid) should be true")
-	}
-}
-
-// --- stopProcessWithContext ---
-
-func TestStopProcessWithContextNilHandle(t *testing.T) { // TestStopProcessWithContextNilHandle verifies that stopProcessWithContext does not panic on a nil process handle.
-	if err := stopProcessWithContext(context.Background(), nil); err != nil {
-		t.Fatalf("stopProcessWithContext(nil) = %v, want nil", err)
-	}
-}
-
-func TestStopProcessWithContextAlreadyDone(t *testing.T) { // TestStopProcessWithContextAlreadyDone verifies that stopProcessWithContext handles an already-completed process without error.
-	done := make(chan struct{})
-	close(done)
-	handle := &processHandle{done: done}
-	if err := stopProcessWithContext(context.Background(), handle); err != nil {
-		t.Fatalf("stopProcessWithContext(done) = %v, want nil", err)
-	}
-}
-
-// --- Persistence ---
-
-func TestPersistRuntimeWithStore(t *testing.T) { // TestPersistRuntimeWithStore verifies that starting a runtime persists it in the storage backend.
-	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	defer store.Close()
-
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, store, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	}
-
-	rt, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	_, _ = supervisor.StopByRuntimeID(rt.ID)
-}
-
-func TestPersistFailureWithStore(t *testing.T) { // TestPersistFailureWithStore verifies that persistFailure writes a failure record to the storage backend.
-	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	defer store.Close()
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	supervisor.store = store
-	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-	supervisor.now = func() time.Time { return now }
-
-	runtime := Runtime{
-		ID:        "run-failed",
-		AgentID:   "mock-acp",
-		AgentName: "Mock ACP",
-		Status:    StatusFailed,
-		LastError: "process exited with status 1",
-		CreatedAt: now,
-	}
-	supervisor.runtimes[runtime.ID] = runtime
-
-	supervisor.persistFailure(runtime.ID, runtime, []LogEntry{
-		{Timestamp: now, Stream: "stderr", Message: "boom"},
-	}, now)
-
-	failures, err := store.ListRecentRuntimeFailures(context.Background(), 5)
-	if err != nil {
-		t.Fatalf("ListRecentRuntimeFailures() error = %v", err)
-	}
-	found := false
-	for _, f := range failures {
-		if f.RuntimeID == runtime.ID {
-			found = true
-			if f.LastError != "process exited with status 1" {
-				t.Fatalf("LastError = %q, want %q", f.LastError, "process exited with status 1")
-			}
-			break
-		}
-	}
-	if !found {
-		t.Fatal("failure record not found in persisted store")
-	}
-}
-
-func TestPersistCleanExitWithStore(t *testing.T) { // TestPersistCleanExitWithStore verifies that persistCleanExit writes a clean-flagged record to the storage backend.
-	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	defer store.Close()
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	supervisor.store = store
-	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-	supervisor.now = func() time.Time { return now }
-
-	runtime := Runtime{
-		ID:        "run-clean",
-		AgentID:   "mock-acp",
-		AgentName: "Mock ACP",
-		Status:    StatusStopped,
-		CreatedAt: now,
-	}
-	supervisor.runtimes[runtime.ID] = runtime
-
-	supervisor.persistCleanExit(runtime.ID, runtime, []LogEntry{
-		{Timestamp: now, Stream: "stderr", Message: "bye"},
-	}, now)
-
-	records, err := store.ListRuntimeFailureRecords(context.Background(), 5)
-	if err != nil {
-		t.Fatalf("ListRuntimeFailureRecords() error = %v", err)
-	}
-	found := false
-	for _, f := range records {
-		if f.RuntimeID == runtime.ID {
-			found = true
-			if !f.CleanExit {
-				t.Fatalf("CleanExit = false, want true for %q", f.RuntimeID)
-			}
-			if f.LastError != "exit status 0 (clean)" {
-				t.Fatalf("LastError = %q, want %q", f.LastError, "exit status 0 (clean)")
-			}
-			break
-		}
-	}
-	if !found {
-		t.Fatal("clean-exit record not found in persisted store")
-	}
-}
-
-func TestHandleProcessExitCleanExitPersistsRecord(t *testing.T) { // TestHandleProcessExitCleanExitPersistsRecord verifies that a clean process exit writes a clean-flagged record via handleProcessExit.
-	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	defer store.Close()
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	supervisor.store = store
-	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-	supervisor.now = func() time.Time { return now }
-
-	done := make(chan struct{})
-	close(done)
-	handle := &processHandle{
-		done:    done,
-		waitErr: nil,
-		agent: catalog.Agent{
-			Launch: catalog.LaunchConfig{
-				Restart: catalog.RestartConfig{Mode: "never"},
-			},
-		},
-	}
-
-	supervisor.runtimes["test-id"] = Runtime{
-		ID: "test-id", AgentID: "test", AgentName: "Test", Status: StatusRunning, CreatedAt: now,
-	}
-	supervisor.runtimeByAgent["test"] = map[string]struct{}{"test-id": {}}
-	supervisor.logs["test-id"] = []LogEntry{}
-
-	supervisor.handleProcessExit("test-id", "test", handle)
-
-	records, err := store.ListRuntimeFailureRecords(context.Background(), 5)
-	if err != nil {
-		t.Fatalf("ListRuntimeFailureRecords() error = %v", err)
-	}
-	found := false
-	for _, f := range records {
-		if f.RuntimeID == "test-id" {
-			found = true
-			if !f.CleanExit {
-				t.Fatal("CleanExit = false, want true for clean exit")
-			}
-			break
-		}
-	}
-	if !found {
-		t.Fatal("clean-exit record not found after handleProcessExit")
-	}
-}
-
-func TestSummaryExcludesCleanExitRecords(t *testing.T) { // TestSummaryExcludesCleanExitRecords verifies that Summary.RecentFailures does not surface clean-exit records.
+func TestSummaryExcludesCleanExitRecords(t *testing.T) {
 	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
@@ -1861,466 +851,7 @@ func TestSummaryExcludesCleanExitRecords(t *testing.T) { // TestSummaryExcludesC
 	}
 }
 
-// --- restartAfterBackoff ---
-
-func TestRestartAfterBackoffLaunchFails(t *testing.T) { // TestRestartAfterBackoffLaunchFails verifies that restartAfterBackoff marks the runtime as failed when the launch itself fails.
-	baseDir := t.TempDir()
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-	supervisor.now = func() time.Time { return now }
-
-	runtimeInfo := Runtime{
-		ID:        "run-restart-fail",
-		AgentID:   "mock-acp",
-		AgentName: "Mock ACP",
-		Status:    StatusStarting,
-		CreatedAt: now,
-	}
-	supervisor.runtimes[runtimeInfo.ID] = runtimeInfo
-	supervisor.runtimeByAgent[runtimeInfo.AgentID] = map[string]struct{}{runtimeInfo.ID: {}}
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	}
-
-	supervisor.restartAfterBackoff(runtimeInfo, agent, nil)
-
-	supervisor.mu.Lock()
-	updated, ok := supervisor.runtimes[runtimeInfo.ID]
-	supervisor.mu.Unlock()
-	if !ok {
-		t.Fatal("runtime should still exist after failed restart")
-	}
-	if updated.Status != StatusFailed {
-		t.Fatalf("Status = %q, want %q after failed restart",
-			updated.Status, StatusFailed)
-	}
-	if updated.LastError == "" {
-		t.Fatal("LastError should be set after failed restart")
-	}
-}
-
-func TestRestartAfterBackoffRuntimeRemoved(t *testing.T) { // TestRestartAfterBackoffRuntimeRemoved verifies that restartAfterBackoff does not recreate a runtime that was already removed from the map.
-	baseDir := t.TempDir()
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-	supervisor.now = func() time.Time { return now }
-
-	runtimeInfo := Runtime{
-		ID:        "run-gone",
-		AgentID:   "mock-acp",
-		AgentName: "Mock ACP",
-		Status:    StatusStarting,
-		CreatedAt: now,
-	}
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	}
-
-	supervisor.restartAfterBackoff(runtimeInfo, agent, nil)
-
-	supervisor.mu.Lock()
-	if _, exists := supervisor.runtimes[runtimeInfo.ID]; exists {
-		t.Fatal("runtime should have been removed if it never existed")
-	}
-	supervisor.mu.Unlock()
-}
-
-func TestStopProcessWithContextNilCmd(t *testing.T) { // TestStopProcessWithContextNilCmd verifies that stopProcessWithContext handles a processHandle with a nil cmd field.
-	handle := &processHandle{cmd: nil, done: make(chan struct{})}
-	if err := stopProcessWithContext(context.Background(), handle); err != nil {
-		t.Fatalf("stopProcessWithContext(nil cmd) = %v, want nil", err)
-	}
-}
-
-func TestStartRejectsRemoteStartDisabled(t *testing.T) { // TestStartRejectsRemoteStartDisabled verifies that Start returns ErrRemoteStartNotAllowed when AllowsRemoteStart is false.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-
-	_, err := supervisor.Start(catalog.Agent{
-		ID:          "no-remote",
-		DisplayName: "No Remote",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: false},
-		Launch: catalog.LaunchConfig{
-			Mode: "process",
-		},
-	})
-	if err != ErrRemoteStartNotAllowed {
-		t.Fatalf("Start() error = %v, want %v", err, ErrRemoteStartNotAllowed)
-	}
-}
-
-func TestAcquireLeaseMissingStdio(t *testing.T) { // TestAcquireLeaseMissingStdio verifies that AcquireLease returns ErrRuntimeNotConnectable when the runtime has no stdio pipes allocated.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	supervisor.runtimes["run-no-stdio"] = Runtime{
-		ID:        "run-no-stdio",
-		AgentID:   "test-agent",
-		AgentName: "Test Agent",
-		Status:    StatusRunning,
-		CreatedAt: time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC),
-	}
-
-	_, err := supervisor.AcquireLease("run-no-stdio", "test")
-	if err != ErrRuntimeNotConnectable {
-		t.Fatalf("AcquireLease(no pipes) error = %v, want %v", err, ErrRuntimeNotConnectable)
-	}
-}
-
-func TestReleaseLeaseMissingProcess(t *testing.T) { // TestReleaseLeaseMissingProcess verifies that ReleaseLease returns ErrRuntimeNotFound for a nonexistent runtime ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	err := supervisor.ReleaseLease("nonexistent", "test")
-	if err != ErrRuntimeNotFound {
-		t.Fatalf("ReleaseLease() error = %v, want %v", err, ErrRuntimeNotFound)
-	}
-}
-
-func TestAppendLogOverflow(t *testing.T) { // TestAppendLogOverflow verifies that the internal log buffer caps at 200 entries, discarding the oldest.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-	supervisor.now = func() time.Time { return now }
-
-	for i := range 250 {
-		supervisor.appendLog("test-id", LogEntry{
-			Timestamp: now,
-			Stream:    "stdout",
-			Message:   fmt.Sprintf("line %d", i),
-		})
-	}
-
-	entries, err := supervisor.Logs("test-id")
-	if err != nil {
-		t.Fatalf("Logs() error = %v", err)
-	}
-	if len(entries) != 200 {
-		t.Fatalf("len(Logs) = %d, want 200", len(entries))
-	}
-	if entries[0].Message != "line 50" {
-		t.Fatalf("first entry message = %q, want %q", entries[0].Message, "line 50")
-	}
-}
-
-func TestMergeEnvOverridesNilCurrent(t *testing.T) { // TestMergeEnvOverridesNilCurrent verifies that mergeEnvOverrides creates a new map when current is nil and returns nil when both are nil.
-	updates := map[string]string{"KEY": "val"}
-	result := mergeEnvOverrides(nil, updates)
-	if result == nil {
-		t.Fatal("mergeEnvOverrides(nil, updates) should not be nil")
-	}
-	if result["KEY"] != "val" {
-		t.Fatalf("result[KEY] = %q, want %q", result["KEY"], "val")
-	}
-
-	bothNil := mergeEnvOverrides(nil, nil)
-	if bothNil != nil {
-		t.Fatal("mergeEnvOverrides(nil, nil) should be nil")
-	}
-}
-
-func TestPersistRuntimeWithClosedStore(t *testing.T) { // TestPersistRuntimeWithClosedStore verifies that persistRuntime does not panic when the store is closed.
-	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	store.Close()
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	supervisor.store = store
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	runtime := Runtime{
-		ID:        "test-id",
-		AgentID:   "test-agent",
-		AgentName: "Test Agent",
-		Status:    StatusRunning,
-		CreatedAt: time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC),
-	}
-	supervisor.persistRuntime(runtime) // must not panic on closed store
-}
-
-func TestPersistFailureWithClosedStore(t *testing.T) { // TestPersistFailureWithClosedStore verifies that persistFailure does not panic when the store is closed.
-	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	store.Close()
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	supervisor.store = store
-	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-
-	runtime := Runtime{
-		ID:        "test-id",
-		AgentID:   "test-agent",
-		AgentName: "Test Agent",
-		Status:    StatusFailed,
-		LastError: "boom",
-		CreatedAt: now,
-	}
-	supervisor.persistFailure(runtime.ID, runtime, []LogEntry{
-		{Timestamp: now, Stream: "stderr", Message: "error"},
-	}, now)
-
-	_, err = store.ListRecentRuntimeFailures(context.Background(), 5)
-	if err == nil {
-		t.Fatal("expected error querying closed store")
-	}
-	if !strings.Contains(err.Error(), "closed") {
-		t.Fatalf("error = %v, want 'closed' in error message", err)
-	}
-}
-
-// --- handleProcessExit ---
-
-func TestHandleProcessExitNoRuntimeInMap(t *testing.T) { // TestHandleProcessExitNoRuntimeInMap verifies that handleProcessExit does nothing for a runtime not in the map.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	supervisor.handleProcessExit("nonexistent", "test", &processHandle{})
-
-	if got := len(supervisor.List()); got != 0 {
-		t.Fatalf("len(List()) = %d, want 0 (handleProcessExit should not modify empty state)", got)
-	}
-}
-
-func TestHandleProcessExitCleanExit(t *testing.T) { // TestHandleProcessExitCleanExit verifies that handleProcessExit transitions a running runtime to StatusStopped on clean exit.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-	supervisor.now = func() time.Time { return now }
-
-	done := make(chan struct{})
-	close(done)
-	handle := &processHandle{
-		done:    done,
-		waitErr: nil,
-		agent: catalog.Agent{
-			Launch: catalog.LaunchConfig{
-				Restart: catalog.RestartConfig{Mode: "never"},
-			},
-		},
-	}
-
-	supervisor.runtimes["test-id"] = Runtime{
-		ID: "test-id", AgentID: "test", AgentName: "Test", Status: StatusRunning, CreatedAt: now,
-	}
-	supervisor.runtimeByAgent["test"] = map[string]struct{}{"test-id": {}}
-	supervisor.logs["test-id"] = []LogEntry{}
-
-	supervisor.handleProcessExit("test-id", "test", handle)
-
-	supervisor.mu.Lock()
-	rt, ok := supervisor.runtimes["test-id"]
-	supervisor.mu.Unlock()
-	if !ok {
-		t.Fatal("runtime should still exist after clean exit")
-	}
-	if rt.Status != StatusStopped {
-		t.Fatalf("Status = %q, want %q after clean exit", rt.Status, StatusStopped)
-	}
-}
-
-func TestHandleProcessExitRuntimeAlreadyRemoved(t *testing.T) { // TestHandleProcessExitRuntimeAlreadyRemoved verifies that a runtime removed by Shutdown does not reappear after process exit.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
-		},
-	}
-
-	_, err := supervisor.Start(agent)
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	if err := supervisor.Shutdown(context.Background()); err != nil {
-		t.Fatalf("Shutdown() error = %v", err)
-	}
-
-	runtimesAfter := supervisor.List()
-	if len(runtimesAfter) != 0 {
-		t.Fatalf("len(List()) = %d, want 0 after shutdown", len(runtimesAfter))
-	}
-}
-
-func TestAcquireLeaseOnNonRunningRuntime(t *testing.T) { // TestAcquireLeaseOnNonRunningRuntime verifies that AcquireLease returns ErrRuntimeNotRunning for stopped runtimes.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	supervisor.runtimes["run-stopped"] = Runtime{
-		ID:        "run-stopped",
-		AgentID:   "test",
-		AgentName: "Test",
-		Status:    StatusStopped,
-		CreatedAt: time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC),
-	}
-
-	_, err := supervisor.AcquireLease("run-stopped", "legacy")
-	if err != ErrRuntimeNotRunning {
-		t.Fatalf("AcquireLease() error = %v, want %v", err, ErrRuntimeNotRunning)
-	}
-}
-
-func TestLogsEmptyForExistingRuntime(t *testing.T) { // TestLogsEmptyForExistingRuntime verifies that Logs returns nil (not an error) for a runtime with no log entries.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	supervisor.runtimes["run-empty"] = Runtime{
-		ID:        "run-empty",
-		AgentID:   "test",
-		AgentName: "Test",
-		Status:    StatusRunning,
-		CreatedAt: time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC),
-	}
-
-	entries, err := supervisor.Logs("run-empty")
-	if err != nil {
-		t.Fatalf("Logs() error = %v, want nil", err)
-	}
-	if entries != nil {
-		t.Fatalf("Logs() = %v, want nil", entries)
-	}
-}
-
-func TestListSortsByCreatedAtThenID(t *testing.T) { // TestListSortsByCreatedAtThenID verifies that List returns runtimes sorted by CreatedAt then ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-
-	supervisor.runtimes["b"] = Runtime{ID: "b", AgentID: "b", AgentName: "B", Status: StatusRunning, CreatedAt: now}
-	supervisor.runtimes["a"] = Runtime{ID: "a", AgentID: "a", AgentName: "A", Status: StatusRunning, CreatedAt: now}
-
-	runtimes := supervisor.List()
-	if len(runtimes) != 2 {
-		t.Fatalf("len = %d, want 2", len(runtimes))
-	}
-	if runtimes[0].ID != "a" || runtimes[1].ID != "b" {
-		t.Fatalf("order = %s, %s; want a, b", runtimes[0].ID, runtimes[1].ID)
-	}
-}
-
-func TestStopByRuntimeIDNotFound(t *testing.T) { // TestStopByRuntimeIDNotFound verifies that StopByRuntimeID returns ErrRuntimeNotFound for nonexistent IDs.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	_, err := supervisor.StopByRuntimeID("nonexistent")
-	if err != ErrRuntimeNotFound {
-		t.Fatalf("StopByRuntimeID() error = %v, want %v", err, ErrRuntimeNotFound)
-	}
-}
-
-type errorReader struct{ err error }
-
-func (r *errorReader) Read(p []byte) (int, error) { return 0, r.err }
-
-func TestCaptureLogsScannerError(t *testing.T) { // TestCaptureLogsScannerError verifies that captureLogs records scanner errors as log entries.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-	supervisor.now = func() time.Time { return now }
-
-	errReader := &errorReader{err: fmt.Errorf("simulated read failure")}
-	supervisor.captureLogs("test-id", "stderr", errReader, io.Discard)
-
-	entries, err := supervisor.Logs("test-id")
-	if err != nil {
-		t.Fatalf("Logs() error = %v", err)
-	}
-	if len(entries) == 0 {
-		t.Fatal("expected at least one log entry from scanner error")
-	}
-	if !strings.Contains(entries[0].Message, "simulated read failure") {
-		t.Fatalf("Message = %q, want it to contain 'simulated read failure'", entries[0].Message)
-	}
-}
-
-func TestResolveLaunchExternalNotFound(t *testing.T) { // TestResolveLaunchExternalNotFound verifies that resolveLaunch returns ErrExecutableNotFound for an unresolvable external command.
-	s := &Supervisor{baseDir: t.TempDir()}
-	_, _, err := s.resolveLaunch(catalog.LaunchConfig{
-		Mode:    "external",
-		Command: "nonexistent-utility-that-does-not-exist",
-	})
-	if !errors.Is(err, ErrExecutableNotFound) {
-		t.Fatalf("resolveLaunch() error = %v, want %v", err, ErrExecutableNotFound)
-	}
-}
-
-func TestStopByAgentIDAlreadyStopped(t *testing.T) { // TestStopByAgentIDAlreadyStopped verifies that StopByAgentID is a no-op for already-stopped runtimes.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	supervisor.runtimes["test-id"] = Runtime{
-		ID: "test-id", AgentID: "test", AgentName: "Test",
-		Status: StatusStopped, CreatedAt: time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC),
-	}
-	supervisor.runtimeByAgent["test"] = map[string]struct{}{"test-id": {}}
-
-	result, err := supervisor.StopByAgentID("test")
-	if err != nil {
-		t.Fatalf("StopByAgentID() error = %v, want nil", err)
-	}
-	if result.Status != StatusStopped {
-		t.Fatalf("Status = %q, want %q", result.Status, StatusStopped)
-	}
-}
-
-func TestStopByRuntimeIDAlreadyStopped(t *testing.T) { // TestStopByRuntimeIDAlreadyStopped verifies that StopByRuntimeID is a no-op for already-stopped runtimes.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	supervisor.runtimes["test-id"] = Runtime{
-		ID: "test-id", AgentID: "test", AgentName: "Test",
-		Status: StatusStopped, CreatedAt: time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC),
-	}
-
-	result, err := supervisor.StopByRuntimeID("test-id")
-	if err != nil {
-		t.Fatalf("StopByRuntimeID() error = %v, want nil", err)
-	}
-	if result.Status != StatusStopped {
-		t.Fatalf("Status = %q, want %q", result.Status, StatusStopped)
-	}
-}
-
-func TestStopByAgentIDOrphanedMapping(t *testing.T) { // TestStopByAgentIDOrphanedMapping verifies that StopByAgentID returns ErrRuntimeNotFound when the agent-to-runtime mapping points to a nonexistent ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	supervisor.runtimeByAgent["orphaned"] = map[string]struct{}{"nonexistent-id": {}}
-
-	_, err := supervisor.StopByAgentID("orphaned")
-	if err != ErrRuntimeNotFound {
-		t.Fatalf("StopByAgentID() error = %v, want %v", err, ErrRuntimeNotFound)
-	}
-}
-
-func TestAcquireLeaseNotFound(t *testing.T) { // TestAcquireLeaseNotFound verifies that AcquireLease returns ErrRuntimeNotFound for a nonexistent runtime ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	_, err := supervisor.AcquireLease("nonexistent", "test")
-	if err != ErrRuntimeNotFound {
-		t.Fatalf("AcquireLease() error = %v, want %v", err, ErrRuntimeNotFound)
-	}
-}
-
-func TestSummaryWithClosedStore(t *testing.T) { // TestSummaryWithClosedStore verifies that Summary works with memory-only state even when the store is closed.
+func TestSummaryWithClosedStore(t *testing.T) {
 	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
@@ -2329,164 +860,150 @@ func TestSummaryWithClosedStore(t *testing.T) { // TestSummaryWithClosedStore ve
 
 	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(), store, nil)
 	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
 	supervisor.runtimes["run-failed"] = Runtime{
-		ID:          "run-failed",
-		AgentID:     "mock-acp",
-		AgentName:   "Mock ACP",
-		Status:      StatusFailed,
-		LastError:   "process exited with status 1",
-		CreatedAt:   time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC),
-		CircuitOpen: true,
+		ID: "run-failed", AgentID: "mock-acp", AgentName: "Mock ACP",
+		Status: StatusFailed, LastError: "process exited with status 1", CreatedAt: supervisor.now(),
 	}
 
 	summary := supervisor.Summary()
-	if summary.Total != 1 {
-		t.Fatalf("Total = %d, want 1", summary.Total)
-	}
-	if summary.CircuitOpen != 1 {
-		t.Fatalf("CircuitOpen = %d, want 1", summary.CircuitOpen)
+	if summary.Total != 1 || summary.Failed != 1 {
+		t.Fatalf("summary = %+v", summary)
 	}
 }
 
-func TestStopByAgentIDNotFound(t *testing.T) { // TestStopByAgentIDNotFound verifies that StopByAgentID returns ErrRuntimeNotFound for an unmapped agent ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	_, err := supervisor.StopByAgentID("nonexistent")
-	if err != ErrRuntimeNotFound {
-		t.Fatalf("StopByAgentID() error = %v, want %v", err, ErrRuntimeNotFound)
+// --- Pure helpers ---
+
+func TestResolveCommandPath(t *testing.T) {
+	supervisor := &Supervisor{baseDir: t.TempDir()}
+	abs := filepath.Join(supervisor.baseDir, "agents", "bin")
+	if got := supervisor.resolveCommandPath(abs); got != abs {
+		t.Fatalf("resolveCommandPath(abs) = %q, want %q", got, abs)
+	}
+	resolved := supervisor.resolveCommandPath(filepath.Join("agents", "bin"))
+	if !filepath.IsAbs(resolved) {
+		t.Fatalf("resolveCommandPath(rel) = %q, want absolute", resolved)
+	}
+	if !strings.HasPrefix(resolved, supervisor.baseDir) {
+		t.Fatalf("resolveCommandPath(rel) = %q, want under %q", resolved, supervisor.baseDir)
 	}
 }
 
-func TestReleaseLeaseAfterProcessRemoved(t *testing.T) { // TestReleaseLeaseAfterProcessRemoved verifies that Release on a lease acquired before StopByRuntimeID does not panic after the process is gone.
-	baseDir := t.TempDir()
-	buildMockAgent(t, baseDir)
+func TestResolveLaunchExternalNotFound(t *testing.T) {
+	supervisor := &Supervisor{baseDir: t.TempDir()}
+	_, _, err := supervisor.resolveLaunch(catalog.LaunchConfig{
+		Mode:    "external",
+		Command: "definitely-not-a-real-binary-ferngeist",
+	})
+	if !errors.Is(err, ErrExecutableNotFound) {
+		t.Fatalf("resolveLaunch() error = %v, want %v", err, ErrExecutableNotFound)
+	}
+}
 
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
+func TestResolveLaunchRejectsUnknownMode(t *testing.T) {
+	supervisor := &Supervisor{baseDir: t.TempDir()}
+	_, _, err := supervisor.resolveLaunch(catalog.LaunchConfig{Mode: "container"})
+	if !errors.Is(err, ErrUnsupportedLaunch) {
+		t.Fatalf("resolveLaunch() error = %v, want %v", err, ErrUnsupportedLaunch)
+	}
+}
 
-	agent := catalog.Agent{
-		ID:          "mock-acp",
-		DisplayName: "Mock ACP",
+func TestFailureSortTime(t *testing.T) {
+	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	created := now.Add(-time.Hour)
+	if got := failureSortTime(FailureSummary{FailedAt: now, CreatedAt: created}); got != now {
+		t.Fatalf("failureSortTime() = %v, want FailedAt", got)
+	}
+	if got := failureSortTime(FailureSummary{CreatedAt: created}); got != created {
+		t.Fatalf("failureSortTime() = %v, want CreatedAt fallback", got)
+	}
+}
+
+func TestFailureSummaryFromRecord(t *testing.T) {
+	now := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	got := failureSummaryFromRecord(storage.RuntimeFailureRecord{
+		RuntimeID:  "rt-1",
+		AgentID:    "mock-acp",
+		AgentName:  "Mock ACP",
+		LastError:  "boom",
+		CreatedAt:  now,
+		FailedAt:   now,
+		LogPreview: `[{"timestamp":"2026-03-25T10:00:00Z","stream":"stderr","message":"line"}]`,
+	})
+	if got.LastError != "boom" || len(got.RecentLogLines) != 1 {
+		t.Fatalf("failureSummaryFromRecord() = %+v", got)
+	}
+
+	empty := failureSummaryFromRecord(storage.RuntimeFailureRecord{RuntimeID: "rt-2"})
+	if empty.RecentLogLines != nil {
+		t.Fatalf("empty LogPreview should yield no log lines, got %+v", empty.RecentLogLines)
+	}
+
+	invalid := failureSummaryFromRecord(storage.RuntimeFailureRecord{RuntimeID: "rt-3", LogPreview: "not json"})
+	if len(invalid.RecentLogLines) != 1 || !strings.Contains(invalid.RecentLogLines[0].Message, "decode") {
+		t.Fatalf("invalid LogPreview = %+v", invalid.RecentLogLines)
+	}
+}
+
+// --- Optional installed-agent smoke test ---
+
+func TestOptionalInstalledOpenCodeACPSmoke(t *testing.T) {
+	if os.Getenv("FERNGEIST_RUN_REAL_AGENT_TESTS") != "1" {
+		t.Skip("set FERNGEIST_RUN_REAL_AGENT_TESTS=1 to run installed-agent smoke tests")
+	}
+	if _, err := exec.LookPath("opencode"); err != nil {
+		t.Skip("opencode is not installed on PATH")
+	}
+
+	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(), nil, nil)
+	proc, err := supervisor.Launch(catalog.Agent{
+		ID:          "opencode",
+		DisplayName: "OpenCode",
 		Detected:    true,
 		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
 		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", mockAgentBinaryName()),
+			Mode:    "external",
+			Command: "opencode",
+			Args:    []string{"acp"},
 		},
-	}
-
-	rt, err := supervisor.Start(agent)
+	}, nil)
 	if err != nil {
-		t.Fatalf("Start() error = %v", err)
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer func() { _ = proc.Stop(2 * time.Second) }()
+
+	request := "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"capabilities\":{},\"clientInfo\":{\"name\":\"ferngeist-smoke\",\"version\":\"dev\"}}}\n"
+	if _, err := io.WriteString(proc.Stdin, request); err != nil {
+		t.Fatalf("WriteString() error = %v", err)
 	}
 
-	pipes, err := supervisor.AcquireLease(rt.ID, "legacy")
-	if err != nil {
-		t.Fatalf("AcquireLease() error = %v", err)
+	type result struct {
+		line string
+		err  error
 	}
-
-	_, err = supervisor.StopByRuntimeID(rt.ID)
-	if err != nil {
-		t.Fatalf("StopByRuntimeID() error = %v", err)
-	}
-
-	if err := pipes.Release(); err != nil {
-		t.Fatalf("Release() error = %v", err)
-	}
-}
-
-func TestHandleProcessExitCircuitOpenBlock(t *testing.T) { // TestHandleProcessExitCircuitOpenBlock verifies that a repeatedly-failing runtime opens the circuit breaker and enters StatusFailed with CircuitOpen.
-	baseDir := t.TempDir()
-	binDir := filepath.Join(baseDir, "bin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll() error = %v", err)
-	}
-
-	flakySource := filepath.Join(baseDir, "circuit-source.go")
-	source := `package main
-import ("time")
-func main() { time.Sleep(50 * time.Millisecond); panic("boom") }`
-	if err := os.WriteFile(flakySource, []byte(source), 0o644); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
-	outputPath := filepath.Join(binDir, namedBinary("circuit-agent"))
-	build := exec.Command("go", "build", "-o", outputPath, flakySource)
-	build.Stdout = os.Stdout
-	build.Stderr = os.Stderr
-	if err := build.Run(); err != nil {
-		t.Fatalf("go build circuit agent error = %v", err)
-	}
-
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), baseDir, nil, nil)
-	supervisor.now = func() time.Time { return time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC) }
-
-	rt, err := supervisor.Start(catalog.Agent{
-		ID:          "circuit-test",
-		DisplayName: "Circuit Test",
-		Detected:    true,
-		Security:    catalog.SecurityConfig{AllowsRemoteStart: true},
-		Launch: catalog.LaunchConfig{
-			Mode:    "process",
-			Command: filepath.Join("bin", namedBinary("circuit-agent")),
-			Restart: catalog.RestartConfig{
-				Mode:           "on_failure",
-				MaxRetries:     1,
-				BackoffSeconds: 0,
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = supervisor.StopByRuntimeID(rt.ID)
-	})
-
-	gotCircuitOpen := false
-	for range 50 {
-		runtimes := supervisor.List()
-		for _, r := range runtimes {
-			if r.ID == rt.ID && r.CircuitOpen {
-				gotCircuitOpen = true
-				break
-			}
+	done := make(chan result, 1)
+	go func() {
+		scanner := bufio.NewScanner(proc.Stdout)
+		if scanner.Scan() {
+			done <- result{line: scanner.Text()}
+			return
 		}
-		if gotCircuitOpen {
-			break
+		done <- result{err: scanner.Err()}
+	}()
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("scanner error = %v", res.err)
 		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if !gotCircuitOpen {
-		t.Fatal("expected circuit to open after exceeding max retries")
-	}
-}
-
-// --- Lease edge cases (empty IDs) ---
-
-func TestAcquireLeaseEmptyRuntimeID(t *testing.T) { // TestAcquireLeaseEmptyRuntimeID verifies that AcquireLease returns ErrRuntimeNotFound for an empty runtime ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	_, err := supervisor.AcquireLease("", "test")
-	if err != ErrRuntimeNotFound {
-		t.Fatalf("AcquireLease(\"\") error = %v, want %v", err, ErrRuntimeNotFound)
+		if strings.TrimSpace(res.line) == "" {
+			t.Fatal("expected non-empty ACP response line from installed opencode")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for ACP response from installed opencode")
 	}
 }
 
-func TestReleaseLeaseEmptyRuntimeID(t *testing.T) { // TestReleaseLeaseEmptyRuntimeID verifies that ReleaseLease returns ErrRuntimeNotFound for an empty runtime ID.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	err := supervisor.ReleaseLease("", "test")
-	if err != ErrRuntimeNotFound {
-		t.Fatalf("ReleaseLease(\"\") error = %v, want %v", err, ErrRuntimeNotFound)
-	}
-}
-
-func TestStartDoesNotPanicWithEmptyAgent(t *testing.T) { // TestStartDoesNotPanicWithEmptyAgent verifies that Start returns an error (not a panic) for a zero-value agent.
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-
-	_, err := supervisor.Start(catalog.Agent{})
-	if err == nil {
-		t.Fatal("expected error for empty agent")
-	}
-}
+// --- Test helpers ---
 
 func buildMockAgent(t *testing.T, baseDir string) {
 	t.Helper()
@@ -2530,22 +1047,4 @@ func namedBinary(name string) string {
 		return name + ".exe"
 	}
 	return name
-}
-
-// TestStartIgnoresRuntimeWithoutProcessHandle verifies Start does not hand back
-// a runtime that has no process (e.g. waiting out a restart backoff): reusing it
-// would give the caller a runtime that cannot be leased.
-func TestStartIgnoresRuntimeWithoutProcessHandle(t *testing.T) {
-	supervisor := NewSupervisor(slog.New(slog.NewTextHandler(io.Discard, nil)), ".", nil, nil)
-	supervisor.runtimes["rt-backoff"] = Runtime{
-		ID: "rt-backoff", AgentID: "agent-x", AgentName: "Agent X",
-		Status: StatusStarting, CreatedAt: time.Now(),
-	}
-	supervisor.addRuntimeByAgentLocked("agent-x", "rt-backoff")
-
-	// The undetected agent makes the fall-through to a fresh launch fail fast.
-	rt, err := supervisor.Start(catalog.Agent{ID: "agent-x"})
-	if !errors.Is(err, ErrAgentNotDetected) {
-		t.Fatalf("Start() = %+v, %v; want ErrAgentNotDetected (no reuse of handle-less runtime)", rt, err)
-	}
 }

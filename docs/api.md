@@ -118,36 +118,50 @@ Base path: `/v1`
 
 ### Agent control
 
-- `POST /v1/agents/{agentId}/start`
-  - Starts the selected agent runtime.
+- `POST /v1/agents/{agentId}/connect`
+  - Starts the agent and creates the resilient gateway session that owns its
+    process, then returns the WebSocket connection details. **Connecting starts
+    the agent** — there is no separate start step, and every call launches a
+    fresh agent process (a new runtime), so opening an independent chat for the
+    same agent is just another connect.
   - Requires `control` scope.
-  - Optional JSON request body:
+  - Response:
     ```json
     {
-      "new": true
+      "runtimeId": "string",
+      "protocol": "string",
+      "scheme": "string",
+      "host": "string",
+      "websocketUrl": "string",
+      "websocketPath": "string",
+      "sessionId": "string",
+      "attachToken": "string"
     }
     ```
-  - When `new` is `true`, the gateway always launches a fresh agent process (a new
-    runtime), bypassing runtime reuse — use this to open an independent chat/session
-    for the agent. When the field is absent or `false`, the gateway keeps the legacy
-    behavior: it reuses an existing unleased runtime for the agent when one is
-    available, and only launches a fresh process when no reusable runtime exists.
+  - The `sessionId` is a **gateway session identifier** (an opaque random string
+    identifying the gateway's session object). It is NOT an ACP agent session ID
+    — that is negotiated between the client and agent during ACP initialization
+    and is unrelated to this field. Store it for reconnection.
   - Error responses:
     - `404` — agent not found
-    - `409` — agent detected but launch mode unsupported, or remote start not allowed
+    - `409` — agent detected but launch mode unsupported, remote start not
+      allowed, or the device's session limit is reached
     - `424` — agent executable not found (auto-install failed/unavailable)
+    - `503` — session service not available
 
 - `POST /v1/agents/{agentId}/stop`
-  - Stops **all** runtimes for the selected agent and revokes each one's gateway token.
+  - Stops the agent: every gateway session for the agent is closed and its agent
+    process stopped. Reports the newest stopped runtime.
   - Requires `control` scope.
   - Error responses:
-    - `404` — agent has no runtimes (none are tracked for this agent)
+    - `404` — agent has no live session/runtime
+    - `503` — session service not available
 
 ### Custom agents
 
 Paired clients can register their own ACP agents (display name + command +
 args). Custom agents appear in `GET /v1/agents` with `"source": "custom"` and
-start/stop through the same `POST /v1/agents/{agentId}/start` /
+connect/stop through the same `POST /v1/agents/{agentId}/connect` /
 `POST /v1/agents/{agentId}/stop` endpoints as catalog agents.
 
 > **Trusted devices only.** These endpoints execute host programs, and pairing
@@ -220,30 +234,25 @@ through the CLI: `ferngeist-gateway agents add|list|update|rm`
   - Returns buffered logs for a runtime.
   - Requires `read` scope.
 
-- `POST /v1/runtimes/{runtimeId}/connect`
-  - Creates a gateway session and returns the WebSocket connection details for ACP traffic.
-  - Requires `control` scope.
-  - Response:
-    ```json
-    {
-      "runtimeId": "string",
-      "protocol": "string",
-      "scheme": "string",
-      "host": "string",
-      "websocketUrl": "string",
-      "websocketPath": "string",
-      "sessionId": "string",
-      "attachToken": "string"
-    }
-    ```
-  - Creates a persistent gateway session with push notification support. The `sessionId` and `attachToken` fields are populated. The client should store `sessionId` for reconnection.
-  - The `sessionId` is a **gateway session identifier** (an opaque random string that identifies the gateway's internal session object). It is NOT an ACP agent session ID — that is negotiated between the client and agent during ACP initialization and is unrelated to this field.
-  - Session creation is best-effort. If it fails, the response still contains a valid connection descriptor (the `sessionId`/`attachToken` fields are simply empty).
-
 - `POST /v1/runtimes/{runtimeId}/restart`
-  - Restarts a runtime, optionally with environment overrides.
+  - Restarts the agent behind a runtime: the gateway session owning the runtime
+    is closed (its agent process stopped) and a fresh agent process + session are
+    created, mirroring `POST /v1/agents/{agentId}/connect`.
   - Requires `control` scope.
-  - Runtime restart with environment overrides may be disabled by configuration.
+  - Optional JSON request body with environment overrides:
+    ```json
+    { "env": { "KEY": "value" } }
+    ```
+    Passing `env` requires the `gateway.runtime.restart_env` scope, granted only
+    when runtime restart with environment overrides is enabled by configuration.
+  - Response: the connect response shape (`runtimeId`, `protocol`, `scheme`,
+    `host`, `websocketUrl`, `websocketPath`, `sessionId`, `attachToken`) for the
+    **new** runtime and session. `runtimeId` differs from the one restarted.
+  - Error responses:
+    - `404` — runtime not found
+    - `409` — runtime is not running, or it has no session to restart
+    - `424` — agent executable not found (auto-install failed/unavailable)
+    - `503` — session service not available
 
 ### Workspace browsing
 
@@ -454,15 +463,14 @@ clean. Worktrees outlive the chats that use them: they are removed only on an ex
 
 ### Gateway sessions
 
-> **Terminology note:** A "gateway session" is a gateway-internal object that keeps a runtime alive across WebSocket disconnections. It manages a stdio pump (for agent stdout), an exclusive pipe lease, and push notification dispatch on notable events. It is not an ACP agent session — ACP agent sessions are negotiated between the client and agent during protocol initialization and are not tracked by this API.
+> **Terminology note:** A "gateway session" is a gateway-internal object that owns an agent process and keeps it alive across WebSocket disconnections. It runs the stdio pump (for agent stdout) and dispatches push notifications on notable events. Connecting starts the agent, so a gateway session and its runtime are 1:1: `POST /v1/agents/{agentId}/connect` both launches the process and creates the session. It is not an ACP agent session — ACP agent sessions are negotiated between the client and agent during protocol initialization and are not tracked by this API.
 
 > **Multi-session per agent:** A device may hold multiple gateway sessions for the
 > same agent concurrently — one per runtime/process — so a background chat (agent
 > mid-turn, client disconnected) can coexist with a foreground chat against a
-> separate process of the same agent. The per-device session limit
+> separate process of the same agent. Every `POST /v1/agents/{agentId}/connect`
+> launches a new process and session; the per-device session limit
 > (`MaxSessionsPerDevice`, default 5) is the parallelism ceiling across all agents.
-> Opening `POST /v1/runtimes/{runtimeId}/connect` against an already-connected
-> runtime resumes that runtime's session rather than starting a second one.
 
 - `POST /v1/sessions/{sessionId}/resume`
   - Prepares a disconnected gateway session for WebSocket reconnection.
@@ -500,7 +508,7 @@ clean. Worktrees outlive the chats that use them: they are removed only on an ex
   - Status values: `active`, `disconnected`, `closing`, `failed`
 
 - `DELETE /v1/sessions/{sessionId}`
-  - Closes a gateway session. Stops the backing runtime, releases the pipe lease, and deletes all session data.
+  - Closes a gateway session. Stops the agent process it owns and deletes all session data.
   - Authenticated with the device credential (bearer token).
   - Response: `204 No Content`
   - Error responses:
@@ -596,7 +604,7 @@ prompt runs, and always fire on each tool call that completes or fails.
 
 - `GET /v1/acp/{runtimeId}`
   - WebSocket endpoint for ACP traffic.
-  - Pass `?sessionId=<id>&attachToken=<token>` as query params. The session ID and initial attach token are obtained from `POST /v1/runtimes/{id}/connect`. For reconnects, a fresh attach token is obtained from `POST /v1/sessions/{id}/resume`.
+  - Pass `?sessionId=<id>&attachToken=<token>` as query params. The session ID and initial attach token are obtained from `POST /v1/agents/{id}/connect`. For reconnects, a fresh attach token is obtained from `POST /v1/sessions/{id}/resume`.
   - On reconnect, the client is responsible for calling the ACP `session/load` method for context restoration. If the agent rejects that load as already loaded (common when the agent process still holds the session), the gateway takes the restore over itself — see the `_ferngeist/resumed` signal below — substituting the `session/update` frames it buffered since taking over the session and answering the `session/load` itself, so the client still receives the transcript instead of hanging. Only `session/update` notifications are buffered — never live requests such as permission prompts — and the buffer is bounded (8 MiB per session), trimmed from the oldest end to a turn boundary.
   - When the gateway restores a session itself, it says so before sending any of the replay. The first frame the client receives is an ACP extension notification:
     ```json
@@ -609,7 +617,7 @@ prompt runs, and always fire on each tool call that completes or fails.
 
 Attach tokens are single-use, short-lived (5-minute TTL) nonces used to prove ownership of a gateway session at WebSocket connect time. They are:
 
-- Minted on gateway session creation (`POST /v1/runtimes/{id}/connect`)
+- Minted on gateway session creation (`POST /v1/agents/{id}/connect`)
 - Minted on gateway session resume (`POST /v1/sessions/{id}/resume`)
 - Consumed on first WebSocket connect (`GET /v1/acp/{runtimeId}?sessionId=&attachToken=`)
 - 64 hex characters (32 random bytes)
@@ -699,7 +707,7 @@ The ACP WebSocket endpoint is the primary transport for agent traffic.
 **Resilient gateway session flow (disconnect-tolerant):**
 
 1. Pair a device.
-2. `POST /v1/runtimes/{id}/connect` — get `sessionId`, `attachToken`, and connection details.
+2. `POST /v1/agents/{id}/connect` — get `sessionId`, `attachToken`, and connection details.
 3. `GET /v1/acp/{runtimeId}?sessionId=<id>&attachToken=<token>` — WebSocket connect.
 4. Exchange ACP messages. Disconnect does NOT kill the runtime; the gateway session stays `disconnected`. The gateway sends Web Push notifications on notable events (turn complete, permission or input request, agent error, agent crash) regardless of whether a client is attached — the client suppresses them in the foreground and posts them when backgrounded or killed (see [Push notification registration](#push-notification-registration)).
 5. Register the push token: `POST /v1/devices/push-token` (authenticated with device credential).

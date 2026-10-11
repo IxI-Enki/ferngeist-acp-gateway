@@ -258,17 +258,12 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 			logger.Warn("remote access shutdown", slog.String("error", err.Error()))
 		}
 	}
-	// Stop the session service first (reaper, inbound diagnostic writer, and all
-	// session pumps) while the backing runtimes are still alive, then stop the
-	// runtimes. Skipping this leaks the reaper and inbound-writer goroutines.
+	// Stop the session service (reaper, inbound diagnostic writer, and all
+	// session pumps), which also stops every agent process it owns.
 	sessionSvc.Shutdown()
-	var runtimeErr error
-	if err := runtimeSvc.Shutdown(shutdownCtx); err != nil {
-		runtimeErr = fmt.Errorf("runtime shutdown failed: %w", err)
-	}
 
 	logger.Info("gateway daemon stopped")
-	return errors.Join(serveErr, shutdownErr, runtimeErr)
+	return errors.Join(serveErr, shutdownErr)
 }
 
 // portOf extracts the TCP port from a listen address like "127.0.0.1:5788".

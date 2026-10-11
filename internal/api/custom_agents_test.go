@@ -254,6 +254,7 @@ func TestCustomAgentCapReached(t *testing.T) {
 
 func TestCustomAgentDeleteBlockedWhileRunning(t *testing.T) {
 	server, store := newCustomTestServer(t)
+	attachTestSessionService(t, server)
 	token := pairDevice(t, server)
 
 	binaryPath := filepath.Join(t.TempDir(), namedBinary("custom-mock-agent"))
@@ -271,9 +272,9 @@ func TestCustomAgentDeleteBlockedWhileRunning(t *testing.T) {
 		t.Fatalf("Unmarshal(create) error = %v", err)
 	}
 
-	startRecorder := doCustomAgentRequest(t, server, token, http.MethodPost, "/v1/agents/"+created.ID+"/start", "")
+	startRecorder := doCustomAgentRequest(t, server, token, http.MethodPost, "/v1/agents/"+created.ID+"/connect", "")
 	if startRecorder.Code != http.StatusOK {
-		t.Fatalf("start status = %d, body %s", startRecorder.Code, startRecorder.Body.String())
+		t.Fatalf("connect status = %d, body %s", startRecorder.Code, startRecorder.Body.String())
 	}
 	t.Cleanup(func() {
 		doCustomAgentRequest(t, server, token, http.MethodPost, "/v1/agents/"+created.ID+"/stop", "")

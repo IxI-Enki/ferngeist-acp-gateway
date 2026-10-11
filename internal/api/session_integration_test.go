@@ -1,13 +1,13 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -73,6 +73,7 @@ type resilientTestHarness struct {
 }
 
 type connectResilientResponse struct {
+	RuntimeID   string `json:"runtimeId"`
 	SessionID   string `json:"sessionId"`
 	AttachToken string `json:"attachToken"`
 }
@@ -101,54 +102,32 @@ func newResilientTestHarness(t *testing.T) *resilientTestHarness {
 		GatewayID:       testGatewayID,
 	})
 	server.sessionSvc = sessionSvc
+	// Shutdown stops every agent process the service launched, so the process is
+	// guaranteed dead before the harness temp dir is removed.
 	t.Cleanup(sessionSvc.Shutdown)
 
 	bearerToken := pairDevice(t, server)
-
-	startReq := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/start", nil)
-	startReq.Header.Set("Authorization", "Bearer "+bearerToken)
-	startRec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(startRec, startReq)
-	if startRec.Code != http.StatusOK {
-		t.Fatalf("agent start status = %d, body=%s", startRec.Code, startRec.Body.String())
-	}
-	var startResp runtimeStartResponse
-	if err := json.Unmarshal(startRec.Body.Bytes(), &startResp); err != nil {
-		t.Fatalf("Unmarshal(start) error = %v", err)
-	}
-
-	// Stop the agent runtime directly and synchronously so the process is
-	// guaranteed dead before t.TempDir() removal runs. An HTTP stop request
-	// would be fire-and-forget here and could leave the mock agent (whose
-	// working directory is the temp dir) alive long enough for RemoveAll to
-	// fail with "directory not empty" on a loaded CI runner.
-	t.Cleanup(func() {
-		if _, err := server.runtime.StopByRuntimeID(startResp.Runtime.ID); err != nil {
-			t.Logf("cleanup stop runtime: %v", err)
-		}
-	})
 
 	httpSrv := httptest.NewServer(server.Handler())
 	t.Cleanup(httpSrv.Close)
 
 	return &resilientTestHarness{
-		t:         t,
-		server:    server,
-		store:     store,
-		token:     bearerToken,
-		runtimeID: startResp.Runtime.ID,
-		pushSvc:   mockPush,
-		httpSrv:   httpSrv,
+		t:       t,
+		server:  server,
+		store:   store,
+		token:   bearerToken,
+		pushSvc: mockPush,
+		httpSrv: httpSrv,
 	}
 }
 
+// connectResilient starts the mock agent and creates its resilient session in
+// one step, recording the session's runtime id for the WebSocket path.
 func (h *resilientTestHarness) connectResilient() connectResilientResponse {
 	h.t.Helper()
 
-	body, _ := json.Marshal(map[string]string{"sessionMode": "resilient"})
-	req := httptest.NewRequest(http.MethodPost, "/v1/runtimes/"+h.runtimeID+"/connect", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/v1/agents/mock-acp/connect", nil)
 	req.Header.Set("Authorization", "Bearer "+h.token)
-	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	h.server.Handler().ServeHTTP(rec, req)
 
@@ -160,6 +139,7 @@ func (h *resilientTestHarness) connectResilient() connectResilientResponse {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		h.t.Fatalf("Unmarshal(connect) error = %v", err)
 	}
+	h.runtimeID = resp.RuntimeID
 	return resp
 }
 
@@ -516,15 +496,15 @@ func TestResilientSession_ConcurrentAttachTakesOver(t *testing.T) {
 	}
 }
 
-// When the app is killed and reconnects, it re-runs the connect flow against the
-// still-running runtime. The gateway must hand back the existing session (the
-// runtime lease is still held, so creating a new one would fail and strand the
-// client without session credentials) and the client must be able to attach.
-func TestResilientSession_ReconnectReusesExistingSession(t *testing.T) {
+// Connecting always launches a fresh agent and session: the runtime lease that
+// used to make a second connect reuse the first session is gone. The client
+// reconnects to an existing session via resume, so a re-connect must produce
+// distinct credentials while leaving the original session reconnectable.
+func TestResilientSession_ConnectLaunchesIndependentSessions(t *testing.T) {
 	h := newResilientTestHarness(t)
 
 	first := h.connectResilient()
-	if first.SessionID == "" || first.AttachToken == "" {
+	if first.SessionID == "" || first.AttachToken == "" || first.RuntimeID == "" {
 		t.Fatalf("first connect returned empty session credentials: %+v", first)
 	}
 
@@ -535,19 +515,22 @@ func TestResilientSession_ReconnectReusesExistingSession(t *testing.T) {
 	// without going through a graceful shutdown.
 	_ = conn1.CloseNow()
 
-	// Reconnect path: connect again against the same runtime.
+	// Connecting again starts a new agent rather than reusing the first session.
 	second := h.connectResilient()
-	if second.SessionID != first.SessionID {
-		t.Fatalf("reconnect should reuse session %q, got %q", first.SessionID, second.SessionID)
+	if second.SessionID == first.SessionID {
+		t.Fatalf("connect should create a new session, both = %q", first.SessionID)
+	}
+	if second.RuntimeID == first.RuntimeID {
+		t.Fatalf("connect should create a new runtime, both = %q", first.RuntimeID)
 	}
 	if second.AttachToken == "" {
-		t.Fatal("reconnect returned an empty attach token")
+		t.Fatal("second connect returned an empty attach token")
 	}
 
-	conn2 := h.dialSessionWS(second.SessionID, second.AttachToken)
-	defer func() { _ = conn2.CloseNow() }()
-	sendWSMessage(t, conn2, `{"jsonrpc":"2.0","id":"2","method":"authenticate","params":{}}`)
-	assertResult(t, readWSMessage(t, conn2), "2")
+	// The first session is untouched and still reconnectable via resume.
+	if token := h.resumeSession(first.SessionID); len(token) != 64 {
+		t.Fatalf("resume attach token = %q, want 64-char hex string", token)
+	}
 }
 
 func TestResilientSession_AgentDeathDuringSession(t *testing.T) {
@@ -561,8 +544,19 @@ func TestResilientSession_AgentDeathDuringSession(t *testing.T) {
 	msg := readWSMessage(t, conn)
 	assertResult(t, msg, "1")
 
-	if _, err := h.server.runtime.StopByRuntimeID(h.runtimeID); err != nil {
-		t.Fatalf("StopByRuntimeID() error = %v", err)
+	// Simulate the agent dying on its own: kill the process out from under the
+	// gateway. The session's exit watcher reclaims the session and fires the
+	// crash push.
+	info, err := h.server.runtime.Get(connectResp.RuntimeID)
+	if err != nil {
+		t.Fatalf("runtime.Get() error = %v", err)
+	}
+	proc, err := os.FindProcess(info.PID)
+	if err != nil {
+		t.Fatalf("os.FindProcess(%d) error = %v", info.PID, err)
+	}
+	if err := proc.Kill(); err != nil {
+		t.Fatalf("Kill() error = %v", err)
 	}
 
 	waitForSessionDeleted(t, h.store, connectResp.SessionID, 5*time.Second)

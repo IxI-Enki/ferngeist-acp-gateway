@@ -52,7 +52,7 @@ func TestPumpDrainNotBlockedBySlowClient(t *testing.T) {
 	r, w := io.Pipe()
 	defer w.Close()
 	pump := &StdioPump{
-		pipes: &runtime.LeasedPipes{
+		proc: &runtime.Process{
 			Stdin:  nopWriteCloser{},
 			Stdout: r,
 		},

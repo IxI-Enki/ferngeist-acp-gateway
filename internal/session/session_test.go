@@ -3,7 +3,6 @@ package session
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,91 +14,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arafatamim/ferngeist-acp-gateway/internal/catalog"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/push"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/runtime"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
 	"github.com/coder/websocket"
 )
-
-// mockProcessManager implements ProcessManager for testing.
-type mockProcessManager struct {
-	mu            sync.Mutex
-	leases        map[string]string
-	exitCallbacks map[string]func(string, bool)
-	stopped       map[string]bool
-	logs          []string
-}
-
-func newMockPM() *mockProcessManager {
-	return &mockProcessManager{
-		leases:        make(map[string]string),
-		exitCallbacks: make(map[string]func(string, bool)),
-		stopped:       make(map[string]bool),
-	}
-}
-
-func (m *mockProcessManager) AcquireLease(runtimeID, leaseholder string) (runtime.Pipes, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if existing, ok := m.leases[runtimeID]; ok && existing != "" {
-		return nil, ErrRuntimeLeaseHeld
-	}
-	m.leases[runtimeID] = leaseholder
-	return &runtime.LeasedPipes{
-		Stdin:     nopWriteCloser{},
-		Stdout:    io.NopCloser(strings.NewReader("")),
-		RuntimeID: runtimeID,
-	}, nil
-}
-
-func (m *mockProcessManager) ReleaseLease(runtimeID, leaseholder string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if existing, ok := m.leases[runtimeID]; !ok || existing != leaseholder {
-		return ErrRuntimeLeaseHeld
-	}
-	m.leases[runtimeID] = ""
-	return nil
-}
-
-func (m *mockProcessManager) OnProcessExit(runtimeID string, callback func(string, bool)) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.exitCallbacks[runtimeID] = callback
-}
-
-func (m *mockProcessManager) StopByRuntimeID(runtimeID string) (runtime.Runtime, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.stopped[runtimeID] = true
-	return runtime.Runtime{}, nil
-}
-
-func (m *mockProcessManager) AppendLog(runtimeID, stream, message string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.logs = append(m.logs, runtimeID+"/"+stream+": "+message)
-}
-
-// triggerExit simulates the agent dying on its own (a crash).
-func (m *mockProcessManager) triggerExit(runtimeID string) {
-	m.mu.Lock()
-	cb, ok := m.exitCallbacks[runtimeID]
-	m.mu.Unlock()
-	if ok {
-		cb(runtimeID, false)
-	}
-}
-
-// triggerIntentionalExit simulates a stop or restart reported by the supervisor.
-func (m *mockProcessManager) triggerIntentionalExit(runtimeID string) {
-	m.mu.Lock()
-	cb, ok := m.exitCallbacks[runtimeID]
-	m.mu.Unlock()
-	if ok {
-		cb(runtimeID, true)
-	}
-}
 
 // recordingPushService captures Notify calls for assertions. Notify is invoked
 // asynchronously by the session, so reads poll via waitForPushCount.
@@ -139,31 +59,53 @@ func waitForPushCount(t *testing.T, r *recordingPushService, want int) {
 	t.Fatalf("expected >= %d push calls, got %d", want, r.count())
 }
 
-func setupPushTest(t *testing.T) (*RuntimeSession, *mockProcessManager, *recordingPushService) {
+// assertProcessRunning fails if the session's real agent process has already
+// exited. Replaces the old mock's "runtime was stopped" bookkeeping.
+func assertProcessRunning(t *testing.T, sess *Session) {
+	t.Helper()
+	select {
+	case <-sess.proc.Done():
+		t.Error("expected agent process to still be running")
+	default:
+	}
+}
+
+// waitProcessStopped waits (bounded) for the session's real agent process to
+// exit, the observable equivalent of the old mock's stopped flag.
+func waitProcessStopped(t *testing.T, sess *Session) {
+	t.Helper()
+	select {
+	case <-sess.proc.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("expected agent process to have stopped")
+	}
+}
+
+func setupPushTest(t *testing.T) (*RuntimeSession, catalog.Agent, *recordingPushService) {
 	t.Helper()
 	store, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
-	mockPM := newMockPM()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	pushSvc := &recordingPushService{}
-	rs := NewRuntimeSession(slog.New(slog.NewTextHandler(io.Discard, nil)), store, mockPM, NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil))), Config{
+	rs := NewRuntimeSession(logger, store, runtime.NewSupervisor(logger, t.TempDir(), nil, nil), NewTokenService(logger), Config{
 		MaxDisconnected: 5 * time.Minute,
 		GatewayID:       "gw-1",
 		PushSvc:         pushSvc,
 	})
 	t.Cleanup(rs.Shutdown)
-	return rs, mockPM, pushSvc
+	return rs, mockAgent(t), pushSvc
 }
 
 // TestProcessExitCrashSendsPush verifies a genuine, unexpected process exit
 // delivers an agent-crash push and marks the session failed.
 func TestProcessExitCrashSendsPush(t *testing.T) {
-	rs, mockPM, pushSvc := setupPushTest(t)
+	rs, agent, pushSvc := setupPushTest(t)
 	ctx := context.Background()
 
-	sess, _, err := rs.Create(ctx, "rt-crash", "dev-crash", "agent-crash")
+	sess, _, err := rs.Create(ctx, agent, "dev-crash", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -178,7 +120,7 @@ func TestProcessExitCrashSendsPush(t *testing.T) {
 	sess.pump.acp.mu.Unlock()
 
 	// Agent dies on its own while the session is active — a genuine crash.
-	mockPM.triggerExit("rt-crash")
+	_ = sess.proc.Cmd.Process.Kill()
 
 	waitForPushCount(t, pushSvc, 1)
 	n := pushSvc.last()
@@ -189,40 +131,10 @@ func TestProcessExitCrashSendsPush(t *testing.T) {
 		t.Errorf("notification = %+v, want sessionID=%q serverID=gw-1 cwd=/work/repo", n, acpID)
 	}
 	// A genuine crash fully reclaims the session: it is removed from the registry
-	// (so its dead runtime lease and per-device quota slot are freed) rather than
+	// (so its dead runtime and per-device quota slot are freed) rather than
 	// lingering as a "failed" record.
 	if _, err := rs.GetSessionStatus(sess.ID); err != ErrSessionNotFound {
 		t.Errorf("expected crashed session to be reclaimed (ErrSessionNotFound), got %v", err)
-	}
-}
-
-// TestProcessExitCrashReleasesLease verifies a crash frees the runtime's exclusive
-// lease so a fresh session can be created on the same runtime — the regression that
-// otherwise leaves the runtime permanently un-leasable (ErrRuntimeLeaseHeld) and
-// forces the gateway to hand the client a session-less connect descriptor.
-func TestProcessExitCrashReleasesLease(t *testing.T) {
-	rs, mockPM, _ := setupPushTest(t)
-	ctx := context.Background()
-
-	sess, _, err := rs.Create(ctx, "rt-release", "dev-release", "agent-release")
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	// Same runtime cannot host a second session while the first holds the lease.
-	if _, _, err := rs.Create(ctx, "rt-release", "dev-release-2", "agent-x"); !errors.Is(err, ErrRuntimeLeaseHeld) {
-		t.Fatalf("expected ErrRuntimeLeaseHeld before crash, got %v", err)
-	}
-
-	// Agent crashes; the lease must be released as part of reclamation.
-	mockPM.triggerExit("rt-release")
-	if _, err := rs.GetSessionStatus(sess.ID); err != ErrSessionNotFound {
-		t.Fatalf("expected reclaimed session, got %v", err)
-	}
-
-	// A fresh session on the same runtime now succeeds.
-	if _, _, err := rs.Create(ctx, "rt-release", "dev-release", "agent-fresh"); err != nil {
-		t.Fatalf("expected Create on reclaimed runtime to succeed, got %v", err)
 	}
 }
 
@@ -230,15 +142,15 @@ func TestProcessExitCrashReleasesLease(t *testing.T) {
 // teardown (session already StatusClosing, as Close and the reaper set it before
 // stopping the runtime) does not deliver a false crash push or clobber the status.
 func TestProcessExitDuringCloseSendsNoCrashPush(t *testing.T) {
-	rs, mockPM, pushSvc := setupPushTest(t)
+	rs, agent, pushSvc := setupPushTest(t)
 	ctx := context.Background()
 
-	sess, _, err := rs.Create(ctx, "rt-close", "dev-close", "agent-close")
+	sess, _, err := rs.Create(ctx, agent, "dev-close", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
-	// Mark the session closing, mirroring Close/reaper before StopByRuntimeID.
+	// Mark the session closing, mirroring Close/reaper before stopping the process.
 	rs.mu.Lock()
 	s := rs.sessions[sess.ID]
 	rs.mu.Unlock()
@@ -246,7 +158,7 @@ func TestProcessExitDuringCloseSendsNoCrashPush(t *testing.T) {
 	s.Status = StatusClosing
 	s.mu.Unlock()
 
-	mockPM.triggerExit("rt-close")
+	_ = sess.proc.Cmd.Process.Kill()
 
 	// The guard decision is synchronous, so no push goroutine is spawned; sleep a
 	// little anyway to give any erroneous async push time to land before asserting.
@@ -264,7 +176,7 @@ type nopWriteCloser struct{}
 func (n nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
 func (n nopWriteCloser) Close() error                { return nil }
 
-func setupTest(t *testing.T, overrides Config) (*RuntimeSession, *storage.SQLiteStore, *mockProcessManager, *TokenService, context.Context) {
+func setupTest(t *testing.T, overrides Config) (*RuntimeSession, *storage.SQLiteStore, catalog.Agent, *TokenService, context.Context) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	store, err := storage.Open(dbPath)
@@ -272,8 +184,8 @@ func setupTest(t *testing.T, overrides Config) (*RuntimeSession, *storage.SQLite
 		t.Fatalf("open store: %v", err)
 	}
 	ctx := context.Background()
-	mockPM := newMockPM()
-	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tokenSvc := NewTokenService(logger)
 
 	cfg := Config{
 		MaxDisconnected: 5 * time.Minute,
@@ -289,18 +201,18 @@ func setupTest(t *testing.T, overrides Config) (*RuntimeSession, *storage.SQLite
 		cfg.ReaperInterval = overrides.ReaperInterval
 	}
 
-	rs := NewRuntimeSession(slog.New(slog.NewTextHandler(io.Discard, nil)), store, mockPM, tokenSvc, cfg)
-	return rs, store, mockPM, tokenSvc, ctx
+	rs := NewRuntimeSession(logger, store, runtime.NewSupervisor(logger, t.TempDir(), nil, nil), tokenSvc, cfg)
+	return rs, store, mockAgent(t), tokenSvc, ctx
 }
 
 // --- Session lifecycle ---
 
 func TestCreateReturnsSessionWithID(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, attachToken, err := rs.Create(ctx, "rt-caa", "dev-caa", "agent-caa")
+	sess, attachToken, err := rs.Create(ctx, agent, "dev-caa", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -321,11 +233,11 @@ func TestCreateReturnsSessionWithID(t *testing.T) {
 }
 
 func TestAttachClientWithValidTokenReturnsRuntimeID(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, attachToken, err := rs.Create(ctx, "rt-caa2", "dev-caa2", "agent-caa2")
+	sess, attachToken, err := rs.Create(ctx, agent, "dev-caa2", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -334,8 +246,8 @@ func TestAttachClientWithValidTokenReturnsRuntimeID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AttachClient: %v", err)
 	}
-	if rID != "rt-caa2" {
-		t.Errorf("expected runtimeID rt-caa2, got %s", rID)
+	if rID == "" || rID != sess.RuntimeID {
+		t.Errorf("expected runtimeID %q, got %q", sess.RuntimeID, rID)
 	}
 
 	_, _, err = rs.AttachClient(ctx, sess.ID, attachToken)
@@ -345,16 +257,16 @@ func TestAttachClientWithValidTokenReturnsRuntimeID(t *testing.T) {
 }
 
 func TestCreateSessionLimit(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{MaxPerDevice: 1})
+	rs, store, agent, _, ctx := setupTest(t, Config{MaxPerDevice: 1})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	_, _, err := rs.Create(ctx, "rt-lim-1", "dev-lim", "agent-1")
+	_, _, err := rs.Create(ctx, agent, "dev-lim", nil)
 	if err != nil {
 		t.Fatalf("Create 1: %v", err)
 	}
 
-	_, _, err = rs.Create(ctx, "rt-lim-2", "dev-lim", "agent-2")
+	_, _, err = rs.Create(ctx, agent, "dev-lim", nil)
 	if err != ErrSessionLimitReached {
 		t.Errorf("expected ErrSessionLimitReached, got %v", err)
 	}
@@ -365,7 +277,7 @@ func TestCreateSessionLimit(t *testing.T) {
 // against the per-device limit. Otherwise a device that crashed N agents could never
 // start another session, even with nothing running.
 func TestCreateSessionLimitIgnoresDeadSessions(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{MaxPerDevice: 1})
+	rs, store, agent, _, ctx := setupTest(t, Config{MaxPerDevice: 1})
 	defer rs.Shutdown()
 	defer store.Close()
 
@@ -376,52 +288,48 @@ func TestCreateSessionLimitIgnoresDeadSessions(t *testing.T) {
 		DeviceID:    "dev-quota",
 		AgentID:     "agent-dead",
 		Status:      StatusFailed,
-		Leaseholder: "dead-1",
 		CreatedAt:   time.Now().UTC(),
 	}); err != nil {
 		t.Fatalf("seed failed session: %v", err)
 	}
 
 	// Despite the device being "at" the limit by raw row count, a live session is allowed.
-	if _, _, err := rs.Create(ctx, "rt-live", "dev-quota", "agent-live"); err != nil {
+	if _, _, err := rs.Create(ctx, agent, "dev-quota", nil); err != nil {
 		t.Fatalf("expected Create to ignore the dead record, got %v", err)
 	}
 
 	// A second live session does hit the limit.
-	if _, _, err := rs.Create(ctx, "rt-live-2", "dev-quota", "agent-live-2"); err != ErrSessionLimitReached {
+	if _, _, err := rs.Create(ctx, agent, "dev-quota", nil); err != ErrSessionLimitReached {
 		t.Errorf("expected ErrSessionLimitReached for second live session, got %v", err)
 	}
 }
 
 // TestCreateAllowsSameAgentParallelSessions verifies that two sessions for the
-// same (device, agent) on different runtimes coexist: neither is superseded,
-// neither runtime is stopped, each runtime holds its own lease, and both count
-// toward the per-device quota.
+// same (device, agent) coexist: neither is superseded, both agent processes stay
+// running, and both count toward the per-device quota.
 func TestCreateAllowsSameAgentParallelSessions(t *testing.T) {
-	rs, store, pm, _, ctx := setupTest(t, Config{MaxPerDevice: 5})
+	rs, store, agent, _, ctx := setupTest(t, Config{MaxPerDevice: 5})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	first, _, err := rs.Create(ctx, "rt-a", "dev-par", "agent-x")
+	first, _, err := rs.Create(ctx, agent, "dev-par", nil)
 	if err != nil {
 		t.Fatalf("Create first: %v", err)
 	}
-	second, _, err := rs.Create(ctx, "rt-b", "dev-par", "agent-x")
+	second, _, err := rs.Create(ctx, agent, "dev-par", nil)
 	if err != nil {
 		t.Fatalf("Create second (same agent, different runtime): %v", err)
 	}
 	if first.ID == second.ID {
 		t.Fatal("expected distinct sessions")
 	}
+	if first.RuntimeID == second.RuntimeID {
+		t.Fatal("expected each Create to launch its own runtime")
+	}
 
-	// Both live; neither runtime was stopped.
-	if pm.stopped["rt-a"] || pm.stopped["rt-b"] {
-		t.Errorf("no runtime should be stopped on Create; stopped=%v", pm.stopped)
-	}
-	if pm.leases["rt-a"] != first.ID || pm.leases["rt-b"] != second.ID {
-		t.Errorf("leases not held by their sessions: rt-a=%q rt-b=%q",
-			pm.leases["rt-a"], pm.leases["rt-b"])
-	}
+	// Both live; neither agent process was stopped by Create.
+	assertProcessRunning(t, first)
+	assertProcessRunning(t, second)
 
 	records, err := store.ListSessionsByDevice(ctx, "dev-par")
 	if err != nil {
@@ -442,51 +350,32 @@ func TestCreateAllowsSameAgentParallelSessions(t *testing.T) {
 // to the same agent: a live session for a different agent on the same device is
 // left intact (and so still counts toward the per-device quota).
 func TestCreateDoesNotSupersedeDifferentAgent(t *testing.T) {
-	rs, store, pm, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	first, _, err := rs.Create(ctx, "rt-a", "dev-multi", "agent-a")
+	first, _, err := rs.Create(ctx, agent, "dev-multi", nil)
 	if err != nil {
 		t.Fatalf("Create first: %v", err)
 	}
 
-	if _, _, err := rs.Create(ctx, "rt-b", "dev-multi", "agent-b"); err != nil {
+	if _, _, err := rs.Create(ctx, agent, "dev-multi", nil); err != nil {
 		t.Fatalf("Create second (different agent): %v", err)
 	}
 
-	// The first agent's session and runtime are untouched.
-	if pm.stopped["rt-a"] {
-		t.Error("different-agent session must not be superseded (rt-a was stopped)")
-	}
+	// The first agent's session and process are untouched.
+	assertProcessRunning(t, first)
 	if _, err := store.GetSession(ctx, first.ID); err != nil {
 		t.Errorf("expected first session to survive, got %v", err)
 	}
 }
 
-func TestCreateDuplicateRuntime(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
-	defer rs.Shutdown()
-	defer store.Close()
-
-	runtimeID := "rt-dup"
-	_, _, err := rs.Create(ctx, runtimeID, "dev-dup", "agent-dup")
-	if err != nil {
-		t.Fatalf("Create 1: %v", err)
-	}
-
-	_, _, err = rs.Create(ctx, runtimeID, "dev-dup-2", "agent-dup-2")
-	if !errors.Is(err, ErrRuntimeLeaseHeld) {
-		t.Fatalf("expected ErrRuntimeLeaseHeld, got %v", err)
-	}
-}
-
 func TestResumeDeviceMismatch(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-rdm", "dev-a", "agent-a")
+	sess, _, err := rs.Create(ctx, agent, "dev-a", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -520,11 +409,11 @@ func TestAttachClientInvalidToken(t *testing.T) {
 }
 
 func TestAttachClientSecondAttachTakesOver(t *testing.T) {
-	rs, store, _, tokenSvc, ctx := setupTest(t, Config{})
+	rs, store, agent, tokenSvc, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, token1, err := rs.Create(ctx, "rt-cc", "dev-cc", "agent-cc")
+	sess, token1, err := rs.Create(ctx, agent, "dev-cc", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -575,11 +464,11 @@ func TestAttachClientSessionNotFound(t *testing.T) {
 }
 
 func TestDetachClientSetsStatusDisconnected(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, token, err := rs.Create(ctx, "rt-dar", "dev-dar", "agent-dar")
+	sess, token, err := rs.Create(ctx, agent, "dev-dar", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -603,11 +492,11 @@ func TestDetachClientSetsStatusDisconnected(t *testing.T) {
 }
 
 func TestAttachClientAfterDetachResumesSession(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, token, err := rs.Create(ctx, "rt-dar2", "dev-dar2", "agent-dar2")
+	sess, token, err := rs.Create(ctx, agent, "dev-dar2", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -644,11 +533,11 @@ func TestAttachClientAfterDetachResumesSession(t *testing.T) {
 }
 
 func TestClose(t *testing.T) {
-	rs, store, mockPM, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-close", "dev-close", "agent-close")
+	sess, _, err := rs.Create(ctx, agent, "dev-close", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -657,9 +546,7 @@ func TestClose(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if !mockPM.stopped[sess.RuntimeID] {
-		t.Error("expected runtime to be stopped")
-	}
+	waitProcessStopped(t, sess)
 
 	_, err = rs.GetSessionStatus(sess.ID)
 	if err != ErrSessionNotFound {
@@ -673,11 +560,11 @@ func TestClose(t *testing.T) {
 }
 
 func TestCloseDeviceMismatch(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-cdm", "dev-a", "agent-a")
+	sess, _, err := rs.Create(ctx, agent, "dev-a", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -700,19 +587,19 @@ func TestCloseSessionNotFound(t *testing.T) {
 }
 
 func TestListByDevice(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	_, _, err := rs.Create(ctx, "rt-lbd-1", "dev-lbd-a", "agent-1")
+	_, _, err := rs.Create(ctx, agent, "dev-lbd-a", nil)
 	if err != nil {
 		t.Fatalf("Create 1: %v", err)
 	}
-	_, _, err = rs.Create(ctx, "rt-lbd-2", "dev-lbd-a", "agent-2")
+	_, _, err = rs.Create(ctx, agent, "dev-lbd-a", nil)
 	if err != nil {
 		t.Fatalf("Create 2: %v", err)
 	}
-	_, _, err = rs.Create(ctx, "rt-lbd-3", "dev-lbd-b", "agent-3")
+	_, _, err = rs.Create(ctx, agent, "dev-lbd-b", nil)
 	if err != nil {
 		t.Fatalf("Create 3: %v", err)
 	}
@@ -727,11 +614,11 @@ func TestListByDevice(t *testing.T) {
 }
 
 func TestGetPump(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-gp", "dev-gp", "agent-gp")
+	sess, _, err := rs.Create(ctx, agent, "dev-gp", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -751,11 +638,11 @@ func TestGetPump(t *testing.T) {
 }
 
 func TestGetSessionStatus(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-gss", "dev-gss", "agent-gss")
+	sess, _, err := rs.Create(ctx, agent, "dev-gss", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -787,11 +674,11 @@ func TestGetSessionStatus(t *testing.T) {
 }
 
 func TestLogInbound(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-log", "dev-log", "agent-log")
+	sess, _, err := rs.Create(ctx, agent, "dev-log", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -872,7 +759,7 @@ func TestPumpStdoutDrainLoopWithWebSocket(t *testing.T) {
 
 	r, w := io.Pipe()
 	pump := &StdioPump{
-		pipes: &runtime.LeasedPipes{
+		proc: &runtime.Process{
 			Stdin:  nopWriteCloser{},
 			Stdout: r,
 		},
@@ -927,7 +814,7 @@ func TestPumpStdoutDrainLoopWebSocketWriteError(t *testing.T) {
 
 	r, w := io.Pipe()
 	pump := &StdioPump{
-		pipes: &runtime.LeasedPipes{
+		proc: &runtime.Process{
 			Stdin:  nopWriteCloser{},
 			Stdout: r,
 		},
@@ -987,7 +874,7 @@ func TestPumpStdoutDrainLoopOversizedFrame(t *testing.T) {
 
 	r, w := io.Pipe()
 	pump := &StdioPump{
-		pipes: &runtime.LeasedPipes{
+		proc: &runtime.Process{
 			Stdin:  nopWriteCloser{},
 			Stdout: r,
 		},
@@ -1048,15 +935,7 @@ func TestPumpStdoutDrainLoopOversizedFrame(t *testing.T) {
 }
 
 func TestPumpAttachBindDetach(t *testing.T) {
-	mockPM := newMockPM()
-	pi, err := mockPM.AcquireLease("pump-test", "test")
-	if err != nil {
-		t.Fatalf("AcquireLease: %v", err)
-	}
-	pipes := pi.(*runtime.LeasedPipes)
-
 	pump := &StdioPump{
-		pipes:     pipes,
 		runtimeID: "pump-test",
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
@@ -1145,15 +1024,7 @@ func newTestWSConn(t *testing.T) *websocket.Conn {
 }
 
 func TestPumpSupportsClose(t *testing.T) {
-	mockPM := newMockPM()
-	pi, err := mockPM.AcquireLease("pump-sc", "test")
-	if err != nil {
-		t.Fatalf("AcquireLease: %v", err)
-	}
-	pipes := pi.(*runtime.LeasedPipes)
-
 	pump := &StdioPump{
-		pipes:     pipes,
 		runtimeID: "pump-sc",
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
@@ -1170,15 +1041,11 @@ func TestPumpSupportsClose(t *testing.T) {
 }
 
 func TestPumpWriteToAgent(t *testing.T) {
-	mockPM := newMockPM()
-	pi, err := mockPM.AcquireLease("pump-wt", "test")
-	if err != nil {
-		t.Fatalf("AcquireLease: %v", err)
-	}
-	pipes := pi.(*runtime.LeasedPipes)
-
 	pump := &StdioPump{
-		pipes:     pipes,
+		proc: &runtime.Process{
+			Stdin:  nopWriteCloser{},
+			Stdout: io.NopCloser(strings.NewReader("")),
+		},
 		runtimeID: "pump-wt",
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
@@ -1214,11 +1081,11 @@ func TestAttachClientStoreFallbackNotFound(t *testing.T) {
 }
 
 func TestCloseWithSupportsClose(t *testing.T) {
-	rs, store, mockPM, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-close-sc", "dev-close-sc", "agent-close-sc")
+	sess, _, err := rs.Create(ctx, agent, "dev-close-sc", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1229,36 +1096,33 @@ func TestCloseWithSupportsClose(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if !mockPM.stopped[sess.RuntimeID] {
-		t.Error("expected runtime to be stopped")
-	}
+	waitProcessStopped(t, sess)
 }
 
 // TestCloseWithSupportsCloseRoutesThroughPump verifies the ACP session/close
 // frame is written via the pump (WriteSessionClose) — the only stdin writer —
-// rather than reaching the leased pipes directly, so the teardown handshake is
+// rather than reaching the agent's stdin directly, so the teardown handshake is
 // frame-logged like every other inbound frame.
 func TestCloseWithSupportsCloseRoutesThroughPump(t *testing.T) {
 	rs, store, _, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	// Create a pump whose pipes are set before any drain-loop goroutine starts,
-	// so the recording stdin is used for the whole session (mutating pump.pipes
-	// after Create would race the already-running StdoutDrainLoop).
+	// Create a pump whose process pipes are set before any drain-loop goroutine
+	// starts, so the recording stdin is used for the whole session (mutating the
+	// pump's proc after Create would race the already-running StdoutDrainLoop).
 	var mu sync.Mutex
 	var writes []string
 	pump := &StdioPump{
-		pipes: &runtime.LeasedPipes{
-			Stdin:     recordingWriteCloser{record: func(b []byte) { mu.Lock(); writes = append(writes, string(b)); mu.Unlock() }},
-			Stdout:    io.NopCloser(strings.NewReader("")),
-			RuntimeID: "rt-close-routed",
+		proc: &runtime.Process{
+			Stdin:  recordingWriteCloser{record: func(b []byte) { mu.Lock(); writes = append(writes, string(b)); mu.Unlock() }},
+			Stdout: io.NopCloser(strings.NewReader("")),
 		},
 		runtimeID:    "rt-close-routed",
 		sessionID:    "sess-close-routed",
 		agentID:      "agent-close-routed",
 		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		appendLog:    rs.pm.AppendLog,
+		appendLog:    rs.runtimeSvc.AppendLog,
 		loadRecovery: newLoadRecovery(rs.logger),
 	}
 	markCloseCapable(pump)
@@ -1270,14 +1134,13 @@ func TestCloseWithSupportsCloseRoutesThroughPump(t *testing.T) {
 	pump.acp.mu.Unlock()
 
 	sess := &Session{
-		ID:          "sess-close-routed",
-		RuntimeID:   "rt-close-routed",
-		DeviceID:    "dev-close-routed",
-		AgentID:     "agent-close-routed",
-		Status:      StatusActive,
-		Leaseholder: "sess-close-routed",
-		CreatedAt:   time.Now().UTC(),
-		pump:        pump,
+		ID:        "sess-close-routed",
+		RuntimeID: "rt-close-routed",
+		DeviceID:  "dev-close-routed",
+		AgentID:   "agent-close-routed",
+		Status:    StatusActive,
+		CreatedAt: time.Now().UTC(),
+		pump:      pump,
 	}
 	rs.mu.Lock()
 	rs.sessions[sess.ID] = sess
@@ -1327,7 +1190,7 @@ func (w recordingWriteCloser) Close() error { return nil }
 // the ACP session id (it is the resilient, non-ACP id).
 func TestWriteSessionCloseSkipsClientSnoop(t *testing.T) {
 	pump := &StdioPump{
-		pipes: &runtime.LeasedPipes{
+		proc: &runtime.Process{
 			Stdin:  nopWriteCloser{},
 			Stdout: io.NopCloser(strings.NewReader("")),
 		},
@@ -1363,9 +1226,9 @@ func TestReaperLoopShutdown(t *testing.T) {
 	}
 	defer store.Close()
 
-	mockPM := newMockPM()
-	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rs := NewRuntimeSession(slog.New(slog.NewTextHandler(io.Discard, nil)), store, mockPM, tokenSvc, Config{})
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tokenSvc := NewTokenService(logger)
+	rs := NewRuntimeSession(logger, store, runtime.NewSupervisor(logger, t.TempDir(), nil, nil), tokenSvc, Config{})
 
 	if rs.cancelReaper == nil {
 		t.Fatal("expected cancelReaper to be non-nil after NewRuntimeSession")
@@ -1410,7 +1273,7 @@ func TestPumpStdoutDrainLoop(t *testing.T) {
 	r, w := io.Pipe()
 
 	pump := &StdioPump{
-		pipes: &runtime.LeasedPipes{
+		proc: &runtime.Process{
 			Stdin:  nopWriteCloser{},
 			Stdout: r,
 		},
@@ -1443,7 +1306,7 @@ func TestPumpStdoutDrainLoopWithFramesAndAppendLog(t *testing.T) {
 	var loggedMu sync.Mutex
 	var logged bool
 	pump := &StdioPump{
-		pipes: &runtime.LeasedPipes{
+		proc: &runtime.Process{
 			Stdin:  nopWriteCloser{},
 			Stdout: r,
 		},
@@ -1544,7 +1407,7 @@ func TestPumpTurnCompletePushUsesACPSessionID(t *testing.T) {
 
 	pushCh := make(chan push.Notification, 4)
 	pump := &StdioPump{
-		pipes: &runtime.LeasedPipes{
+		proc: &runtime.Process{
 			Stdin:  nopWriteCloser{},
 			Stdout: r,
 		},
@@ -1652,24 +1515,24 @@ func TestCreateStoreError(t *testing.T) {
 	}
 	store.Close()
 
-	mockPM := newMockPM()
-	tokenSvc := NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rs := NewRuntimeSession(slog.New(slog.NewTextHandler(io.Discard, nil)), store, mockPM, tokenSvc, Config{})
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tokenSvc := NewTokenService(logger)
+	rs := NewRuntimeSession(logger, store, runtime.NewSupervisor(logger, t.TempDir(), nil, nil), tokenSvc, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	_, _, err = rs.Create(context.Background(), "rt-err", "dev-err", "agent-err")
+	_, _, err = rs.Create(context.Background(), mockAgent(t), "dev-err", nil)
 	if err == nil {
 		t.Error("expected error from closed store")
 	}
 }
 
 func TestResumeInMemoryStatusClosing(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-rs-cl", "dev-rs-cl", "agent-rs-cl")
+	sess, _, err := rs.Create(ctx, agent, "dev-rs-cl", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1697,11 +1560,11 @@ func TestAttachClientTokenSessionIDMismatch(t *testing.T) {
 }
 
 func TestAttachClientInMemoryDeviceMismatch(t *testing.T) {
-	rs, store, _, tokenSvc, ctx := setupTest(t, Config{})
+	rs, store, agent, tokenSvc, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-ac-dmim", "dev-ac-dmim", "agent-ac-dmim")
+	sess, _, err := rs.Create(ctx, agent, "dev-ac-dmim", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1714,11 +1577,11 @@ func TestAttachClientInMemoryDeviceMismatch(t *testing.T) {
 }
 
 func TestAttachClientInMemoryStatusFailed(t *testing.T) {
-	rs, store, _, tokenSvc, ctx := setupTest(t, Config{})
+	rs, store, agent, tokenSvc, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-ac-fail", "dev-ac-fail", "agent-ac-fail")
+	sess, _, err := rs.Create(ctx, agent, "dev-ac-fail", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1745,7 +1608,6 @@ func TestReaperLoopDefensiveDefaults(t *testing.T) {
 	rs := &RuntimeSession{
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:    store,
-		pm:       newMockPM(),
 		tokenSvc: NewTokenService(slog.New(slog.NewTextHandler(io.Discard, nil))),
 		cfg:      Config{},
 		sessions: make(map[string]*Session),
@@ -1770,11 +1632,11 @@ func TestReaperLoopDefensiveDefaults(t *testing.T) {
 }
 
 func TestReaperLoopTickerFires(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{ReaperInterval: time.Millisecond, MaxDisconnected: time.Millisecond})
+	rs, store, agent, _, ctx := setupTest(t, Config{ReaperInterval: time.Millisecond, MaxDisconnected: time.Millisecond})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-reap-tick", "dev-reap-tick", "agent-reap-tick")
+	sess, _, err := rs.Create(ctx, agent, "dev-reap-tick", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1800,11 +1662,11 @@ func TestReaperLoopTickerFires(t *testing.T) {
 }
 
 func TestReapExpiredSkipsActive(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, tok, err := rs.Create(ctx, "rt-reap-skip", "dev-reap-skip", "agent-reap-skip")
+	sess, tok, err := rs.Create(ctx, agent, "dev-reap-skip", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1824,11 +1686,11 @@ func TestReapExpiredSkipsActive(t *testing.T) {
 }
 
 func TestReapExpired(t *testing.T) {
-	rs, store, mockPM, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-reap", "dev-reap", "agent-reap")
+	sess, _, err := rs.Create(ctx, agent, "dev-reap", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1850,9 +1712,7 @@ func TestReapExpired(t *testing.T) {
 		t.Errorf("expected session to be reaped (ErrSessionNotFound), got %v", err)
 	}
 
-	if !mockPM.stopped[sess.RuntimeID] {
-		t.Error("expected runtime to be stopped")
-	}
+	waitProcessStopped(t, sess)
 
 	_, err = store.GetSession(ctx, sess.ID)
 	if err == nil {
@@ -1861,11 +1721,11 @@ func TestReapExpired(t *testing.T) {
 }
 
 func TestReapExpiredSkipsStreamingAgent(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-stream", "dev-stream", "agent-stream")
+	sess, _, err := rs.Create(ctx, agent, "dev-stream", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1892,11 +1752,11 @@ func TestReapExpiredSkipsStreamingAgent(t *testing.T) {
 }
 
 func TestReapExpiredReapsIdleAgent(t *testing.T) {
-	rs, store, mockPM, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-idle", "dev-idle", "agent-idle")
+	sess, _, err := rs.Create(ctx, agent, "dev-idle", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1921,39 +1781,15 @@ func TestReapExpiredReapsIdleAgent(t *testing.T) {
 		t.Errorf("expected session to be reaped (ErrSessionNotFound), got %v", err)
 	}
 
-	if !mockPM.stopped[sess.RuntimeID] {
-		t.Error("expected runtime to be stopped")
-	}
-}
-
-func TestCreateEmptyRuntimeID(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
-	defer rs.Shutdown()
-	defer store.Close()
-
-	sess, token, err := rs.Create(ctx, "", "dev-empty", "agent-empty")
-	if err != nil {
-		t.Fatalf("Create with empty runtimeID: %v", err)
-	}
-	if sess == nil || sess.ID == "" {
-		t.Fatal("expected non-nil session with ID")
-	}
-	if token == "" {
-		t.Fatal("expected non-empty attach token")
-	}
-
-	_, _, err = rs.Create(ctx, "", "dev-empty-2", "agent-empty-2")
-	if !errors.Is(err, ErrRuntimeLeaseHeld) {
-		t.Errorf("expected ErrRuntimeLeaseHeld on duplicate empty runtimeID, got %v", err)
-	}
+	waitProcessStopped(t, sess)
 }
 
 func TestCreateEmptyDeviceID(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, token, err := rs.Create(ctx, "rt-empty-dev", "", "agent-empty")
+	sess, token, err := rs.Create(ctx, agent, "", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1966,11 +1802,11 @@ func TestCreateEmptyDeviceID(t *testing.T) {
 }
 
 func TestAttachClientOnDisconnectedSession(t *testing.T) {
-	rs, store, _, tokenSvc, ctx := setupTest(t, Config{})
+	rs, store, agent, tokenSvc, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, token, err := rs.Create(ctx, "rt-att-disc", "dev-att-disc", "agent-att-disc")
+	sess, token, err := rs.Create(ctx, agent, "dev-att-disc", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -2182,11 +2018,11 @@ func TestPumpAttachBindRaceFencesEvictedConn(t *testing.T) {
 // (the app died before opening the WebSocket) is born disconnected, so the
 // reaper reclaims its process, lease and quota slot after MaxDisconnected.
 func TestCreateNeverAttachedIsReaped(t *testing.T) {
-	rs, store, mockPM, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-never", "dev-never", "agent-never")
+	sess, _, err := rs.Create(ctx, agent, "dev-never", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -2213,33 +2049,34 @@ func TestCreateNeverAttachedIsReaped(t *testing.T) {
 	if _, err := rs.GetSessionStatus(sess.ID); err != ErrSessionNotFound {
 		t.Errorf("expected never-attached session to be reaped, got %v", err)
 	}
-	if !mockPM.stopped["rt-never"] {
-		t.Error("expected runtime to be stopped")
-	}
+	waitProcessStopped(t, sess)
 	if _, err := store.GetSession(ctx, sess.ID); err == nil {
 		t.Error("expected session to be deleted from store")
 	}
 }
 
-// TestProcessExitIntentionalReclaimsWithoutPush verifies that a stop or restart
-// reported by the supervisor (intentional exit of a non-closing session) frees
-// the session and its lease exactly like a crash, but sends no "Agent Crashed" push.
+// TestProcessExitIntentionalReclaimsWithoutPush verifies that an intentional
+// stop — the session is marked closing before its process is terminated —
+// reclaims the session without sending an "Agent Crashed" push.
 func TestProcessExitIntentionalReclaimsWithoutPush(t *testing.T) {
-	rs, mockPM, pushSvc := setupPushTest(t)
+	rs, agent, pushSvc := setupPushTest(t)
 	ctx := context.Background()
 
-	sess, _, err := rs.Create(ctx, "rt-stop", "dev-stop", "agent-stop")
+	sess, _, err := rs.Create(ctx, agent, "dev-stop", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
-	mockPM.triggerIntentionalExit("rt-stop")
+	if _, err := rs.StopByRuntimeID(ctx, sess.RuntimeID); err != nil {
+		t.Fatalf("StopByRuntimeID: %v", err)
+	}
+	waitProcessStopped(t, sess)
 
 	if _, err := rs.GetSessionStatus(sess.ID); err != ErrSessionNotFound {
 		t.Fatalf("expected session reclaimed (ErrSessionNotFound), got %v", err)
 	}
-	if _, _, err := rs.Create(ctx, "rt-stop", "dev-stop", "agent-fresh"); err != nil {
-		t.Fatalf("expected lease released so Create succeeds, got %v", err)
+	if _, _, err := rs.Create(ctx, agent, "dev-stop", nil); err != nil {
+		t.Fatalf("expected a fresh Create to succeed, got %v", err)
 	}
 	// The push, if erroneously sent, is dispatched asynchronously.
 	time.Sleep(150 * time.Millisecond)
@@ -2259,34 +2096,33 @@ func (b blockedWriteCloser) Close() error                { return nil }
 // write stuck on an unresponsive agent does not freeze the registry shared by
 // every other session, and that Close still completes once the wait is bounded.
 func TestCloseDoesNotHoldRegistryLockDuringBlockedWrite(t *testing.T) {
-	rs, store, mockPM, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
 	release := make(chan struct{})
 	defer close(release)
 	pump := &StdioPump{
-		pipes: &runtime.LeasedPipes{
-			Stdin:     blockedWriteCloser{release: release},
-			Stdout:    io.NopCloser(strings.NewReader("")),
-			RuntimeID: "rt-stuck",
+		proc: &runtime.Process{
+			Stdin:  blockedWriteCloser{release: release},
+			Stdout: io.NopCloser(strings.NewReader("")),
 		},
 		runtimeID:    "rt-stuck",
 		sessionID:    "sess-stuck",
 		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		appendLog:    rs.pm.AppendLog,
+		appendLog:    rs.runtimeSvc.AppendLog,
 		loadRecovery: newLoadRecovery(rs.logger),
 	}
 	markCloseCapable(pump)
 	stuck := &Session{
 		ID: "sess-stuck", RuntimeID: "rt-stuck", DeviceID: "dev-stuck", AgentID: "agent-stuck",
-		Status: StatusActive, Leaseholder: "sess-stuck", CreatedAt: time.Now().UTC(), pump: pump,
+		Status: StatusActive, CreatedAt: time.Now().UTC(), pump: pump,
 	}
 	rs.mu.Lock()
 	rs.sessions[stuck.ID] = stuck
 	rs.mu.Unlock()
 
-	other, _, err := rs.Create(ctx, "rt-other", "dev-other", "agent-other")
+	other, _, err := rs.Create(ctx, agent, "dev-other", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -2325,21 +2161,16 @@ func TestCloseDoesNotHoldRegistryLockDuringBlockedWrite(t *testing.T) {
 	case <-time.After(closeWriteTimeout + 3*time.Second):
 		t.Fatal("Close did not return after the bounded wait")
 	}
-	mockPM.mu.Lock()
-	defer mockPM.mu.Unlock()
-	if !mockPM.stopped["rt-stuck"] {
-		t.Error("expected runtime to be stopped despite the blocked write")
-	}
 }
 
 // A disconnected session whose agent waits on an unanswered request outlives
 // MaxDisconnected; once answered it is reaped as usual.
 func TestReapSparesSessionAwaitingClient(t *testing.T) {
-	rs, store, _, _, ctx := setupTest(t, Config{})
+	rs, store, agent, _, ctx := setupTest(t, Config{})
 	defer rs.Shutdown()
 	defer store.Close()
 
-	sess, _, err := rs.Create(ctx, "rt-wait", "dev-wait", "agent-wait")
+	sess, _, err := rs.Create(ctx, agent, "dev-wait", nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

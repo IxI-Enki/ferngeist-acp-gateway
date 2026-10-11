@@ -96,7 +96,7 @@ func (q *clientQueue) take() []string {
 // notify.go, client request ids in request_ids.go, and re-load replay in
 // load_recovery.go.
 type StdioPump struct {
-	pipes     *runtime.LeasedPipes
+	proc      *runtime.Process
 	runtimeID string
 	sessionID string
 	agentID   string
@@ -180,7 +180,7 @@ func (p *StdioPump) StdoutDrainLoop(ctx context.Context) {
 	// the drain loop exits, which closed the client WebSocket with no log
 	// ("connection dropped while loading a session"). readStdoutFrame keeps
 	// frames up to maxAgentFrameBytes and discards the rest of a longer line.
-	reader := bufio.NewReader(p.pipes.Stdout)
+	reader := bufio.NewReader(p.proc.Stdout)
 drain:
 	for {
 		select {
@@ -329,7 +329,7 @@ func (p *StdioPump) WriteToAgent(payload []byte) error {
 	if p.frameLog != nil {
 		p.frameLog.append(p.agentID, p.runtimeID, p.sessionID, "in", payload)
 	}
-	return p.pipes.WriteToAgent(payload)
+	return p.writeToAgent(payload)
 }
 
 // WriteSessionClose sends the agent a session/close request during session
@@ -342,7 +342,13 @@ func (p *StdioPump) WriteSessionClose(payload []byte) error {
 	if p.frameLog != nil {
 		p.frameLog.append(p.agentID, p.runtimeID, p.sessionID, "in", payload)
 	}
-	return p.pipes.WriteToAgent(payload)
+	return p.writeToAgent(payload)
+}
+
+// writeToAgent writes one frame to the agent's stdin followed by a newline.
+func (p *StdioPump) writeToAgent(payload []byte) error {
+	_, err := p.proc.Stdin.Write(append(payload, '\n'))
+	return err
 }
 
 // Attach claims the pump for a new client: bumps the connection generation and

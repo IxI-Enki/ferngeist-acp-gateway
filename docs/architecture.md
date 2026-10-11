@@ -10,8 +10,8 @@ Its main job is to expose ACP agents through a unified WebSocket API. It discove
 - `internal/api` — public and admin HTTP APIs, WebSocket bridge, session handlers
 - `internal/push` — platform-neutral push dispatcher with pluggable delivery providers (Web Push)
 - `internal/pairing` — pairing flow and device credentials
-- `internal/runtime` — process supervision, lease-based transport bridging
-- `internal/session` — resilient session domain: session lifecycle, stdio pump, attach tokens, inbound diagnostics
+- `internal/runtime` — agent process launching, the per-runtime log ring buffer, and persisted failure records. The supervisor does not own the process: `Launch` hands the caller a `*exec.Cmd` plus its pipes, the caller reports the exit back with `RecordExit`, and there is no automatic restart.
+- `internal/session` — resilient session domain: session lifecycle, the stdio pump, agent process ownership (a session owns the `*exec.Cmd` it launched), attach tokens, and inbound diagnostics
 - `internal/catalog` — supported agent discovery and validation
 - `internal/registry` — ACP registry fetch and cache
 - `internal/storage` — SQLite persistence (sessions, pairings, runtimes, push tokens, gateway identity, inbound diagnostics)
@@ -26,14 +26,15 @@ Its main job is to expose ACP agents through a unified WebSocket API. It discove
 Every connection creates a persistent gateway session with:
 
 - **StdioPump** — a long-lived goroutine that drains agent stdout and forwards frames to the WebSocket when a client is attached. When no client is connected, output is discarded after end-turn detection and log append. The pump owns the pipe lifecycle and runs independently of WebSocket connectivity.
-- **Lease** — the session holds an exclusive lease on the runtime's stdio pipes via `AcquireLease`/`ReleaseLease`. The runtime is not stopped on WebSocket disconnect — only the leaseholder string is cleared. Sessions always stop the runtime on close.
+- **Agent process ownership** — connecting starts the agent, so the session owns the `*exec.Cmd` it launched directly: it drains stdout, writes stdin, waits for the process, and stops it on close. A session and its runtime are 1:1 — there is no pipe lease and no exit-callback registry. The runtime record is only diagnostics (status, log ring, failure records); the session reports the exit to it with `RecordExit`.
 
 > A **device may run multiple sessions for the same agent concurrently** — one
 > session per runtime/process — so a background chat (agent mid-turn, client
 > disconnected) can coexist with a foreground chat against a separate process of
-> the same agent. Per-session close still stops by runtime ID
-> (`StopByRuntimeID`); per-agent stop (`StopByAgentID`) stops all runtimes for the
-> agent. The exclusive pipe lease is unchanged: one leaseholder per runtime.
+> the same agent. Every `POST /v1/agents/{agentId}/connect` launches a fresh
+> process and session. Per-session close stops that session's own process;
+> per-agent stop closes every session for the agent. The supervisor never
+> auto-restarts a process: a crash is reported and the session is reclaimed.
 - **Push notifications** — when the pump detects a notable event (turn complete, permission request, agent error, or live progress) — or the runtime crashes — it emits a platform-neutral notification through the push dispatcher, which delivers it over Web Push to the subscription the device registered. Pushes fire **regardless of whether a client is attached**: the gateway can't tell whether the app is foregrounded or backgrounded (only whether a socket is attached, a poor proxy), so the client decides — it suppresses the notification for a chat already on screen and posts it otherwise, including when the push wakes a killed app. The client reconnects and calls `session/load` on the agent for context restoration.
 - **Inbound diagnostics** — client-to-agent frames are logged asynchronously to SQLite via a buffered channel (non-blocking, dropped on overflow with counter).
 - **ACP session/close** — before stopping the runtime on session close, the gateway sends a `session/close` JSON-RPC request to the agent if it advertised `sessionCapabilities.close` during initialize. The mock agent supports this for testing.
@@ -45,21 +46,21 @@ The pump buffers each ACP session's `session/update` history (bounded, 8 MiB, tr
 
 ## Session lifecycle
 
-1. `POST /v1/runtimes/{id}/connect` → session created, connect descriptor with sessionId and attachToken returned
+1. `POST /v1/agents/{agentId}/connect` → agent process launched, session created, connect descriptor with sessionId and attachToken returned
 2. `GET /v1/acp/{runtimeId}?sessionId=<id>&attachToken=<token>` → initial WebSocket connect
 3. ACP messages flow bidirectionally via pump + proxy
 4. WebSocket disconnects → pump keeps running, session → `disconnected`
 5. `POST /v1/sessions/{id}/resume` → new attach token minted
 6. `GET /v1/acp/{runtimeId}?sessionId=&attachToken=` → sets pump client, live proxying resumes (client calls `session/load` on agent for context)
-7. `DELETE /v1/sessions/{id}` → mark `closing`, stop pump, send ACP `session/close`, stop runtime (2s graceful timeout), release lease, delete from storage
+7. `DELETE /v1/sessions/{id}` → mark `closing`, stop pump, send ACP `session/close`, stop the session's agent process (2s graceful timeout), delete from storage
 
 ### Session close ordering
 
 1. Mark session status `closing` in SQLite
 2. Stop the stdio pump (context cancellation)
-3. If the agent advertised `sessionCapabilities.close`, send `{"jsonrpc":"2.0","method":"session/close",...}` to stdin
-4. `StopByRuntimeID` with 2-second graceful timeout
-5. Release the pipe lease
+3. Remove the session from the in-memory registry so the exit watcher reclaims nothing
+4. If the agent advertised `sessionCapabilities.close`, send `{"jsonrpc":"2.0","method":"session/close",...}` to stdin
+5. Stop the agent process the session owns, marking the exit intentional (2-second graceful timeout, then kill)
 6. Delete session record from SQLite
 
 ## Data flow

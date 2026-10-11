@@ -310,7 +310,6 @@ func TestSessionStore_SaveAndGetSession(t *testing.T) {
 		DeviceID:    "dev_001",
 		AgentID:     "agent_mock",
 		Status:      "active",
-		Leaseholder: "sess_abc123",
 		CreatedAt:   now,
 	}
 
@@ -344,7 +343,6 @@ func TestSessionStore_UpdateSessionStatus(t *testing.T) {
 		DeviceID:    "dev_001",
 		AgentID:     "agent_mock",
 		Status:      "active",
-		Leaseholder: "sess_abc123",
 		CreatedAt:   now,
 	}
 
@@ -385,7 +383,6 @@ func TestSessionStore_ListSessionsByDevice(t *testing.T) {
 		DeviceID:    "dev_001",
 		AgentID:     "agent_mock",
 		Status:      "active",
-		Leaseholder: "sess_abc123",
 		CreatedAt:   now,
 	}
 
@@ -419,7 +416,6 @@ func TestSessionStore_InboundFrameRoundtrip(t *testing.T) {
 		DeviceID:    "dev_001",
 		AgentID:     "agent_mock",
 		Status:      "active",
-		Leaseholder: "sess_abc123",
 		CreatedAt:   now,
 	}
 
@@ -458,7 +454,6 @@ func TestSessionStore_CascadeDeleteRemovesDiagnostics(t *testing.T) {
 		DeviceID:    "dev_001",
 		AgentID:     "agent_mock",
 		Status:      "active",
-		Leaseholder: "sess_abc123",
 		CreatedAt:   now,
 	}
 
@@ -505,7 +500,6 @@ func TestAppendInboundDiagnostic(t *testing.T) {
 		DeviceID:    "dev_inbound",
 		AgentID:     "agent_inbound",
 		Status:      "active",
-		Leaseholder: "sess_inbound",
 		CreatedAt:   now,
 	}
 	if err := store.SaveSession(ctx, rec); err != nil {
@@ -1013,13 +1007,13 @@ func TestSessionStore_ReconcileOnStartup(t *testing.T) {
 	now := time.Now().UTC()
 	if err := store.SaveSession(ctx, SessionRecord{
 		SessionID: "sess_active", RuntimeID: "rt_1", DeviceID: "dev_1",
-		AgentID: "agent_1", Status: "active", Leaseholder: "sess_active", CreatedAt: now,
+		AgentID: "agent_1", Status: "active", CreatedAt: now,
 	}); err != nil {
 		t.Fatalf("SaveSession(sess_active): %v", err)
 	}
 	if err := store.SaveSession(ctx, SessionRecord{
 		SessionID: "sess_disc", RuntimeID: "rt_2", DeviceID: "dev_1",
-		AgentID: "agent_1", Status: "disconnected", Leaseholder: "sess_disc", CreatedAt: now,
+		AgentID: "agent_1", Status: "disconnected", CreatedAt: now,
 	}); err != nil {
 		t.Fatalf("SaveSession(sess_disc): %v", err)
 	}
@@ -1091,9 +1085,9 @@ func TestSessionStore_ListSessionsByDeviceMultiple(t *testing.T) {
 
 	now := time.Now().UTC()
 	for _, s := range []SessionRecord{
-		{SessionID: "sess_dev_1a", RuntimeID: "rt_1", DeviceID: "dev_multi", AgentID: "agent_1", Status: "active", Leaseholder: "sess_dev_1a", CreatedAt: now},
-		{SessionID: "sess_dev_1b", RuntimeID: "rt_2", DeviceID: "dev_multi", AgentID: "agent_2", Status: "disconnected", Leaseholder: "sess_dev_1b", CreatedAt: now.Add(-1 * time.Minute)},
-		{SessionID: "sess_dev_2a", RuntimeID: "rt_3", DeviceID: "dev_other", AgentID: "agent_1", Status: "active", Leaseholder: "sess_dev_2a", CreatedAt: now},
+		{SessionID: "sess_dev_1a", RuntimeID: "rt_1", DeviceID: "dev_multi", AgentID: "agent_1", Status: "active", CreatedAt: now},
+		{SessionID: "sess_dev_1b", RuntimeID: "rt_2", DeviceID: "dev_multi", AgentID: "agent_2", Status: "disconnected", CreatedAt: now.Add(-1 * time.Minute)},
+		{SessionID: "sess_dev_2a", RuntimeID: "rt_3", DeviceID: "dev_other", AgentID: "agent_1", Status: "active", CreatedAt: now},
 	} {
 		if err := store.SaveSession(ctx, s); err != nil {
 			t.Fatalf("SaveSession(%s): %v", s.SessionID, err)

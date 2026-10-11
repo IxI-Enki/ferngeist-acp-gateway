@@ -47,8 +47,8 @@ FERNGEIST_GATEWAY_UPDATE_CHECK_ENABLED=0 \
   /tmp/fg/ferngeist-gateway daemon run
 
 # 3. Drive it: POST /admin/v1/pairings/start (port 5791) -> GET the code ->
-#    POST /v1/pair/complete -> POST /v1/agents/mock-acp/start {"new":true}
-#    twice -> connect both runtimes with sessionMode:"resilient" -> ACP over
+#    POST /v1/pair/complete -> POST /v1/agents/mock-acp/connect twice (each call
+#    launches its own process) -> ACP over
 #    GET /v1/acp/{runtimeId}?sessionId=&attachToken= -> POST stop -> confirm
 #    GET /v1/agents shows both runtimes stopped but still tracked.
 ```

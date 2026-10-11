@@ -91,7 +91,11 @@ type Server struct {
 // Clients use this to detect compatibility mismatches. The daemon also emits it
 // in its mDNS discovery TXT records, so bump both consumers together by
 // referencing this constant.
-const ProtocolVersion = "v1"
+//
+// v2: connecting starts the agent — POST /v1/agents/{id}/connect replaces
+// POST /v1/agents/{id}/start and POST /v1/runtimes/{id}/connect, whose
+// responses the client must read. See docs/changelog.md.
+const ProtocolVersion = "v2"
 
 // Security and request limits.
 const (
@@ -261,9 +265,8 @@ func NewServer(deps Deps) *Server {
 	mux.HandleFunc("POST /v1/agents/custom", server.requireScope(pairing.ScopeControl, server.handleCustomAgentCreate))
 	mux.HandleFunc("PUT /v1/agents/custom/{id}", server.requireScope(pairing.ScopeControl, server.handleCustomAgentUpdate))
 	mux.HandleFunc("DELETE /v1/agents/custom/{id}", server.requireScope(pairing.ScopeControl, server.handleCustomAgentDelete))
-	mux.HandleFunc("POST /v1/agents/{agentId}/start", server.handleAgentStart)
+	mux.HandleFunc("POST /v1/agents/{agentId}/connect", server.handleAgentConnect)
 	mux.HandleFunc("POST /v1/agents/{agentId}/stop", server.handleAgentStop)
-	mux.HandleFunc("POST /v1/runtimes/{runtimeId}/connect", server.handleRuntimeConnect)
 	mux.HandleFunc("POST /v1/runtimes/{runtimeId}/restart", server.handleRuntimeRestart)
 	mux.HandleFunc("GET /v1/runtimes/{runtimeId}/files", server.handleWorkspaceFile)
 	mux.HandleFunc("GET /v1/runtimes/{runtimeId}/git/status", server.handleWorkspaceGitStatus)
@@ -543,13 +546,11 @@ func (s *Server) statusSnapshot(includePublicURL bool) statusResponse {
 		Remote:            s.remoteStatus(includePublicURL),
 		Registry:          s.registryStatus(),
 		RuntimeCounts: runtimeCounts{
-			Starting:    summary.Starting,
-			Total:       summary.Total,
-			Running:     summary.Running,
-			Stopping:    summary.Stopping,
-			Stopped:     summary.Stopped,
-			Failed:      summary.Failed,
-			CircuitOpen: summary.CircuitOpen,
+			Starting: summary.Starting,
+			Total:    summary.Total,
+			Running:  summary.Running,
+			Stopped:  summary.Stopped,
+			Failed:   summary.Failed,
 		},
 	}
 }

@@ -8,10 +8,11 @@ package session
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"sort"
 	"time"
 
+	"github.com/arafatamim/ferngeist-acp-gateway/internal/catalog"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/push"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/runtime"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/storage"
@@ -19,18 +20,15 @@ import (
 	"github.com/coder/websocket"
 )
 
-// Create establishes a new resilient session for a runtime. It is best-effort:
-// if creation fails after the runtime was already acquired, the session
-// record is cleaned up and the lease is released.
-//
-// Ordering matters: store record first so the session is visible even if
-// subsequent steps fail (allowing cleanup). Then acquire the lease to ensure
-// the runtime is alive and unleased. On failure at any step, delete the record
-// and release any acquired lease to leave no orphaned state.
-func (rs *RuntimeSession) Create(ctx context.Context, runtimeID, deviceID, agentID string) (*Session, string, error) {
+// Create launches the agent and establishes a resilient session that owns its
+// process. It is best-effort: if the session record cannot be saved after the
+// process was launched, the process is stopped so no orphan remains.
+func (rs *RuntimeSession) Create(ctx context.Context, agent catalog.Agent, deviceID string, env map[string]string) (*Session, string, error) {
 	rs.mu.Lock()
-	defer rs.mu.Unlock()
-
+	if rs.closed {
+		rs.mu.Unlock()
+		return nil, "", ErrSessionNotActive
+	}
 	if rs.cfg.MaxPerDevice > 0 {
 		existing, err := rs.store.ListSessionsByDevice(ctx, deviceID)
 		if err == nil {
@@ -46,49 +44,36 @@ func (rs *RuntimeSession) Create(ctx context.Context, runtimeID, deviceID, agent
 				}
 			}
 			if live >= rs.cfg.MaxPerDevice {
+				rs.mu.Unlock()
 				return nil, "", ErrSessionLimitReached
 			}
 		}
 	}
-
 	sessionID := generateID()
+	rs.mu.Unlock()
+
+	// Connecting starts the agent: the session owns the process it launches.
+	proc, err := rs.runtimeSvc.Launch(agent, env)
+	if err != nil {
+		return nil, "", err
+	}
+	runtimeID := proc.Runtime.ID
 
 	now := time.Now().UTC()
 	rec := storage.SessionRecord{
 		SessionID:   sessionID,
 		RuntimeID:   runtimeID,
 		DeviceID:    deviceID,
-		AgentID:     agentID,
+		AgentID:     agent.ID,
 		Status:      StatusDisconnected,
-		Leaseholder: sessionID,
 		CreatedAt:   now,
 		// Born disconnected: the reaper reclaims a session whose client never
 		// attaches. AttachClient flips it to active.
 		DisconnectedSince: &now,
 	}
 	if err := rs.store.SaveSession(ctx, rec); err != nil {
+		_ = proc.Stop(2 * time.Second)
 		return nil, "", err
-	}
-
-	pipes, err := rs.pm.AcquireLease(runtimeID, sessionID)
-	if err != nil {
-		// Lease acquisition failed — undo the store record so no orphaned session remains.
-		if delErr := rs.store.DeleteSession(ctx, sessionID); delErr != nil {
-			rs.logger.Error("failed to delete session after lease acquisition failure", "error", delErr)
-		}
-		return nil, "", err
-	}
-
-	// The pump needs the concrete *runtime.LeasedPipes for Stdout access in the drain loop.
-	lp, ok := pipes.(*runtime.LeasedPipes)
-	if !ok {
-		if delErr := rs.store.DeleteSession(ctx, sessionID); delErr != nil {
-			rs.logger.Error("failed to delete session after pipe type assertion failure", "error", delErr)
-		}
-		if relErr := rs.pm.ReleaseLease(runtimeID, sessionID); relErr != nil {
-			rs.logger.Error("failed to release lease after pipe type assertion failure", "error", relErr)
-		}
-		return nil, "", errors.New("unexpected pipe type from ProcessManager")
 	}
 
 	pumpCtx, pumpCancel := context.WithCancel(context.Background())
@@ -108,12 +93,12 @@ func (rs *RuntimeSession) Create(ctx context.Context, runtimeID, deviceID, agent
 	}
 
 	pump := &StdioPump{
-		pipes:              lp,
+		proc:               proc,
 		runtimeID:          runtimeID,
 		sessionID:          sessionID,
-		agentID:            agentID,
+		agentID:            agent.ID,
 		logger:             rs.logger,
-		appendLog:          rs.pm.AppendLog,
+		appendLog:          rs.runtimeSvc.AppendLog,
 		onPushNotification: onPushNotification,
 		ProgressInterval:   rs.cfg.ProgressInterval,
 		frameLog:           rs.frameLog,
@@ -126,19 +111,30 @@ func (rs *RuntimeSession) Create(ctx context.Context, runtimeID, deviceID, agent
 		ID:             sessionID,
 		RuntimeID:      runtimeID,
 		DeviceID:       deviceID,
-		AgentID:        agentID,
+		AgentID:        agent.ID,
 		Status:         StatusDisconnected,
-		Leaseholder:    sessionID,
 		CreatedAt:      now,
 		DisconnectedAt: &now,
+		proc:           proc,
 		pump:           pump,
 		cancelPump:     pumpCancel,
+		exited:         make(chan struct{}),
+	}
+
+	rs.mu.Lock()
+	if rs.closed {
+		rs.mu.Unlock()
+		pumpCancel()
+		_ = proc.Stop(2 * time.Second)
+		_ = rs.store.DeleteSession(context.Background(), sessionID)
+		return nil, "", ErrSessionNotActive
 	}
 	rs.sessions[sessionID] = sess
+	rs.mu.Unlock()
 
-	rs.pm.OnProcessExit(runtimeID, func(rid string, intentional bool) {
-		rs.handleProcessExit(sessionID, runtimeID, deviceID, agentID, intentional)
-	})
+	// The session owns the process, so it watches for the exit itself: record
+	// it on the runtime and reclaim the session if the agent died on its own.
+	go rs.watchProcess(sess, proc)
 
 	attachToken, err := rs.tokenSvc.Mint(sessionID, deviceID, 5*time.Minute)
 	if err != nil {
@@ -146,6 +142,19 @@ func (rs *RuntimeSession) Create(ctx context.Context, runtimeID, deviceID, agent
 	}
 
 	return sess, attachToken, nil
+}
+
+// watchProcess waits for the session's agent process to exit and records the
+// exit. The session owns the process, so this is the replacement for the old
+// supervisor exit callback.
+func (rs *RuntimeSession) watchProcess(sess *Session, proc *runtime.Process) {
+	<-proc.Done()
+	intentional := sess.stopping.Load()
+	rs.runtimeSvc.RecordExit(sess.RuntimeID, proc.Err(), intentional)
+	rs.handleProcessExit(sess, intentional)
+	if sess.exited != nil {
+		close(sess.exited)
+	}
 }
 
 // sendPushNotification dispatches a push notification asynchronously with a 10s
@@ -173,32 +182,27 @@ func (rs *RuntimeSession) sendPushNotification(deviceID, acpSessionID, cwd, titl
 	}()
 }
 
-// handleProcessExit is called by the OnProcessExit callback when a runtime
-// process terminates. It detects exits not preceded by a Close that set
-// StatusClosing, reclaims the session (cancels the pump, releases the runtime
-// lease, deletes the registry and store records), and fires a crash push
-// notification if the session belongs to a device. An intentional exit (the
-// supervisor reports a stop or restart, e.g. from the agent-stop API) is
-// reclaimed the same way but sends no push.
-func (rs *RuntimeSession) handleProcessExit(sessionID, runtimeID, deviceID, agentID string, intentional bool) {
+// handleProcessExit reclaims a session whose agent process died. It detects
+// exits not preceded by a close (which sets StatusClosing) and, for a genuine
+// crash, removes the session from the registry and store and fires a crash push.
+// An intentional exit finds the session already removed and no-ops.
+func (rs *RuntimeSession) handleProcessExit(sess *Session, intentional bool) {
 	rs.mu.Lock()
 	var deviceIDForPush string
 	var acpSessionIDForPush string
 	var cwdForPush string
 	var crashed bool
 	var agentForPush string
-	if s, ok := rs.sessions[sessionID]; ok {
+	if s, ok := rs.sessions[sess.ID]; ok {
 		s.mu.Lock()
-		// The supervisor fires this callback on every process exit — including
-		// the intentional StopByRuntimeID issued by Close and the reaper, both
-		// of which mark the session StatusClosing *before* stopping the runtime.
-		// Only an exit from a non-closing session is a genuine crash; otherwise
-		// we must not reclaim the session or push a false alarm.
+		// A session still present and not closing died on its own. Close and the
+		// reaper mark the session closing *before* stopping the process, so an
+		// intentional exit never reaches here with a live registry entry.
 		if s.Status != StatusClosing {
 			crashed = true
-			// Vestigial: this in-memory write is no longer persisted (the session
-			// is deleted below), but kept for any future diagnostics that read
-			// the in-memory status before reclamation completes.
+			// Vestigial: this in-memory write is not persisted (the session is
+			// deleted below), but kept for any diagnostic that reads the
+			// in-memory status before reclamation completes.
 			s.Status = StatusFailed
 			deviceIDForPush = s.DeviceID
 			// ACP session id (the id the client navigates by), for the crash push.
@@ -208,25 +212,21 @@ func (rs *RuntimeSession) handleProcessExit(sessionID, runtimeID, deviceID, agen
 		}
 		s.mu.Unlock()
 		if crashed {
-			// A crashed session is dead and unrecoverable — its agent process is gone.
-			// Reclaim it fully so it cannot keep holding the runtime's exclusive lease
-			// (which would reject a fresh session on the same runtime with
-			// ErrRuntimeLeaseHeld) or linger as a "failed" record. Mirrors Close's
-			// teardown, minus stopping the already-dead runtime. The crash push below
-			// still fires so the client is notified.
+			// A crashed session is dead and unrecoverable — its agent process is
+			// gone. Reclaim it fully so it cannot linger as a "failed" record. The
+			// crash push below still fires so the client is notified.
 			if s.cancelPump != nil {
 				s.cancelPump()
 			}
-			_ = rs.pm.ReleaseLease(runtimeID, s.Leaseholder)
-			delete(rs.sessions, sessionID)
-			_ = rs.store.DeleteSession(context.Background(), sessionID)
+			delete(rs.sessions, sess.ID)
+			_ = rs.store.DeleteSession(context.Background(), sess.ID)
 		}
 	}
 	rs.mu.Unlock()
 
-	// Notify on a genuine crash (not an intentional stop) regardless of client attachment; the client
-	// decides whether to surface it based on its own foreground/background
-	// state. Dispatched asynchronously inside sendPushNotification.
+	// Notify on a genuine crash (not an intentional stop) regardless of client
+	// attachment; the client decides whether to surface it based on its own
+	// foreground/background state. Dispatched asynchronously in sendPushNotification.
 	if crashed && !intentional && deviceIDForPush != "" {
 		rs.sendPushNotification(deviceIDForPush, acpSessionIDForPush, cwdForPush, "Agent Crashed", agentForPush+" has stopped unexpectedly.", push.CategoryAgentCrash)
 	}
@@ -234,10 +234,10 @@ func (rs *RuntimeSession) handleProcessExit(sessionID, runtimeID, deviceID, agen
 
 // FindReconnectableByRuntime returns the ID of the existing reconnectable
 // session (active or disconnected) for a runtime owned by the given device, if
-// one exists. A runtime has at most one session because the session holds the
-// runtime's exclusive lease. This lets a reconnect reuse the live session — and
-// its still-running agent — instead of attempting to create a second session,
-// which would fail with ErrRuntimeLeaseHeld because the lease is still held.
+// one exists. A runtime has at most one session, because connecting starts the
+// agent and the session owns its single process. This lets a reconnect reuse
+// the live session — and its still-running agent — instead of launching a
+// second process.
 func (rs *RuntimeSession) FindReconnectableByRuntime(runtimeID, deviceID string) (string, bool) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -360,7 +360,6 @@ func (rs *RuntimeSession) AttachClient(ctx context.Context, sessionID, attachTok
 		DeviceID:    sess.DeviceID,
 		AgentID:     sess.AgentID,
 		Status:      StatusActive,
-		Leaseholder: sess.Leaseholder,
 		CreatedAt:   sess.CreatedAt,
 	}
 	runtimeID := sess.RuntimeID
@@ -436,7 +435,6 @@ func (rs *RuntimeSession) DetachClient(sessionID string, gen int64) error {
 		DeviceID:               sess.DeviceID,
 		AgentID:                sess.AgentID,
 		Status:                 StatusDisconnected,
-		Leaseholder:            sess.Leaseholder,
 		CreatedAt:              sess.CreatedAt,
 		LastClientDisconnectAt: &now,
 		DisconnectedSince:      &now,
@@ -466,22 +464,7 @@ func (rs *RuntimeSession) DetachClient(sessionID string, gen int64) error {
 	return nil
 }
 
-// Close terminates a session. The order of operations ensures clean teardown:
-//  1. Mark closing (persisted) — prevents reconnection during shutdown
-//  2. Stop pump — the stdout drain loop is cancelled
-//  3. Delete from in-memory registry and release rs.mu — before any I/O to the
-//     agent, so the OnProcessExit callback (which fires during StopByRuntimeID)
-//     won't find the session and will no-op safely instead of racing with
-//     teardown, and so a stuck agent can never block other sessions
-//  4. Send ACP session/close — gives agent a chance to cancel in-flight work.
-//     The pipe write has no deadline (an agent that stopped reading stdin blocks
-//     it), so it runs in a goroutine and is waited on for at most
-//     closeWriteTimeout; stopping the runtime next unblocks it with EPIPE.
-//  5. Stop runtime — 2-second graceful timeout, then force kill. The session is
-//     already out of the map, so any concurrent lookup fails cleanly.
-//  6. Release lease — clears the leaseholder on the process handle. Stopping the
-//     runtime normally drops the handle first, so ErrRuntimeNotFound is expected.
-//  7. Delete from storage — cascades to outbound/inbound rows
+// Close terminates a session after checking that it belongs to the device.
 func (rs *RuntimeSession) Close(ctx context.Context, sessionID, deviceID string) error {
 	rs.mu.Lock()
 	sess, ok := rs.sessions[sessionID]
@@ -493,32 +476,99 @@ func (rs *RuntimeSession) Close(ctx context.Context, sessionID, deviceID string)
 		rs.mu.Unlock()
 		return ErrDeviceMismatch
 	}
+	rs.mu.Unlock()
 
-	// Step 1: Mark the session as closing so no concurrent operation treats it as live.
+	return rs.closeSession(ctx, sess)
+}
+
+// StopByRuntimeID closes the session bound to runtimeID, stopping its agent
+// process. Runtimes are gateway-global, so any control-scoped client may stop
+// one. Returns the runtime's final record.
+func (rs *RuntimeSession) StopByRuntimeID(ctx context.Context, runtimeID string) (runtime.Runtime, error) {
+	rs.mu.Lock()
+	sess, ok := rs.sessionByRuntimeLocked(runtimeID)
+	rs.mu.Unlock()
+	if !ok {
+		return runtime.Runtime{}, ErrSessionNotFound
+	}
+	if err := rs.closeSession(ctx, sess); err != nil {
+		return runtime.Runtime{}, err
+	}
+	return rs.runtimeSvc.Get(runtimeID)
+}
+
+// StopByAgent closes every session for the agent, stopping each agent process.
+// It returns the newest stopped runtime.
+func (rs *RuntimeSession) StopByAgent(ctx context.Context, agentID string) (runtime.Runtime, error) {
+	rs.mu.Lock()
+	var targets []*Session
+	for _, s := range rs.sessions {
+		if s.AgentID == agentID {
+			targets = append(targets, s)
+		}
+	}
+	rs.mu.Unlock()
+	if len(targets) == 0 {
+		return runtime.Runtime{}, ErrSessionNotFound
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].CreatedAt.After(targets[j].CreatedAt) })
+
+	newestID := targets[0].RuntimeID
+	for _, s := range targets {
+		if err := rs.closeSession(ctx, s); err != nil {
+			rs.logger.Warn("failed to stop session for agent", "session_id", s.ID, "agent_id", agentID, "error", err)
+		}
+	}
+	newest, err := rs.runtimeSvc.Get(newestID)
+	if err != nil {
+		return runtime.Runtime{}, err
+	}
+	return newest, nil
+}
+
+// sessionByRuntimeLocked returns the session bound to runtimeID. Caller holds rs.mu.
+func (rs *RuntimeSession) sessionByRuntimeLocked(runtimeID string) (*Session, bool) {
+	for _, s := range rs.sessions {
+		if s.RuntimeID == runtimeID {
+			return s, true
+		}
+	}
+	return nil, false
+}
+
+// closeSession tears down one session and stops the agent process it owns. The
+// caller must not hold rs.mu. Ordering keeps teardown safe: the session is
+// marked closing (persisted) and removed from the registry before any agent
+// I/O, so the exit watcher (which fires while the process is stopped) finds no
+// live session and records the exit as intentional.
+func (rs *RuntimeSession) closeSession(ctx context.Context, sess *Session) error {
+	// Step 1: mark the session as closing and its exit intentional, so no
+	// concurrent operation treats it as live and the exit watcher records a
+	// clean stop even if the process dies during teardown.
+	sess.stopping.Store(true)
 	sess.mu.Lock()
 	sess.Status = StatusClosing
 	sess.mu.Unlock()
 
 	if err := rs.store.SaveSession(ctx, storage.SessionRecord{
-		SessionID:   sess.ID,
-		RuntimeID:   sess.RuntimeID,
-		DeviceID:    sess.DeviceID,
-		AgentID:     sess.AgentID,
-		Status:      StatusClosing,
-		Leaseholder: sess.Leaseholder,
-		CreatedAt:   sess.CreatedAt,
+		SessionID: sess.ID,
+		RuntimeID: sess.RuntimeID,
+		DeviceID:  sess.DeviceID,
+		AgentID:   sess.AgentID,
+		Status:    StatusClosing,
+		CreatedAt: sess.CreatedAt,
 	}); err != nil {
 		rs.logger.Error("failed to persist closing status", "error", err)
 	}
 
-	// Step 2: Stop the stdout drain loop so no new frames enter the buffer.
+	// Step 2: stop the stdout drain loop so no new frames enter the buffer.
 	if sess.cancelPump != nil {
 		sess.cancelPump()
 	}
 
-	// Step 3: Drop the session from the registry and release rs.mu before the
-	// agent I/O below; rs.mu is shared by every session.
-	delete(rs.sessions, sessionID)
+	// Step 3: drop the session from the registry before the agent I/O below.
+	rs.mu.Lock()
+	delete(rs.sessions, sess.ID)
 	rs.mu.Unlock()
 
 	// Step 4: If the agent supports session/close, send one last ACP request
@@ -538,7 +588,7 @@ func (rs *RuntimeSession) Close(ctx context.Context, sessionID, deviceID string)
 		if acpID == "" {
 			// Fallback: no session/new response observed (defensive; the
 			// agent accepted initialize, so it should have one).
-			acpID = sessionID
+			acpID = sess.ID
 		}
 		closeMsg, _ := json.Marshal(struct {
 			JSONRPC string                  `json:"jsonrpc"`
@@ -548,7 +598,7 @@ func (rs *RuntimeSession) Close(ctx context.Context, sessionID, deviceID string)
 		}{
 			JSONRPC: "2.0",
 			Method:  "session/close",
-			ID:      "gw-close-" + sessionID,
+			ID:      "gw-close-" + sess.ID,
 			Params:  acp.CloseSessionRequest{SessionId: acp.SessionId(acpID)},
 		})
 		written := make(chan struct{})
@@ -559,23 +609,28 @@ func (rs *RuntimeSession) Close(ctx context.Context, sessionID, deviceID string)
 		select {
 		case <-written:
 		case <-time.After(closeWriteTimeout):
-			rs.logger.Warn("agent did not accept session/close in time; stopping runtime", "runtime_id", sess.RuntimeID)
+			rs.logger.Warn("agent did not accept session/close in time; stopping process", "runtime_id", sess.RuntimeID)
 		}
 	}
 
-	if _, err := rs.pm.StopByRuntimeID(sess.RuntimeID); err != nil {
-		rs.logger.Error("failed to stop runtime during close", "error", err, "runtime_id", sess.RuntimeID)
+	// Step 5: stop the process the session owns; the exit is already marked
+	// intentional (Step 1). Wait for the watcher to record the exit so the
+	// runtime is observably stopped when this returns.
+	if err := sess.proc.Stop(2 * time.Second); err != nil {
+		rs.logger.Warn("agent process did not stop cleanly", "runtime_id", sess.RuntimeID, "error", err)
+	}
+	if sess.exited != nil {
+		select {
+		case <-sess.exited:
+		case <-time.After(5 * time.Second):
+			rs.logger.Warn("timed out waiting for process exit to be recorded", "runtime_id", sess.RuntimeID)
+		}
 	}
 
-	rs.mu.Lock()
-	if err := rs.pm.ReleaseLease(sess.RuntimeID, sess.Leaseholder); err != nil && !errors.Is(err, runtime.ErrRuntimeNotFound) {
-		rs.logger.Error("failed to release lease during close", "error", err, "runtime_id", sess.RuntimeID)
+	// Step 6: delete from storage — cascades to outbound/inbound rows.
+	if err := rs.store.DeleteSession(ctx, sess.ID); err != nil {
+		rs.logger.Error("failed to delete session from store during close", "error", err, "session_id", sess.ID)
 	}
-	if err := rs.store.DeleteSession(ctx, sessionID); err != nil {
-		rs.logger.Error("failed to delete session from store during close", "error", err, "session_id", sessionID)
-	}
-
-	rs.mu.Unlock()
 
 	return nil
 }
@@ -700,34 +755,33 @@ func (rs *RuntimeSession) reapExpired(maxDisc time.Duration) {
 	}
 	rs.mu.Unlock()
 
-	for id, sess := range toClose {
-		if sess.cancelPump != nil {
-			sess.cancelPump()
+	for _, sess := range toClose {
+		if err := rs.closeSession(context.Background(), sess); err != nil {
+			rs.logger.Warn("failed to reap expired session", "session_id", sess.ID, "error", err)
 		}
-		_, _ = rs.pm.StopByRuntimeID(sess.RuntimeID)
-		_ = rs.pm.ReleaseLease(sess.RuntimeID, sess.Leaseholder)
-		_ = rs.store.DeleteSession(context.Background(), sess.ID)
-		rs.mu.Lock()
-		delete(rs.sessions, id)
-		rs.mu.Unlock()
 	}
 }
 
-// Shutdown stops the reaper, cancels all active session pumps, releases their
-// leases, and stops the inbound diagnostic writer.
+// Shutdown stops the reaper, cancels all active session pumps, stops every
+// agent process, and stops the inbound diagnostic writer.
 func (rs *RuntimeSession) Shutdown() {
 	if rs.cancelReaper != nil {
 		rs.cancelReaper()
 	}
 	rs.mu.Lock()
-	for id, sess := range rs.sessions {
-		if sess.cancelPump != nil {
-			sess.cancelPump()
-		}
-		_ = rs.pm.ReleaseLease(sess.RuntimeID, sess.Leaseholder)
-		delete(rs.sessions, id)
+	rs.closed = true
+	sessions := make([]*Session, 0, len(rs.sessions))
+	for _, sess := range rs.sessions {
+		sessions = append(sessions, sess)
 	}
 	rs.mu.Unlock()
+
+	for _, sess := range sessions {
+		if err := rs.closeSession(context.Background(), sess); err != nil {
+			rs.logger.Warn("failed to stop session during shutdown", "session_id", sess.ID, "error", err)
+		}
+	}
+
 	if rs.inbound != nil {
 		rs.inbound.stop()
 	}

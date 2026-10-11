@@ -90,7 +90,7 @@ func (s *Server) handleSessionClose(w http.ResponseWriter, r *http.Request) {
 
 // handleACPWebSocket handles resilient session WebSocket connections.
 // Clients must supply ?sessionId=<id>&attachToken=<token> query parameters,
-// obtained via POST /v1/runtimes/{id}/connect with sessionMode:"resilient".
+// obtained via POST /v1/agents/{id}/connect.
 func (s *Server) handleACPWebSocket(w http.ResponseWriter, r *http.Request) {
 	runtimeID := r.PathValue("runtimeId")
 	sessionID := r.URL.Query().Get("sessionId")

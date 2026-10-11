@@ -54,29 +54,8 @@ var (
 	ErrAttachTokenExpired  = errors.New("attach token has expired")
 	ErrSessionLimitReached = errors.New("session limit for this device has been reached")
 	ErrDeviceMismatch      = errors.New("session does not belong to this device")
-	ErrRuntimeLeaseHeld    = errors.New("runtime is already leased by another session")
 	ErrCwdUnknown          = errors.New("agent working directory is not known yet")
 )
-
-// ProcessManager is the interface RuntimeSession depends on for runtime
-// lifecycle operations. Satisfied by *runtime.Supervisor. This interface
-// exists to break the import cycle that would occur if the session package
-// imported the runtime package directly. It exposes only the five methods
-// RuntimeSession actually needs:
-//
-//   - AcquireLease: grants exclusive pipe access for a new session
-//   - ReleaseLease: clears the lease on session close or failure
-//   - OnProcessExit: registers a callback for agent exit notification, flagging
-//     intentional exits (stop/restart) apart from crashes
-//   - StopByRuntimeID: terminates the backing runtime process
-//   - AppendLog: mirrors ACP traffic into the runtime log buffer
-type ProcessManager interface {
-	AcquireLease(runtimeID, leaseholder string) (runtime.Pipes, error)
-	ReleaseLease(runtimeID, leaseholder string) error
-	OnProcessExit(runtimeID string, callback func(runtimeID string, intentional bool))
-	StopByRuntimeID(runtimeID string) (runtime.Runtime, error)
-	AppendLog(runtimeID, stream, message string)
-}
 
 type SessionSummary struct {
 	SessionID string    `json:"sessionId"`
@@ -117,18 +96,19 @@ type Config struct {
 }
 
 // RuntimeSession is the central session orchestrator. It owns the in-memory
-// session registry, coordinates with ProcessManager for runtime lifecycle,
-// mints attach tokens via TokenService, and runs a background reaper
-// to clean up expired disconnected sessions.
+// session registry and the agent processes behind them, mints attach tokens via
+// TokenService, and runs a background reaper to clean up expired disconnected
+// sessions.
 type RuntimeSession struct {
-	logger   *slog.Logger
-	store    *storage.SQLiteStore
-	pm       ProcessManager // runtime lifecycle (lease, stop, exit callback)
-	tokenSvc *TokenService  // attach token mint/validate
-	cfg      Config
+	logger     *slog.Logger
+	store      *storage.SQLiteStore
+	runtimeSvc *runtime.Supervisor // process launch + runtime diagnostics
+	tokenSvc   *TokenService       // attach token mint/validate
+	cfg        Config
 
 	mu       sync.Mutex
 	sessions map[string]*Session // in-memory registry, keyed by session ID
+	closed   bool                // set by Shutdown; refuses new sessions
 
 	inbound *inboundWriter // async diagnostic logger for client->agent messages
 
@@ -137,21 +117,30 @@ type RuntimeSession struct {
 	cancelReaper context.CancelFunc // shuts down the reaper goroutine on Close
 }
 
-// Session is a single resilient agent session. It outlives any WebSocket
-// connection — the pump continues draining agent stdout even when no client
-// is attached.
+// Session is a single resilient agent session. It owns its agent process
+// directly and outlives any WebSocket connection — the pump continues draining
+// agent stdout even when no client is attached.
 type Session struct {
 	ID             string
 	RuntimeID      string
 	DeviceID       string
 	AgentID        string
 	Status         string // active, disconnected, closing, failed
-	Leaseholder    string // always the session's own ID
 	CreatedAt      time.Time
 	DisconnectedAt *time.Time // set when client detaches, nil when attached
 
+	proc       *runtime.Process   // the agent process this session owns
 	pump       *StdioPump         // long-lived stdout drain + stdin writer
 	cancelPump context.CancelFunc // stops the StdoutDrainLoop on session close
+
+	// exited is closed once the exit watcher has recorded the process exit on
+	// the runtime and reclaimed the session. Close waits on it so a stopped
+	// runtime is observed as stopped.
+	exited chan struct{}
+
+	// stopping is set before the process is intentionally terminated, so the
+	// exit watcher records the exit as intentional rather than a crash.
+	stopping atomic.Bool
 
 	inboundSeq atomic.Int64 // monotonic counter for client->agent diagnostic frames
 
@@ -159,7 +148,7 @@ type Session struct {
 }
 
 // NewRuntimeSession creates a new session service and starts the reaper goroutine.
-func NewRuntimeSession(logger *slog.Logger, store *storage.SQLiteStore, pm ProcessManager, tokenSvc *TokenService, cfg Config) *RuntimeSession {
+func NewRuntimeSession(logger *slog.Logger, store *storage.SQLiteStore, runtimeSvc *runtime.Supervisor, tokenSvc *TokenService, cfg Config) *RuntimeSession {
 	frameLog, err := newFrameLogManager(cfg.FrameLogEnabled, cfg.FrameLogDir, cfg.FrameLogMaxSize, cfg.FrameLogMaxBackups)
 	if err != nil {
 		// A misconfigured frame log must not take down the session service;
@@ -168,13 +157,13 @@ func NewRuntimeSession(logger *slog.Logger, store *storage.SQLiteStore, pm Proce
 		frameLog = nil
 	}
 	rs := &RuntimeSession{
-		logger:   logger.With("component", "session"),
-		store:    store,
-		pm:       pm,
-		tokenSvc: tokenSvc,
-		cfg:      cfg,
-		sessions: make(map[string]*Session),
-		frameLog: frameLog,
+		logger:     logger.With("component", "session"),
+		store:      store,
+		runtimeSvc: runtimeSvc,
+		tokenSvc:   tokenSvc,
+		cfg:        cfg,
+		sessions:   make(map[string]*Session),
+		frameLog:   frameLog,
 	}
 	if cfg.MaxDisconnected <= 0 {
 		rs.cfg.MaxDisconnected = defaultMaxDisconnected

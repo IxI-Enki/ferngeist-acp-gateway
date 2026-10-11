@@ -32,12 +32,7 @@ type runtimesResponse struct {
 	Runtimes []runtime.Runtime `json:"runtimes"`
 }
 
-// runtimeStartResponse is returned when an agent runtime is successfully started.
-type runtimeStartResponse struct {
-	Runtime runtime.Runtime `json:"runtime"`
-}
-
-// runtimeStopResponse is returned when an agent runtime is successfully stopped.
+// runtimeStopResponse is returned when an agent's runtimes are successfully stopped.
 type runtimeStopResponse struct {
 	Runtime runtime.Runtime `json:"runtime"`
 }
@@ -69,13 +64,11 @@ type runtimeLogsResponse struct {
 
 // runtimeCounts aggregates the current state of all managed runtimes.
 type runtimeCounts struct {
-	Starting    int `json:"starting"`
-	Total       int `json:"total"`
-	Running     int `json:"running"`
-	Stopping    int `json:"stopping"`
-	Stopped     int `json:"stopped"`
-	Failed      int `json:"failed"`
-	CircuitOpen int `json:"circuitOpen"` // circuit breaker tripped, no new starts attempted
+	Starting int `json:"starting"`
+	Total    int `json:"total"`
+	Running  int `json:"running"`
+	Stopped  int `json:"stopped"`
+	Failed   int `json:"failed"`
 }
 
 // handleAgents merges static catalog data with live runtime state so clients do
@@ -143,138 +136,95 @@ func (s *Server) handleRuntimeLogs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleAgentStart(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireGatewayScope(w, r, pairing.ScopeControl); !ok {
+// handleAgentConnect starts the selected agent and creates the resilient
+// session that owns its process, returning the WebSocket connection details.
+// Connecting starts the agent: there is no separate start step.
+func (s *Server) handleAgentConnect(w http.ResponseWriter, r *http.Request) {
+	credential, ok := s.requireGatewayScope(w, r, pairing.ScopeControl)
+	if !ok {
+		return
+	}
+	if s.sessionSvc == nil {
+		writeError(w, http.StatusServiceUnavailable, "session service not available")
 		return
 	}
 
-	agentID := r.PathValue("agentId")
-	agent, err := s.catalog.Get(agentID)
+	agent, err := s.catalog.Get(r.PathValue("agentId"))
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
 
-	var req struct {
-		New bool `json:"new"`
-	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req) // absent/empty body -> New=false
-	}
-	var runtimeInfo runtime.Runtime
-	if req.New {
-		runtimeInfo, err = s.runtime.StartNew(agent)
-	} else {
-		runtimeInfo, err = s.runtime.Start(agent)
-	}
+	sess, attachToken, err := s.sessionSvc.Create(r.Context(), agent, credential.DeviceID, nil)
 	if err != nil {
-		switch {
-		case errors.Is(err, runtime.ErrAgentNotDetected), errors.Is(err, runtime.ErrUnsupportedLaunch), errors.Is(err, runtime.ErrRemoteStartNotAllowed):
-			writeError(w, http.StatusConflict, err.Error())
-		case errors.Is(err, runtime.ErrExecutableNotFound):
-			writeError(w, http.StatusFailedDependency, err.Error())
-		default:
-			writeError(w, http.StatusInternalServerError, "failed to start runtime")
-		}
+		writeAgentLaunchError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, runtimeStartResponse{Runtime: runtimeInfo})
+
+	descriptor, err := s.runtime.Connect(sess.RuntimeID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session runtime is not connectable")
+		return
+	}
+	resp := connectResponseFromDescriptor(r, descriptor)
+	resp.SessionID = sess.ID
+	resp.AttachToken = attachToken
+	writeJSON(w, http.StatusOK, resp)
 }
 
+// writeAgentLaunchError maps the session service's launch failures onto the
+// agent-control HTTP contract.
+func writeAgentLaunchError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, runtime.ErrAgentNotDetected),
+		errors.Is(err, runtime.ErrUnsupportedLaunch),
+		errors.Is(err, runtime.ErrRemoteStartNotAllowed),
+		errors.Is(err, session.ErrSessionLimitReached):
+		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, runtime.ErrExecutableNotFound):
+		writeError(w, http.StatusFailedDependency, err.Error())
+	case errors.Is(err, session.ErrSessionNotActive):
+		writeError(w, http.StatusServiceUnavailable, "session service is shutting down")
+	default:
+		writeError(w, http.StatusInternalServerError, "failed to start agent")
+	}
+}
+
+// handleAgentStop stops every runtime for the agent (each is owned by one
+// session) and reports the newest stopped runtime.
 func (s *Server) handleAgentStop(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireGatewayScope(w, r, pairing.ScopeControl); !ok {
 		return
 	}
-
-	agentID := r.PathValue("agentId")
-
-	var agentRuntimes []runtime.Runtime
-	for _, rt := range s.runtime.List() {
-		if rt.AgentID == agentID {
-			agentRuntimes = append(agentRuntimes, rt)
-		}
-	}
-	if len(agentRuntimes) == 0 {
-		writeError(w, http.StatusNotFound, "no runtimes for agent")
+	if s.sessionSvc == nil {
+		writeError(w, http.StatusServiceUnavailable, "session service not available")
 		return
 	}
 
-	for _, rt := range agentRuntimes {
-		s.runtime.StopByRuntimeID(rt.ID)
-	}
-
-	writeJSON(w, http.StatusOK, runtimeStopResponse{Runtime: agentRuntimes[0]})
-}
-
-// handleRuntimeConnect converts a running runtime into an ACP connection
-// descriptor. The WebSocket endpoint authenticates the client with the attach
-// token issued for a resilient session.
-func (s *Server) handleRuntimeConnect(w http.ResponseWriter, r *http.Request) {
-	credential, ok := s.requireGatewayScope(w, r, pairing.ScopeControl)
-	if !ok {
-		return
-	}
-
-	runtimeID := r.PathValue("runtimeId")
-	descriptor, err := s.runtime.Connect(runtimeID)
+	runtimeInfo, err := s.sessionSvc.StopByAgent(r.Context(), r.PathValue("agentId"))
 	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		if errors.Is(err, session.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "no runtimes for agent")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to stop agent")
 		return
 	}
-	resp := connectResponseFromDescriptor(r, descriptor)
 
-	// If the client requested a resilient session, attach the session ID and a
-	// fresh attach token to the connect response. Reuse an existing session for
-	// this runtime when one is still alive (the common reconnect-after-app-kill
-	// case): the agent process and the runtime lease are still held by it, so
-	// creating a second session would fail with ErrRuntimeLeaseHeld and leave the
-	// client without session credentials.
-	if r.Body != nil && r.ContentLength > 0 {
-		var body struct {
-			SessionMode string `json:"sessionMode"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil && body.SessionMode == "resilient" && s.sessionSvc != nil {
-			if existingID, ok := s.sessionSvc.FindReconnectableByRuntime(runtimeID, credential.DeviceID); ok {
-				attachToken, err := s.sessionSvc.Resume(r.Context(), existingID, credential.DeviceID)
-				if err != nil {
-					s.logger.Warn("failed to resume existing resilient session", "error", err)
-				} else {
-					resp.SessionID = existingID
-					resp.AttachToken = attachToken
-				}
-			} else {
-				sess, attachToken, err := s.sessionSvc.Create(r.Context(), runtimeID, credential.DeviceID, descriptor.AgentID)
-				if err != nil {
-					// A second device targeting a runtime already leased by
-					// another device's session must fail loudly (409) so the
-					// client can retry with POST /start {"new":true}. Returning
-					// 200 with empty session credentials leaves the client
-					// guessing between crash and session limit.
-					if errors.Is(err, runtime.ErrRuntimeLeaseHeld) || errors.Is(err, session.ErrRuntimeLeaseHeld) {
-						s.logger.Warn("resilient connect rejected: runtime lease held", "runtimeId", runtimeID)
-						writeError(w, http.StatusConflict, "runtime_lease_held")
-						return
-					}
-					s.logger.Warn("failed to create resilient session", "error", err)
-				} else {
-					resp.SessionID = sess.ID
-					resp.AttachToken = attachToken
-				}
-			}
-		}
-	}
-
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, runtimeStopResponse{Runtime: runtimeInfo})
 }
 
-// handleRuntimeRestart performs an atomic restart of a runtime: it stops the
-// existing runtime, starts a fresh instance with optional environment
-// overrides, and issues a new connection descriptor.
-// The env scope check ensures only credentials with runtimeRestartEnv scope
-// can pass custom environment variables.
+// handleRuntimeRestart restarts an agent: it stops the session that owns the
+// runtime's process and connects afresh with the merged environment. The env
+// scope check ensures only credentials with runtimeRestartEnv scope can pass
+// custom environment variables.
 func (s *Server) handleRuntimeRestart(w http.ResponseWriter, r *http.Request) {
 	credential, ok := s.requireGatewayScope(w, r, pairing.ScopeControl)
 	if !ok {
+		return
+	}
+	if s.sessionSvc == nil {
+		writeError(w, http.StatusServiceUnavailable, "session service not available")
 		return
 	}
 
@@ -294,28 +244,45 @@ func (s *Server) handleRuntimeRestart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	restarted, err := s.runtime.Restart(runtimeID, request.Env)
+	runtimeInfo, err := s.runtime.Get(runtimeID)
 	if err != nil {
-		s.runtime.AppendLog(runtimeID, "gateway", "runtime restart failed: "+err.Error())
-		switch {
-		case errors.Is(err, runtime.ErrRuntimeNotFound):
-			writeError(w, http.StatusNotFound, err.Error())
-		case errors.Is(err, runtime.ErrRuntimeNotRunning):
-			writeError(w, http.StatusConflict, err.Error())
-		case errors.Is(err, runtime.ErrExecutableNotFound):
-			writeError(w, http.StatusFailedDependency, err.Error())
-		default:
-			writeError(w, http.StatusInternalServerError, "failed to restart runtime")
-		}
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if runtimeInfo.Status != runtime.StatusRunning {
+		writeError(w, http.StatusConflict, runtime.ErrRuntimeNotRunning.Error())
+		return
+	}
+	agent, err := s.catalog.Get(runtimeInfo.AgentID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
 
-	descriptor, err := s.runtime.Connect(restarted.ID)
+	if _, err := s.sessionSvc.StopByRuntimeID(r.Context(), runtimeID); err != nil {
+		if errors.Is(err, session.ErrSessionNotFound) {
+			writeError(w, http.StatusConflict, "runtime has no session to restart")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to stop runtime for restart")
+		return
+	}
+
+	sess, attachToken, err := s.sessionSvc.Create(r.Context(), agent, credential.DeviceID, request.Env)
+	if err != nil {
+		writeAgentLaunchError(w, err)
+		return
+	}
+
+	descriptor, err := s.runtime.Connect(sess.RuntimeID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "restarted runtime is not connectable")
 		return
 	}
-	writeJSON(w, http.StatusOK, connectResponseFromDescriptor(r, descriptor))
+	resp := connectResponseFromDescriptor(r, descriptor)
+	resp.SessionID = sess.ID
+	resp.AttachToken = attachToken
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func connectResponseFromDescriptor(r *http.Request, descriptor runtime.ConnectDescriptor) runtimeConnectResponse {
