@@ -172,10 +172,10 @@ func TestProcessExitCrashSendsPush(t *testing.T) {
 	// carries the ACP session id the client navigates by — not the gateway's own
 	// resilient session id (sess.ID), which lives in a different namespace.
 	const acpID = "ses_crash_test"
-	sess.pump.acpMu.Lock()
-	sess.pump.acpSessionID = acpID
-	sess.pump.cwdBySession = map[string]string{acpID: "/work/repo"}
-	sess.pump.acpMu.Unlock()
+	sess.pump.acp.mu.Lock()
+	sess.pump.acp.sessionID = acpID
+	sess.pump.acp.cwdBySession = map[string]string{acpID: "/work/repo"}
+	sess.pump.acp.mu.Unlock()
 
 	// Agent dies on its own while the session is active — a genuine crash.
 	mockPM.triggerExit("rt-crash")
@@ -1162,7 +1162,7 @@ func TestPumpSupportsClose(t *testing.T) {
 		t.Error("expected SupportsClose to be false initially")
 	}
 
-	pump.snoopInitialize(`{"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"close":{}}}}}`)
+	feedInitialize(pump, `{"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"close":{}}}}}`)
 
 	if !pump.SupportsClose() {
 		t.Error("expected SupportsClose to be true after snooping initialize")
@@ -1223,7 +1223,7 @@ func TestCloseWithSupportsClose(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	sess.pump.supportsClose.Store(true)
+	markCloseCapable(sess.pump)
 
 	if err := rs.Close(ctx, sess.ID, "dev-close-sc"); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -1261,13 +1261,13 @@ func TestCloseWithSupportsCloseRoutesThroughPump(t *testing.T) {
 		appendLog:    rs.pm.AppendLog,
 		loadRecovery: newLoadRecovery(rs.logger),
 	}
-	pump.supportsClose.Store(true)
+	markCloseCapable(pump)
 	// The pump snooped the agent-side ACP session id from session/new; the
 	// gateway's session/close must address the agent with it, not the
 	// gateway's own resilient id.
-	pump.acpMu.Lock()
-	pump.acpSessionID = "ses_agent_1"
-	pump.acpMu.Unlock()
+	pump.acp.mu.Lock()
+	pump.acp.sessionID = "ses_agent_1"
+	pump.acp.mu.Unlock()
 
 	sess := &Session{
 		ID:          "sess-close-routed",
@@ -1480,8 +1480,8 @@ func TestPumpStdoutDrainLoopWithFramesAndAppendLog(t *testing.T) {
 
 func TestPumpSnoopInitializeAlreadySet(t *testing.T) {
 	pump := &StdioPump{}
-	pump.supportsClose.Store(true)
-	pump.snoopInitialize(`{"result":{"agentCapabilities":{"sessionCapabilities":{"close":false}}}}`)
+	markCloseCapable(pump)
+	feedInitialize(pump, `{"result":{"agentCapabilities":{"sessionCapabilities":{"close":false}}}}`)
 	if !pump.SupportsClose() {
 		t.Error("expected SupportsClose still true")
 	}
@@ -1493,20 +1493,20 @@ func TestPumpSnoopSessionID(t *testing.T) {
 	pump := &StdioPump{}
 
 	// Unrelated frames don't set it.
-	pump.snoopSessionID(`{"result":{"protocolVersion":1}}`)
-	pump.snoopSessionID(`{"method":"session/update","params":{}}`)
+	feedSessionID(t, pump, `{"result":{"protocolVersion":1}}`)
+	feedSessionID(t, pump, `{"method":"session/update","params":{}}`)
 	if got := pump.AcpSessionID(); got != "" {
 		t.Fatalf("AcpSessionID = %q, want empty before session/new", got)
 	}
 
 	// The session/new response carries result.sessionId — captured here.
-	pump.snoopSessionID(`{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_abc123"}}`)
+	feedSessionID(t, pump, `{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_abc123"}}`)
 	if got := pump.AcpSessionID(); got != "ses_abc123" {
 		t.Fatalf("AcpSessionID = %q, want %q", got, "ses_abc123")
 	}
 
 	// A later session/new (e.g. reconnect) does not clobber the captured id.
-	pump.snoopSessionID(`{"result":{"sessionId":"ses_other"}}`)
+	feedSessionID(t, pump, `{"result":{"sessionId":"ses_other"}}`)
 	if got := pump.AcpSessionID(); got != "ses_abc123" {
 		t.Fatalf("AcpSessionID = %q, want it to stay %q", got, "ses_abc123")
 	}
@@ -1519,19 +1519,19 @@ func TestPumpSnoopInboundSessionID(t *testing.T) {
 	pump := &StdioPump{}
 
 	// Frames without params.sessionId don't set it (e.g. initialize).
-	pump.snoopInboundSessionID([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}`))
+	pump.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}`))
 	if got := pump.AcpSessionID(); got != "" {
 		t.Fatalf("AcpSessionID = %q, want empty before a frame carries sessionId", got)
 	}
 
 	// A session/prompt (or session/load) carries params.sessionId — captured here.
-	pump.snoopInboundSessionID([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"ses_inbound","prompt":[]}}`))
+	pump.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"ses_inbound","prompt":[]}}`))
 	if got := pump.AcpSessionID(); got != "ses_inbound" {
 		t.Fatalf("AcpSessionID = %q, want %q", got, "ses_inbound")
 	}
 
 	// A later inbound frame does not clobber the captured id.
-	pump.snoopInboundSessionID([]byte(`{"method":"session/cancel","params":{"sessionId":"ses_other"}}`))
+	pump.acp.observeInbound([]byte(`{"method":"session/cancel","params":{"sessionId":"ses_other"}}`))
 	if got := pump.AcpSessionID(); got != "ses_inbound" {
 		t.Fatalf("AcpSessionID = %q, want it to stay %q", got, "ses_inbound")
 	}
@@ -1594,10 +1594,10 @@ func TestPumpSwallowedFailureDetection(t *testing.T) {
 			events <- e
 		},
 	}
-	pump.markTurnStart([]byte(`{"jsonrpc":"2.0","id":9,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}`))
+	pump.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":9,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}`))
 
 	// Swallowed failure: end_turn, zero usage, no content → error frame.
-	out, handled := pump.markTurnActivity(`{"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}`)
+	out, handled := turnReplacement(t, pump, `{"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}`)
 	if !handled {
 		t.Fatal("expected swallowed failure to be rewritten")
 	}
@@ -1619,97 +1619,28 @@ func TestPumpSwallowedFailureDetection(t *testing.T) {
 	}
 
 	// Healthy turn: content streamed → passthrough.
-	pump.markTurnStart([]byte(`{"jsonrpc":"2.0","id":10,"method":"session/prompt","params":{}}`))
-	pump.markTurnActivity(`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"}}}`)
-	if _, handled := pump.markTurnActivity(`{"jsonrpc":"2.0","id":10,"result":{"stopReason":"end_turn"}}`); handled {
+	pump.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":10,"method":"session/prompt","params":{}}`))
+	turnReplacement(t, pump, `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"}}}`)
+	if _, handled := turnReplacement(t, pump, `{"jsonrpc":"2.0","id":10,"result":{"stopReason":"end_turn"}}`); handled {
 		t.Fatal("healthy turn with content must not be rewritten")
 	}
 
 	// Non-zero usage → passthrough.
-	pump.markTurnStart([]byte(`{"jsonrpc":"2.0","id":11,"method":"session/prompt","params":{}}`))
-	if _, handled := pump.markTurnActivity(`{"jsonrpc":"2.0","id":11,"result":{"stopReason":"end_turn","usage":{"inputTokens":30,"outputTokens":12}}}`); handled {
+	pump.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":11,"method":"session/prompt","params":{}}`))
+	if _, handled := turnReplacement(t, pump, `{"jsonrpc":"2.0","id":11,"result":{"stopReason":"end_turn","usage":{"inputTokens":30,"outputTokens":12}}}`); handled {
 		t.Fatal("turn with usage must not be rewritten")
 	}
 
 	// Non-end_turn stop reason (e.g. refusal) → passthrough.
-	pump.markTurnStart([]byte(`{"jsonrpc":"2.0","id":12,"method":"session/prompt","params":{}}`))
-	if _, handled := pump.markTurnActivity(`{"jsonrpc":"2.0","id":12,"result":{"stopReason":"refusal"}}`); handled {
+	pump.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":12,"method":"session/prompt","params":{}}`))
+	if _, handled := turnReplacement(t, pump, `{"jsonrpc":"2.0","id":12,"result":{"stopReason":"refusal"}}`); handled {
 		t.Fatal("refusal turn must not be rewritten")
 	}
 
 	// Result without a tracked prompt (e.g. initialize) → passthrough.
-	pump.markTurnStart([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
-	if _, handled := pump.markTurnActivity(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}`); handled {
+	pump.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
+	if _, handled := turnReplacement(t, pump, `{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}`); handled {
 		t.Fatal("initialize result must not be rewritten")
-	}
-}
-
-func TestIsTurnCompleteWithAllStopReasons(t *testing.T) {
-	tests := []struct {
-		name string
-		data string
-		want bool
-	}{
-		{"end_turn", `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`, true},
-		{"max_tokens", `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"max_tokens"}}`, true},
-		{"refusal", `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"refusal"}}`, true},
-		{"cancelled", `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"cancelled"}}`, true},
-		{"empty_stop_reason", `{"jsonrpc":"2.0","id":1,"result":{"stopReason":""}}`, false},
-		{"no_stop_reason", `{"jsonrpc":"2.0","id":1,"result":{"foo":"bar"}}`, false},
-		{"no_result", `{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"err"}}`, false},
-		{"notification", `{"jsonrpc":"2.0","method":"session/update","params":{}}`, false},
-		{"request", `{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{}}`, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isTurnComplete([]byte(tt.data)); got != tt.want {
-				t.Errorf("isTurnComplete(%q) = %v, want %v", tt.data, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestIsPermissionRequest(t *testing.T) {
-	tests := []struct {
-		name string
-		data string
-		want bool
-	}{
-		{"permission_request", `{"jsonrpc":"2.0","method":"session/request_permission","params":{"sessionId":"s1","request":{}}}`, true},
-		{"session_update", `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"plan"}}}`, false},
-		{"prompt_response", `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`, false},
-		{"error_response", `{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"err"}}`, false},
-		{"cancel_notification", `{"jsonrpc":"2.0","method":"session/cancel","params":{}}`, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isPermissionRequest([]byte(tt.data)); got != tt.want {
-				t.Errorf("isPermissionRequest(%q) = %v, want %v", tt.data, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestIsJSONRPCError(t *testing.T) {
-	tests := []struct {
-		name string
-		data string
-		want bool
-	}{
-		{"internal_error", `{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"internal error"}}`, true},
-		{"method_not_found", `{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}`, true},
-		{"invalid_params", `{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params","data":{}}}`, true},
-		{"prompt_response", `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`, false},
-		{"notification", `{"jsonrpc":"2.0","method":"session/update","params":{}}`, false},
-		{"request", `{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{}}`, false},
-		{"malformed", `not json`, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isJSONRPCError([]byte(tt.data)); got != tt.want {
-				t.Errorf("isJSONRPCError(%q) = %v, want %v", tt.data, got, tt.want)
-			}
-		})
 	}
 }
 
@@ -2080,7 +2011,7 @@ func TestPumpReplaysInitializeAfterCaching(t *testing.T) {
 	}
 
 	// Agent's initialize response is cached (identified by result.protocolVersion).
-	p.snoopInitialize(`{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"close":{}}}}}`)
+	feedInitialize(p, `{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"close":{}}}}}`)
 	if !p.initResponseCached() {
 		t.Fatal("expected initialize response to be cached")
 	}
@@ -2104,7 +2035,7 @@ func TestPumpSnoopIgnoresNonInitializeResults(t *testing.T) {
 	p := &StdioPump{logger: slog.Default()}
 	// A prompt response has a result object but no protocolVersion; it must not
 	// be mistaken for the initialize response.
-	p.snoopInitialize(`{"jsonrpc":"2.0","id":"5","result":{"stopReason":"end_turn"}}`)
+	feedInitialize(p, `{"jsonrpc":"2.0","id":"5","result":{"stopReason":"end_turn"}}`)
 	if p.initResponseCached() {
 		t.Fatal("non-initialize result must not be cached as the initialize response")
 	}
@@ -2164,7 +2095,7 @@ func TestWorkingDirByRuntime(t *testing.T) {
 	}
 
 	// After the pump captures a cwd, WorkingDir returns it.
-	pump1.snoopInboundCwd([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/proj"}}`))
+	pump1.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/proj"}}`))
 	got, err := rs.WorkingDir("rt-1", "")
 	if err != nil {
 		t.Fatalf("WorkingDir(with cwd) error = %v", err)
@@ -2175,8 +2106,8 @@ func TestWorkingDirByRuntime(t *testing.T) {
 
 	// Two ACP sessions on one agent: each resolves to its own project, while
 	// the unscoped lookup still follows the most recently opened one.
-	pump1.snoopInboundCwd([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"acp-x","cwd":"/x"}}`))
-	pump1.snoopInboundCwd([]byte(`{"jsonrpc":"2.0","id":3,"method":"session/load","params":{"sessionId":"acp-y","cwd":"/y"}}`))
+	pump1.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"acp-x","cwd":"/x"}}`))
+	pump1.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":3,"method":"session/load","params":{"sessionId":"acp-y","cwd":"/y"}}`))
 	if got, err := rs.WorkingDir("rt-1", "acp-x"); err != nil || got != "/x" {
 		t.Fatalf("WorkingDir(acp-x) = (%q, %v), want /x", got, err)
 	}
@@ -2346,7 +2277,7 @@ func TestCloseDoesNotHoldRegistryLockDuringBlockedWrite(t *testing.T) {
 		appendLog:    rs.pm.AppendLog,
 		loadRecovery: newLoadRecovery(rs.logger),
 	}
-	pump.supportsClose.Store(true)
+	markCloseCapable(pump)
 	stuck := &Session{
 		ID: "sess-stuck", RuntimeID: "rt-stuck", DeviceID: "dev-stuck", AgentID: "agent-stuck",
 		Status: StatusActive, Leaseholder: "sess-stuck", CreatedAt: time.Now().UTC(), pump: pump,

@@ -22,15 +22,16 @@ const maxLoadHistoryBytes = 8 << 20 // 8 MiB
 // history as it streams, remembers in-flight load request ids, caches the first
 // successful load response, and — when the agent rejects a duplicate load —
 // replays the buffered history followed by a synthesized success in place of
-// the error. Idempotent agents never reach the error path, so their behavior is
-// unchanged.
+// the error. The replay is announced first with a `_ferngeist/resumed`
+// notification so the client is never lied to about who restored the session.
+// Idempotent agents never reach the error path, so their behavior is unchanged.
 type LoadRecovery struct {
 	mu           sync.Mutex
 	history      map[string][]historyFrame // acpSessionId -> ordered session/update frames
 	histSize     map[string]int            // acpSessionId -> approximate buffered bytes
 	userFrames   map[string]int            // acpSessionId -> buffered user_message_chunk frames
-	response     map[string][]byte   // acpSessionId -> first successful session/load response
-	pendingLoads map[string]string   // load request id -> acpSessionId
+	response     map[string][]byte         // acpSessionId -> first successful session/load response
+	pendingLoads map[string]string         // load request id -> acpSessionId
 
 	logger *slog.Logger
 }
@@ -83,21 +84,12 @@ func (r *LoadRecovery) OnOutbound(payload []byte) {
 // OnFrame inspects an agent->client frame and applies the re-load recovery
 // policy. It first buffers session/update history for future re-loads, then
 // handles recovery. When a duplicate session/load is rejected as "already
-// loaded", it returns replacement frames — the buffered session/update history
-// followed by a synthesized success — and reports handled=true so the caller
-// suppresses the original error. Otherwise the frame passes through unchanged.
-func (r *LoadRecovery) OnFrame(line string) ([]string, bool) {
-	probe, ok := parseFrameProbe([]byte(line))
-	if !ok {
-		probe = frameProbe{}
-	}
-	return r.OnFrameProbe(line, probe, ok)
-}
-
-// OnFrameProbe is the single-parse variant: history buffering and the
-// load-response check read the shared probe instead of re-parsing.
-func (r *LoadRecovery) OnFrameProbe(line string, probe frameProbe, ok bool) ([]string, bool) {
-	r.bufferHistoryProbe(line, probe, ok)
+// loaded", it returns replacement frames — an explicit `_ferngeist/resumed`
+// notification, the buffered session/update history, and a synthesized success
+// — and reports handled=true so the caller suppresses the original error.
+// Otherwise the frame passes through unchanged.
+func (r *LoadRecovery) OnFrame(line string, probe frameProbe, ok bool) ([]string, bool) {
+	r.bufferHistory(line, probe, ok)
 
 	r.mu.Lock()
 	noPending := len(r.pendingLoads) == 0
@@ -140,7 +132,12 @@ func (r *LoadRecovery) OnFrameProbe(line string, probe frameProbe, ok bool) ([]s
 		return nil, false
 	}
 
-	frames := make([]string, 0, len(r.history[sid]))
+	// The gateway restores the session itself here: it tells the client so
+	// openly, then replays the buffered history and finally answers the load
+	// with a synthesized success. The client can trust the replay instead of
+	// defending against a fabricated agent response (see docs/api.md).
+	frames := make([]string, 0, len(r.history[sid])+1)
+	frames = append(frames, resumedFrame(sid, len(r.history[sid])))
 	for _, frame := range r.history[sid] {
 		frames = append(frames, frame.line)
 	}
@@ -152,7 +149,7 @@ func (r *LoadRecovery) OnFrameProbe(line string, probe frameProbe, ok bool) ([]s
 		return nil, false // could not build a safe success; surface the original error
 	}
 	r.logger.Info("recovered already-loaded session/load by replaying buffered history",
-		"acpSessionId", sid, "historyFrames", len(frames))
+		"acpSessionId", sid, "historyFrames", len(frames)-1)
 	return append(frames, success), true
 }
 
@@ -161,16 +158,7 @@ func (r *LoadRecovery) OnFrameProbe(line string, probe frameProbe, ok bool) ([]s
 // session/update notifications are buffered; live request/response frames
 // (permission prompts, rpc results) are not, so a reconnecting client never
 // replays a stale, since-resolved request.
-func (r *LoadRecovery) bufferHistory(line string) {
-	probe, ok := parseFrameProbe([]byte(line))
-	if !ok {
-		return
-	}
-	r.bufferHistoryProbe(line, probe, ok)
-}
-
-// bufferHistoryProbe is the single-parse variant.
-func (r *LoadRecovery) bufferHistoryProbe(line string, probe frameProbe, ok bool) {
+func (r *LoadRecovery) bufferHistory(line string, probe frameProbe, ok bool) {
 	if !ok ||
 		probe.Method != "session/update" || probe.Params == nil || probe.Params.SessionID == "" {
 		return
@@ -266,4 +254,46 @@ func synthesizeLoadSuccess(cached []byte, id json.RawMessage) (string, bool) {
 		return "", false
 	}
 	return string(out), true
+}
+
+// resumedMethod is the gateway's ACP extension notification announcing that a
+// session was restored by the gateway rather than by the agent. Underscore-
+// prefixed per ACP's extension rule, like turnEndedMethod.
+const resumedMethod = "_ferngeist/resumed"
+
+// resumedFrame tells the client, in band on the ACP stream, that everything
+// that follows — buffered history and then a session/load success — came from
+// the gateway, not from the agent. The gateway cannot make an agent re-emit a
+// session it still holds, so it synthesizes the reply; saying so lets the
+// client stop treating the synthesized response as an agent contract and rely
+// on the gateway's resume instead (see docs/api.md).
+func resumedFrame(acpSessionID string, replayed int) string {
+	out, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  resumedMethod,
+		"params": map[string]any{
+			"sessionId":      acpSessionID,
+			"replayedFrames": replayed,
+		},
+	})
+	return string(out)
+}
+
+// rewriteResponseID returns the cached JSON-RPC response with its `id` replaced
+// by id (a reconnecting client's request id), so the client correlates the
+// replayed response with its own request. Returns false if the cache is not a
+// valid JSON object.
+func rewriteResponseID(cached []byte, id json.RawMessage) ([]byte, bool) {
+	var resp map[string]json.RawMessage
+	if err := json.Unmarshal(cached, &resp); err != nil {
+		return nil, false
+	}
+	if len(id) > 0 {
+		resp["id"] = id
+	}
+	out, err := json.Marshal(resp)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }

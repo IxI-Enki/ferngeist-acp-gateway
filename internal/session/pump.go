@@ -2,9 +2,7 @@ package session
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -13,59 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/arafatamim/ferngeist-acp-gateway/internal/push"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/runtime"
-	"github.com/coder/acp-go-sdk"
 	"github.com/coder/websocket"
 )
-
-// frameProbe is the single-parse view of an agent stdout frame. The hot path
-// previously paid 5-6 json.Unmarshal scans per line (markTurnActivity,
-// isTurnComplete, isPermissionRequest, isJSONRPCError, isProgressEvent, plus
-// load-recovery buffering), each with its own []byte(line) copy. Parsing once
-// into this superset struct cuts per-frame CPU/GC to one scan + one copy;
-// rare paths (typed initialize capabilities, load-success synthesis) keep
-// their second parse off the hot path.
-type frameProbe struct {
-	Method string           `json:"method"`
-	ID     *json.RawMessage `json:"id"`
-	Result *struct {
-		ProtocolVersion *int           `json:"protocolVersion"`
-		SessionID       string         `json:"sessionId"`
-		StopReason      acp.StopReason `json:"stopReason"`
-		Usage           *acp.Usage     `json:"usage"`
-	} `json:"result"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error"`
-	Params *struct {
-		SessionID string `json:"sessionId"`
-		// The client request a request-scoped elicitation/create is tied to.
-		RequestID json.RawMessage `json:"requestId"`
-		Update    *struct {
-			Discriminator string `json:"sessionUpdate"`
-			ToolCallID    string `json:"toolCallId"`
-			Status        string `json:"status"`
-			Title         string `json:"title"`
-			Kind          string `json:"kind"`
-			// Content is RawMessage because agents emit both a single
-			// object and an array; a typed slice would fail the whole
-			// probe parse on the object shape (history buffering must
-			// never depend on content shape).
-			Content json.RawMessage `json:"content"`
-		} `json:"update"`
-	} `json:"params"`
-}
-
-// parseFrameProbe parses one stdout frame once. ok=false means invalid JSON;
-// callers treat it as opaque (forward, no notifications).
-func parseFrameProbe(data []byte) (frameProbe, bool) {
-	var probe frameProbe
-	if err := json.Unmarshal(data, &probe); err != nil {
-		return frameProbe{}, false
-	}
-	return probe, true
-}
 
 // acpWebSocketWriteTimeout is the write deadline per WebSocket frame — keep in
 // sync with api/server.go:acpWebSocketWriteTimeout (same value, separate context
@@ -88,7 +36,7 @@ const maxAgentFrameBytes = 64 << 20 // 64 MiB
 // frame either corrupts the transcript (turns glued together) or is the
 // session/load response itself, which leaves the client waiting out its load
 // deadline. Overflowing this byte cap disconnects the client instead of
-// dropping (see handleStdoutLine); the client reconnects and re-loads.
+// dropping (see queueLocked); the client reconnects and re-loads.
 const maxClientQueueBytes = 128 << 20 // 128 MiB
 
 // clientQueue is the per-client outbound frame queue: unbounded in frames,
@@ -134,23 +82,19 @@ func (q *clientQueue) take() []string {
 	return frames
 }
 
-// StdioPump owns the agent's stdout drain loop and provides stdin write access
-// for the session. It runs independently of any WebSocket client — agent output
-// is forwarded to the WebSocket when attached or discarded when no client is
-// connected. Turn-complete, permission-request, and error detection fire push
-// notifications regardless of client attachment: the gateway cannot tell whether
-// the app is foregrounded or backgrounded (only whether a socket is attached, a
-// poor proxy), so it always emits and lets the client decide whether to display.
-// PushEvent carries all context for a push notification fired by the pump.
-// The client decides whether to display it based on its own foreground state.
-type PushEvent struct {
-	SessionID    string
-	AcpSessionID string
-	Category     string
-	Title        string
-	Body         string
-}
-
+// StdioPump moves bytes between one agent process and whichever WebSocket
+// client is attached, and owns the agent session's memory of the ACP
+// conversation while doing it. It runs independently of any WebSocket client —
+// agent output is forwarded when a client is attached and discarded when none
+// is — and it always fires push notifications on notable events, because the
+// gateway cannot tell whether the app is foregrounded (only whether a socket is
+// attached, a poor proxy). The client decides whether to display them.
+//
+// The pump itself parses nothing: it reads a frame, hands it to the ordered
+// stage list in acpstate.go, and queues whatever comes back. Agent-side
+// conversation state lives in acp (acpstate.go), push notification decisions in
+// notify.go, client request ids in request_ids.go, and re-load replay in
+// load_recovery.go.
 type StdioPump struct {
 	pipes     *runtime.LeasedPipes
 	runtimeID string
@@ -159,12 +103,40 @@ type StdioPump struct {
 	logger    *slog.Logger
 	appendLog func(string, string, string)
 
+	// frameLog optionally records every raw ACP frame (in + out) as
+	// newline-delimited JSON in per-agent files. nil when disabled.
+	frameLog *frameLogManager
+
+	// acp is everything the gateway remembers about the ACP conversation on
+	// this agent process (initialize cache, agent name, session ids and cwds,
+	// turn state, running tool kinds). One struct, one mutex.
+	acp acpState
+
+	// onPushNotification receives notable events; nil disables pushes.
 	onPushNotification func(PushEvent)
 
-	clientMu      sync.Mutex
-	client        *websocket.Conn // current connected WebSocket, or nil
-	connGen       int64           // bumped on every Attach; fences stale Bind/Detach from evicted conns
-	supportsClose atomic.Bool     // set when agent advertises sessionCapabilities.close
+	// ProgressInterval is the minimum time between progress pushes.
+	// 0 means push every changed summary with no throttle.
+	ProgressInterval time.Duration
+
+	// Throttle/dedupe state for live progress pushes, per ACP session so one
+	// chat's progress never mutes another's on a shared agent. Guarded by
+	// progressMu. ponytail: entries are never evicted; one per chat the pump hosts.
+	progressMu sync.Mutex
+	progress   map[string]*progressState
+
+	// Translates client request ids so requests from successive connections
+	// never share one. See requestIDs.
+	reqIDs requestIDs
+
+	// Resilient re-load support: buffers session/update history and recovers
+	// "already loaded" rejections from agents that keep the session loaded
+	// across a disconnect. See LoadRecovery. Nil when disabled.
+	loadRecovery *LoadRecovery
+
+	clientMu sync.Mutex
+	client   *websocket.Conn // current connected WebSocket, or nil
+	connGen  int64           // bumped on every Attach; fences stale Bind/Detach from evicted conns
 
 	// Per-client write queue. The drain loop enqueues outbound frames and
 	// returns immediately — it must never block on a client write, or a slow
@@ -191,79 +163,13 @@ type StdioPump struct {
 	// keepalive exists to catch.
 	lastClientWrite atomic.Int64
 
-	// Cached agent `initialize` response. A reconnecting client re-runs the ACP
-	// handshake, but the agent process is already initialized — forwarding a
-	// second `initialize` can make a strict agent error out and exit. Instead we
-	// replay this cached response (with the new request's id) and never forward
-	// the duplicate to the agent.
-	initMu       sync.Mutex
-	initResponse []byte
-	// The agent's human-readable name from initialize's agentInfo, "" until known.
-	// Guarded by initMu.
-	agentName string
-
-	// Cached ACP session id ("ses_…"), snooped from the agent's session/new
-	// response. Sent as the push SessionID so it matches the id the client
-	// navigates and keys ActiveChat by — the gateway's own resilient session id
-	// (sessionID above) is a different namespace and never matches the client.
-	acpMu        sync.Mutex
-	acpSessionID string
-
-	// ACP session working directory ("/abs/project/path"), snooped from the
-	// client's session/new request params.cwd. This is the project directory the
-	// user opened in the agent — the anchor for the gateway's file/diff/status
-	// workspace endpoints. Empty until the client issues session/new.
-	acpCwd string
-	// cwdBySession maps each ACP session id to its own cwd, so the workspace
-	// endpoints can target one chat when the agent hosts several. session/load
-	// carries both; session/new only learns its id from the agent's response,
-	// so its cwd waits in pendingCwd, keyed by the raw request id, until then.
-	// ponytail: never pruned, bounded by the sessions one agent process opens.
-	cwdBySession map[string]string
-	pendingCwd   map[string]string
-
-	// Resilient re-load support: buffers session/update history and recovers
-	// "already loaded" rejections from agents that keep the session loaded
-	// across a disconnect. See LoadRecovery. Nil when disabled.
-	loadRecovery *LoadRecovery
-
-	// Translates client request ids so requests from successive connections
-	// never share one. See requestIDs.
-	reqIDs requestIDs
-
 	lastStdoutAt time.Time // updated on each agent stdout line; used by reaper to avoid killing active agents
 	lastStdoutMu sync.Mutex
-
-	// ProgressInterval is the minimum time between progress pushes.
-	// 0 means push every changed summary with no throttle.
-	ProgressInterval time.Duration
-
-	// Throttle/dedupe state for live progress pushes, per ACP session so one
-	// chat's progress never mutes another's on a shared agent. Guarded by
-	// progressMu. ponytail: entries are never evicted; one per chat the pump hosts.
-	progressMu sync.Mutex
-	progress   map[string]*progressState
-	// Each running tool call's kind: a tool_call_update usually omits it. Entries
-	// leave when the call completes or fails. Guarded by progressMu.
-	toolKinds map[string]string
-
-	// Swallowed-failure detection. Some agents (e.g. Opencode) never send a
-	// JSON-RPC error for a failed LLM call — they return a success with
-	// stopReason=end_turn, zero usage, and no streamed content. The pump
-	// tracks whether the current turn produced any visible output so such
-	// failures can be flagged. Guarded by turnMu.
-	turnMu         sync.Mutex
-	turnActive     bool // a session/prompt is awaiting its result
-	turnHadContent bool // an agent_message_chunk or tool_call arrived this turn
-
-	// frameLog optionally records every raw ACP frame (in + out) as
-	// newline-delimited JSON in per-agent files. nil when disabled.
-	frameLog *frameLogManager
 }
 
 // StdoutDrainLoop continuously reads from agent stdout and forwards frames
 // to an attached WebSocket client. When no client is connected, frames are
-// discarded after notable-event detection and log append. Push notifications
+// discarded after their stage list runs and the log append. Push notifications
 // fire on notable events regardless of whether a client is attached. The loop
 // stops when the context is cancelled.
 func (p *StdioPump) StdoutDrainLoop(ctx context.Context) {
@@ -387,651 +293,39 @@ func readStdoutFrame(r *bufio.Reader, max int) (frame string, dropped bool, err 
 	}
 }
 
-// handleStdoutLine processes a single complete agent stdout frame: log append,
-// session snooping, notification, history buffering, and forwarding to the
-// attached WebSocket (with load-recovery replacement).
-func (p *StdioPump) handleStdoutLine(line string) {
-	// Track when the agent last produced output, so the reaper can
-	// distinguish abandoned sessions from actively-streaming ones.
-	p.lastStdoutMu.Lock()
-	p.lastStdoutAt = time.Now()
-	p.lastStdoutMu.Unlock()
-
-	if p.appendLog != nil {
-		p.appendLog(p.runtimeID, "acp.stdout", line)
-	}
-	if p.frameLog != nil {
-		p.frameLog.append(p.agentID, p.runtimeID, p.sessionID, "out", []byte(line))
-	}
-	// Single parse for the whole frame: one []byte copy + one scan. All
-	// downstream classifiers read the probe instead of re-parsing.
-	// Invalid JSON stays opaque (snoop/notify/recovery skip, frame forwards).
-	frameBytes := []byte(line)
-	probe, probeOK := parseFrameProbe(frameBytes)
-	if !probeOK {
-		probe = frameProbe{}
-	}
-	p.snoopInitializeProbe(probe, line, frameBytes)
-	p.snoopSessionIDProbe(probe)
-	p.snoopSessionCwdProbe(probe)
-	replaced := false
-	if replacement, handled := p.markTurnActivityProbe(probe); handled {
-		line = replacement
-		replaced = true
-		// Replacement is a synthesized error frame; re-probe it cheaply so
-		// routing below sees the frame actually forwarded.
-		if rp, ok := parseFrameProbe([]byte(line)); ok {
-			probe = rp
-			probeOK = true
+// queueLocked moves frames to the bound client's writer goroutine and returns
+// immediately — the drain loop must never block on a client write, or a slow
+// client would stall agent stdout draining (agent pipe fills, agent stalls,
+// session looks dead) and takeover would be blocked. The writer goroutine
+// applies the per-frame timeout and closes the conn on failure. Caller holds
+// clientMu.
+//
+// A client whose backlog overflows is disconnected rather than sent a stream
+// with holes in it: a slow client must not backpressure the agent, and a
+// JSON-RPC stream missing frames is worse than a reconnect. The returned
+// connection (if any) must be closed by the caller after releasing clientMu.
+func (p *StdioPump) queueLocked(frames []string) *websocket.Conn {
+	for i, frame := range frames {
+		if p.writerQ.push(frame) {
+			continue
 		}
+		dropped := p.droppedFrames.Add(uint64(len(frames) - i))
+		p.logger.Warn("client backlog exceeds cap; disconnecting client",
+			"runtime_id", p.runtimeID, "session_id", p.sessionID,
+			"cap_bytes", maxClientQueueBytes, "dropped_total", dropped)
+		evict := p.client
+		p.client = nil
+		p.stopWriterLocked()
+		return evict
 	}
-
-	// Fire a push on notable events regardless of client attachment. A
-	// replaced frame already pushed its own, more specific error.
-	if !replaced {
-		p.checkAndNotifyProbe(probe, probeOK)
-	}
-
-	// Buffer conversation history so a reconnecting client can be re-hydrated
-	// even when the agent rejects a duplicate session/load as "already loaded".
-	// Normally the frame is forwarded as-is. A rejected duplicate session/load
-	// is replaced with the buffered history followed by a synthesized success,
-	// so the client restores context instead of seeing an unrecoverable error.
-	// If the recovery multi-frame write fails partway through, the client
-	// sees history frames but no terminal success. The connection closes,
-	// triggering the detach flow; the client's reconnect logic handles it.
-	outFrames := []string{line}
-	recovered := false
-	if p.loadRecovery != nil {
-		if replacements, handled := p.loadRecovery.OnFrameProbe(line, probe, probeOK); handled {
-			outFrames = replacements
-			recovered = true
-		}
-	}
-
-	// Enqueue the frames to the bound client's writer goroutine and return
-	// immediately — the drain loop must never block on a client write, or a
-	// slow client would stall agent stdout draining (agent pipe fills, agent
-	// stalls, session looks dead) and takeover would be blocked. The writer
-	// goroutine applies the per-frame timeout and closes the conn on failure.
-	// A client whose backlog overflows is disconnected rather than sent a
-	// stream with holes in it: a slow client must not backpressure the agent,
-	// and a JSON-RPC stream missing frames is worse than a reconnect.
-	var evict *websocket.Conn
-	p.clientMu.Lock()
-	// Under clientMu: a reply routed for one generation must not reach the next.
-	origin, isReply := p.reqIDs.peek(probe)
-	outFrames = p.reqIDs.reply(p.connGen, probe, outFrames)
-	bound := p.client != nil && p.writerQ != nil
-	// The agent's unanswered requests are not in load history, so the reply that
-	// restores their session carries them. Only for the connection that asked,
-	// and only once the load succeeded (a recovered "already loaded" counts).
-	if isReply && origin.method == "session/load" && origin.gen == p.connGen &&
-		bound && (recovered || probe.Error == nil) {
-		outFrames = p.reqIDs.redeliver(p.connGen, origin.loadSession, outFrames)
-	}
-	var deliveredGen int64
-	if bound {
-		deliveredGen = p.connGen
-	}
-	p.reqIDs.trackAgentRequest(probe, line, deliveredGen)
-	if bound {
-		outFrames = p.reqIDs.scopeElicitation(p.connGen, probe, outFrames)
-		for i, frame := range outFrames {
-			if p.writerQ.push(frame) {
-				continue
-			}
-			dropped := p.droppedFrames.Add(uint64(len(outFrames) - i))
-			p.logger.Warn("client backlog exceeds cap; disconnecting client",
-				"runtime_id", p.runtimeID, "session_id", p.sessionID,
-				"cap_bytes", maxClientQueueBytes, "dropped_total", dropped)
-			evict = p.client
-			p.client = nil
-			p.stopWriterLocked()
-			break
-		}
-	}
-	p.clientMu.Unlock()
-	if evict != nil {
-		_ = evict.CloseNow()
-	}
+	return nil
 }
 
-// checkAndNotify fires a push notification when the agent emits a notable
-// event (turn complete, permission request, or error). The client decides
-// whether to display it based on its own foreground/background state.
-func (p *StdioPump) checkAndNotify(line string) {
-	if p.onPushNotification == nil {
-		return
-	}
-	probe, ok := parseFrameProbe([]byte(line))
-	if !ok {
-		return
-	}
-	p.checkAndNotifyProbe(probe, true)
-}
-
-// checkAndNotifyProbe is the single-parse variant reading the shared probe.
-func (p *StdioPump) checkAndNotifyProbe(probe frameProbe, ok bool) {
-	if p.onPushNotification == nil || !ok {
-		return
-	}
-	origin, isReply := p.reqIDs.peek(probe)
-	acpID := p.pushAcpSessionID(probe, origin)
-	switch {
-	case probe.Result != nil && probe.Result.StopReason != "":
-		p.endProgress(acpID)
-		// The user cancelled this turn themselves; telling them it ended is noise.
-		if probe.Result.StopReason != acp.StopReasonCancelled {
-			p.onPushNotification(PushEvent{SessionID: p.sessionID, AcpSessionID: acpID, Category: push.CategoryTurnComplete, Title: "Turn Complete", Body: p.AgentName("Your agent") + " has finished processing."})
-		}
-	case probe.Method == "session/request_permission":
-		p.onPushNotification(PushEvent{SessionID: p.sessionID, AcpSessionID: acpID, Category: push.CategoryPermissionRequest, Title: "Permission Required", Body: p.AgentName("Your agent") + " needs approval to run a tool."})
-	case probe.Method == elicitationMethod:
-		// ponytail: shares the permission category so clients route it without a new case.
-		p.onPushNotification(PushEvent{SessionID: p.sessionID, AcpSessionID: acpID, Category: push.CategoryPermissionRequest, Title: "Input Required", Body: p.AgentName("Your agent") + " needs your input."})
-	case probe.Error != nil:
-		// Only a failed prompt is worth a push: errors for optional methods,
-		// replies to an earlier connection, and the "already loaded" rejection
-		// load recovery hides from the client are not.
-		if isReply && origin.method == "session/prompt" {
-			p.endProgress(acpID)
-			p.onPushNotification(PushEvent{SessionID: p.sessionID, AcpSessionID: acpID, Category: push.CategoryError, Title: "Agent Error", Body: p.AgentName("Your agent") + " encountered an unexpected error."})
-		}
-	default:
-		// Only while a prompt runs: session/load replays finished tool calls as
-		// the same updates, which would buzz the phone once per past tool call.
-		if ev := progressEventFromProbe(probe); ev != nil && p.reqIDs.promptRunning(acpID) {
-			ev.acpSessionID = acpID
-			p.maybeNotifyProgress(ev)
-		}
-	}
-}
-
-// pushAcpSessionID picks the ACP session a frame's push should deep-link to: the
-// session the frame names, else the session of the prompt it answers, else the
-// cached id. One agent process can host several chats, so the cached id alone
-// would send every push to the first one.
-func (p *StdioPump) pushAcpSessionID(probe frameProbe, origin pendingRequest) string {
-	if probe.Params != nil && probe.Params.SessionID != "" {
-		return probe.Params.SessionID
-	}
-	if origin.promptSession != "" {
-		return origin.promptSession
-	}
-	return p.AcpSessionID()
-}
-
-type progressState struct {
-	at      time.Time
-	summary string
-	// A throttled summary, sent when the window ends so the notification never
-	// keeps naming a call the agent has moved past.
-	pending string
-	timer   *time.Timer
-}
-
-// maybeNotifyProgress pushes the generic verb of a tool call that starts running,
-// e.g. "Reading a file", the way the app's tool group summary names running calls.
-// A finished call never pushes: its verb would claim work that is already done.
-// Throttled by ProgressInterval (the latest throttled summary goes out when the
-// window ends) and deduplicated against the previous summary.
-func (p *StdioPump) maybeNotifyProgress(ev *progressEvent) {
-	p.progressMu.Lock()
-	defer p.progressMu.Unlock()
-	if ev.acpSessionID == "" {
-		ev.acpSessionID = p.AcpSessionID()
-	}
-
-	if p.toolKinds == nil {
-		p.toolKinds = make(map[string]string)
-	}
-	kind := ev.kind
-	if kind != "" {
-		p.toolKinds[ev.toolCallID] = kind
-	} else {
-		kind = p.toolKinds[ev.toolCallID]
-	}
-	if ev.status == "completed" || ev.status == "failed" {
-		delete(p.toolKinds, ev.toolCallID)
-		return
-	}
-	if ev.status != "in_progress" {
-		return
-	}
-
-	if p.progress == nil {
-		p.progress = make(map[string]*progressState)
-	}
-	st := p.progress[ev.acpSessionID]
-	if st == nil {
-		st = &progressState{}
-		p.progress[ev.acpSessionID] = st
-	}
-	summary := verbForKind(kind)
-	wait := p.ProgressInterval - time.Since(st.at)
-	if p.ProgressInterval <= 0 || wait <= 0 {
-		p.sendProgressLocked(ev.acpSessionID, st, summary)
-		return
-	}
-	st.pending = summary
-	if st.timer == nil {
-		acpID := ev.acpSessionID
-		st.timer = time.AfterFunc(wait, func() {
-			p.progressMu.Lock()
-			defer p.progressMu.Unlock()
-			if p.progress[acpID] != st || st.timer == nil {
-				return // the turn ended first
-			}
-			st.timer = nil
-			p.sendProgressLocked(acpID, st, st.pending)
-		})
-	}
-}
-
-// sendProgressLocked pushes summary unless it repeats the last push. Caller holds progressMu.
-func (p *StdioPump) sendProgressLocked(acpID string, st *progressState, summary string) {
-	st.pending = ""
-	if summary == st.summary {
-		return
-	}
-	st.at, st.summary = time.Now(), summary
-	p.onPushNotification(PushEvent{
-		SessionID:    p.sessionID,
-		AcpSessionID: acpID,
-		Category:     push.CategoryProgress,
-		Title:        p.workingTitle(),
-		Body:         summary,
-	})
-}
-
-// endProgress drops a session's throttled progress at turn end: a push landing
-// after "Turn Complete" would claim the agent is still working.
-func (p *StdioPump) endProgress(acpID string) {
-	p.progressMu.Lock()
-	defer p.progressMu.Unlock()
-	if st := p.progress[acpID]; st != nil && st.timer != nil {
-		st.timer.Stop()
-	}
-	delete(p.progress, acpID)
-}
-
-// snoopInitialize inspects an outbound frame for the agent's `initialize`
-// response. When found it caches the raw response (for replay to reconnecting
-// clients) and records whether the agent advertises sessionCapabilities.close.
-// A response is identified by the presence of result.protocolVersion, which only
-// initialize responses carry.
-func (p *StdioPump) snoopInitialize(line string) {
-	frameBytes := []byte(line)
-	probe, ok := parseFrameProbe(frameBytes)
-	if !ok {
-		return
-	}
-	p.snoopInitializeProbe(probe, line, frameBytes)
-}
-
-// snoopInitializeProbe is the single-parse variant: no re-parse on the hot path.
-func (p *StdioPump) snoopInitializeProbe(probe frameProbe, line string, frameBytes []byte) {
-	if p.initResponseCached() {
-		return
-	}
-	if probe.Result == nil || probe.Result.ProtocolVersion == nil {
-		return
-	}
-
-	p.initMu.Lock()
-	p.initResponse = append([]byte(nil), frameBytes...)
-	p.initMu.Unlock()
-
-	var typed struct {
-		Result *acp.InitializeResponse `json:"result"`
-	}
-	if err := json.Unmarshal(frameBytes, &typed); err != nil || typed.Result == nil {
-		return
-	}
-	if typed.Result.AgentCapabilities.SessionCapabilities.Close != nil {
-		p.supportsClose.Store(true)
-	}
-	if info := typed.Result.AgentInfo; info != nil {
-		name := info.Name
-		if info.Title != nil && *info.Title != "" {
-			name = *info.Title
-		}
-		p.initMu.Lock()
-		p.agentName = name
-		p.initMu.Unlock()
-	}
-}
-
-// AgentName is the agent's name for push text, e.g. "Claude Code", or fallback
-// when initialize carried no agentInfo.
-func (p *StdioPump) AgentName(fallback string) string {
-	p.initMu.Lock()
-	defer p.initMu.Unlock()
-	if p.agentName == "" {
-		return fallback
-	}
-	return p.agentName
-}
-
-// workingTitle is the progress push title, e.g. "Claude Code working".
-func (p *StdioPump) workingTitle() string {
-	return p.AgentName("Agent") + " working"
-}
-
-func (p *StdioPump) initResponseCached() bool {
-	p.initMu.Lock()
-	defer p.initMu.Unlock()
-	return p.initResponse != nil
-}
-
-// snoopSessionID inspects an outbound frame for the agent's `session/new`
-// response and caches the ACP session id it returns. Only the session/new
-// response carries a top-level result.sessionId, so this never misfires on
-// other frames. The id is captured once and reused for the session's lifetime;
-// it is sent as the push SessionID so notifications match the id the client
-// navigates and suppresses by.
-func (p *StdioPump) snoopSessionID(line string) {
-	probe, ok := parseFrameProbe([]byte(line))
-	if !ok {
-		return
-	}
-	p.snoopSessionIDProbe(probe)
-}
-
-// snoopSessionIDProbe is the single-parse variant.
-func (p *StdioPump) snoopSessionIDProbe(probe frameProbe) {
-	p.acpMu.Lock()
-	cached := p.acpSessionID != ""
-	p.acpMu.Unlock()
-	if cached {
-		return
-	}
-	if probe.Result == nil || probe.Result.SessionID == "" {
-		return
-	}
-	p.acpMu.Lock()
-	p.acpSessionID = probe.Result.SessionID
-	p.acpMu.Unlock()
-}
-
-// AcpSessionID returns the snooped ACP session id, or "" if no session/new
-// response has been observed yet.
-func (p *StdioPump) AcpSessionID() string {
-	p.acpMu.Lock()
-	defer p.acpMu.Unlock()
-	return p.acpSessionID
-}
-
-// rewriteResponseID returns the cached JSON-RPC response with its `id` replaced
-// by id (a reconnecting client's request id), so the client correlates the
-// replayed response with its own request. Returns false if the cache is not a
-// valid JSON object.
-func rewriteResponseID(cached []byte, id json.RawMessage) ([]byte, bool) {
-	var resp map[string]json.RawMessage
-	if err := json.Unmarshal(cached, &resp); err != nil {
-		return nil, false
-	}
-	if len(id) > 0 {
-		resp["id"] = id
-	}
-	out, err := json.Marshal(resp)
-	if err != nil {
-		return nil, false
-	}
-	return out, true
-}
-
-// MaybeReplayInitialize intercepts a client `initialize` request. If the agent
-// has already been initialized (its response is cached), it answers the client
-// directly with that cached response — rewritten to carry the request's id — and
-// returns true so the caller does not forward a duplicate `initialize` to the
-// agent. It returns false for non-initialize frames, or for the first
-// `initialize` (no cache yet), which must reach the agent normally.
-func (p *StdioPump) MaybeReplayInitialize(payload []byte) bool {
-	var req struct {
-		Method string          `json:"method"`
-		ID     json.RawMessage `json:"id"`
-	}
-	if err := json.Unmarshal(payload, &req); err != nil || req.Method != "initialize" {
-		return false
-	}
-
-	p.initMu.Lock()
-	cached := p.initResponse
-	p.initMu.Unlock()
-	if cached == nil {
-		return false
-	}
-
-	out, ok := rewriteResponseID(cached, req.ID)
-	if !ok {
-		return false // malformed cache: fall back to forwarding to the agent
-	}
-
-	p.clientMu.Lock()
-	client := p.client
-	p.clientMu.Unlock()
-	if client != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), acpWebSocketWriteTimeout)
-		err := client.Write(ctx, websocket.MessageText, out)
-		cancel()
-		if err != nil {
-			p.logger.Warn("replay initialize write failed", "error", err)
-		}
-	}
-	return true
-}
-
-// markTurnStart records that a session/prompt request is heading to the agent.
-// payload is the raw client frame.
-func (p *StdioPump) markTurnStart(payload []byte) {
-	var req struct {
-		Method string `json:"method"`
-	}
-	if err := json.Unmarshal(payload, &req); err != nil || req.Method != "session/prompt" {
-		return
-	}
-	p.turnMu.Lock()
-	p.turnActive = true
-	p.turnHadContent = false
-	p.turnMu.Unlock()
-}
-
-// markTurnActivity flags content on the active turn: any agent_message_chunk
-// or tool_call/tool_call_update session/update counts as the LLM having
-// actually produced output. It also evaluates the prompt result when it
-// arrives: a success with end_turn, zero usage, and no content is how some
-// agents (e.g. Opencode) report a swallowed LLM failure. In that case it
-// returns a replacement JSON-RPC error response (same request id) so
-// the client sees the turn as failed instead of an empty success; handled
-// reports whether the caller must substitute the frame.
-func (p *StdioPump) markTurnActivity(line string) (out string, handled bool) {
-	probe, ok := parseFrameProbe([]byte(line))
-	if !ok {
-		return "", false
-	}
-	return p.markTurnActivityProbe(probe)
-}
-
-// markTurnActivityProbe is the single-parse variant (no re-parse).
-func (p *StdioPump) markTurnActivityProbe(probe frameProbe) (out string, handled bool) {
-	origin, isReply := p.reqIDs.peek(probe)
-	p.turnMu.Lock()
-
-	if probe.Params != nil && probe.Params.Update != nil {
-		switch probe.Params.Update.Discriminator {
-		case "agent_message_chunk", "tool_call", "tool_call_update":
-			p.turnHadContent = true
-		}
-		p.turnMu.Unlock()
-		return "", false
-	}
-
-	// Prompt result: only judge when a turn was tracked and the response is a
-	// clean success (no JSON-RPC error — that path already pushes via
-	// isJSONRPCError). A reply known to answer another request (a set_mode
-	// reply mid-turn) is not the prompt result; an unknown id is still judged.
-	if !p.turnActive || (isReply && origin.method != "session/prompt") || probe.ID == nil || probe.Result == nil || probe.Error != nil {
-		p.turnMu.Unlock()
-		return "", false
-	}
-	p.turnActive = false
-	// Any non-zero token field counts as usage: agents may populate
-	// input/output without the unstable totalTokens field.
-	used := probe.Result.Usage != nil && (probe.Result.Usage.TotalTokens != 0 ||
-		probe.Result.Usage.InputTokens != 0 || probe.Result.Usage.OutputTokens != 0)
-	swallowed := probe.Result.StopReason == "end_turn" && !used && !p.turnHadContent
-	p.turnMu.Unlock()
-
-	if !swallowed {
-		return "", false
-	}
-
-	// Log/push outside the lock: the callback reaches network code, and
-	// markTurnStart on the next prompt must never queue behind push I/O.
-	p.logger.Warn("agent returned empty success; rewriting as JSON-RPC error "+
-		"(likely swallowed LLM failure: rate limit / invalid model setting)",
-		"runtime_id", p.runtimeID, "session_id", p.sessionID)
-	if p.onPushNotification != nil {
-		p.onPushNotification(PushEvent{
-			SessionID:    p.sessionID,
-			AcpSessionID: p.pushAcpSessionID(probe, origin),
-			Category:     push.CategoryError,
-			Title:        "Agent Error",
-			Body:         p.AgentName("The agent") + " finished without producing anything. This usually means the model call failed (rate limit or invalid setting). Check the gateway logs for details.",
-		})
-	}
-
-	errFrame := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      *probe.ID,
-		"error": map[string]any{
-			"code":    -32000,
-			"message": "Agent produced no output for this turn. The model call likely failed (rate limit or invalid model setting); see the gateway logs for details.",
-		},
-	}
-	outBytes, err := json.Marshal(errFrame)
-	if err != nil {
-		p.logger.Error("failed to marshal swallowed-failure error frame", "error", err)
-		return "", false // forward path treats ""+false as no replacement
-	}
-	return string(outBytes), true
-}
-
-// isTurnComplete checks if a stdout line is a JSON-RPC response with a non-empty
-// stopReason. Any terminal stop reason (end_turn, stop, error, etc.) triggers
-// the push notification callback. Uses acp.PromptResponse for typed access to
-// the StopReason field.
-func isTurnComplete(data []byte) bool {
-	var msg struct {
-		Result *acp.PromptResponse `json:"result"`
-	}
-	if err := json.Unmarshal(data, &msg); err != nil {
-		return false
-	}
-	return msg.Result != nil && msg.Result.StopReason != ""
-}
-
-// isPermissionRequest checks if a stdout line is a session/request_permission
-// notification. The agent sends this during a turn when it needs user approval
-// before executing a tool. Detected here so a push notification can be fired.
-// Uses acp.AgentNotification for typed method name access.
-func isPermissionRequest(data []byte) bool {
-	var n acp.AgentNotification
-	if err := json.Unmarshal(data, &n); err != nil {
-		return false
-	}
-	return n.Method == "session/request_permission"
-}
-
-// isJSONRPCError checks if a stdout line is a JSON-RPC error response (top-level
-// error field instead of result). This catches agent-side failures that aren't
-// represented as a stopReason — e.g. uncaught exceptions, protocol violations.
-// Uses acp.AgentResponse which validates id+error presence per JSON-RPC 2.0.
-func isJSONRPCError(data []byte) bool {
-	var resp acp.AgentResponse
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return false
-	}
-	return resp.Error != nil
-}
-
-// progressEvent is a tool call's status change from an agent's session/update
-// notification. kind is empty when the frame omits it (usual for updates).
-type progressEvent struct {
-	toolCallID string
-	kind       string
-	status     string
-	// The ACP session the push deep-links to; filled in by the notifier.
-	acpSessionID string
-}
-
-// isProgressEvent parses a stdout line for an ACP session/update tool_call or
-// tool_call_update event and returns a progressEvent, or nil for any other frame.
-func isProgressEvent(line string) *progressEvent {
-	probe, ok := parseFrameProbe([]byte(line))
-	if !ok {
-		return nil
-	}
-	return progressEventFromProbe(probe)
-}
-
-// progressEventFromProbe is the single-parse variant.
-func progressEventFromProbe(probe frameProbe) *progressEvent {
-	if probe.Method != "session/update" ||
-		probe.Params == nil || probe.Params.Update == nil {
-		return nil
-	}
-	u := probe.Params.Update
-	switch u.Discriminator {
-	case "tool_call", "tool_call_update":
-	default:
-		return nil
-	}
-	return &progressEvent{toolCallID: u.ToolCallID, kind: u.Kind, status: u.Status}
-}
-
-// verbForKind maps a ToolKind to the generic verb of one running call, worded
-// like the app's tool group summary.
-func verbForKind(kind string) string {
-	switch kind {
-	case "read":
-		return "Reading a file"
-	case "edit":
-		return "Editing a file"
-	case "delete":
-		return "Deleting a file"
-	case "move":
-		return "Moving a file"
-	case "search":
-		return "Searching"
-	case "execute":
-		return "Running a command"
-	case "think":
-		return "Thinking"
-	case "fetch":
-		return "Fetching a URL"
-	case "switch_mode":
-		return "Switching mode"
-	default:
-		return "Using a tool"
-	}
-}
-
+// WriteToAgent writes one client→agent frame to the agent's stdin: it rewrites
+// the client's request id for this connection, records what the frame says
+// about the conversation, and buffers anything a later re-load has to replay.
 func (p *StdioPump) WriteToAgent(payload []byte) error {
-	p.clientMu.Lock()
-	gen := p.connGen
-	p.clientMu.Unlock()
-	payload = p.reqIDs.outbound(gen, payload)
-	p.markTurnStart(payload)
-	p.snoopInboundSessionID(payload)
-	p.snoopInboundCwd(payload)
-	// Record session/load requests so the pump can recover from an "already
-	// loaded" rejection by replaying buffered history (see LoadRecovery).
-	if p.loadRecovery != nil {
-		p.loadRecovery.OnOutbound(payload)
-	}
+	payload = p.prepareOutbound(payload)
 	if p.frameLog != nil {
 		p.frameLog.append(p.agentID, p.runtimeID, p.sessionID, "in", payload)
 	}
@@ -1039,134 +333,16 @@ func (p *StdioPump) WriteToAgent(payload []byte) error {
 }
 
 // WriteSessionClose sends the agent a session/close request during session
-// teardown. It is the only stdin write path that bypasses the client-snooping
-// in WriteToAgent — the frame is gateway-originated (not a client frame, so it
-// must never contaminate the acpSessionId/acpCwd caches) and it is always the
-// final frame before the process is killed. It still passes through the frame
-// log so the teardown handshake is auditable.
+// teardown. It is the only stdin write path that bypasses the inbound frame
+// observation in WriteToAgent — the frame is gateway-originated (not a client
+// frame, so it must never contaminate the ACP session-id/cwd state) and it is
+// always the final frame before the process is killed. It still passes through
+// the frame log so the teardown handshake is auditable.
 func (p *StdioPump) WriteSessionClose(payload []byte) error {
 	if p.frameLog != nil {
 		p.frameLog.append(p.agentID, p.runtimeID, p.sessionID, "in", payload)
 	}
 	return p.pipes.WriteToAgent(payload)
-}
-
-// snoopInboundSessionID captures the ACP session id from a client→agent frame's
-// params.sessionId (session/prompt, session/load, session/cancel, …). The
-// outbound snoop only sees session/new responses, so on a resilient reconnect —
-// where the client restores context via session/load and the agent never
-// re-emits session/new — it would never observe the id and the push SessionID
-// would be empty. The inbound frames always carry it, so this fills the gap.
-// Only client frames reach this path; the gateway's own session/close is written
-// via the leased pipes directly, so it never contaminates the cache with the
-// resilient (non-ACP) session id.
-func (p *StdioPump) snoopInboundSessionID(payload []byte) {
-	p.acpMu.Lock()
-	cached := p.acpSessionID != ""
-	p.acpMu.Unlock()
-	if cached {
-		return
-	}
-	var probe struct {
-		Params *struct {
-			SessionID string `json:"sessionId"`
-		} `json:"params"`
-	}
-	if err := json.Unmarshal(payload, &probe); err != nil ||
-		probe.Params == nil || probe.Params.SessionID == "" {
-		return
-	}
-	p.acpMu.Lock()
-	p.acpSessionID = probe.Params.SessionID
-	p.acpMu.Unlock()
-}
-
-// snoopInboundCwd captures the ACP session working directory from a
-// client->agent session/new, session/load or session/resume request's params.cwd.
-// All carry cwd (load/resume are what Ferngeist sends when reopening a session);
-// unlike sessionId (present on every session-scoped frame), cwd is set once when
-// the client opens the project. Re-captured on each such request so a project
-// switch updates it.
-func (p *StdioPump) snoopInboundCwd(payload []byte) {
-	// Hot path: every client->agent frame passes through here, but only
-	// session/new, session/load and session/resume requests carry cwd. A cheap substring scan
-	// avoids a full JSON parse per frame.
-	if !bytes.Contains(payload, []byte("session/new")) &&
-		!bytes.Contains(payload, []byte("session/load")) &&
-		!bytes.Contains(payload, []byte("session/resume")) {
-		return
-	}
-	var probe struct {
-		Method string           `json:"method"`
-		ID     *json.RawMessage `json:"id"`
-		Params *struct {
-			Cwd       string `json:"cwd"`
-			SessionID string `json:"sessionId"`
-		} `json:"params"`
-	}
-	if err := json.Unmarshal(payload, &probe); err != nil ||
-		(probe.Method != "session/new" && probe.Method != "session/load" && probe.Method != "session/resume") ||
-		probe.Params == nil || probe.Params.Cwd == "" {
-		return
-	}
-	cwd := probe.Params.Cwd
-	p.acpMu.Lock()
-	defer p.acpMu.Unlock()
-	p.acpCwd = cwd
-	switch {
-	case probe.Method != "session/new" && probe.Params.SessionID != "":
-		if p.cwdBySession == nil {
-			p.cwdBySession = make(map[string]string)
-		}
-		p.cwdBySession[probe.Params.SessionID] = cwd
-	case probe.Method == "session/new" && probe.ID != nil:
-		if p.pendingCwd == nil {
-			p.pendingCwd = make(map[string]string)
-		}
-		p.pendingCwd[string(*probe.ID)] = cwd
-	}
-}
-
-// snoopSessionCwdProbe binds a pending session/new cwd to the session id the
-// agent's response assigns. The request id is the one written to the agent
-// (after rewriting), so the agent echoes it verbatim. An error response just
-// drops the pending entry.
-func (p *StdioPump) snoopSessionCwdProbe(probe frameProbe) {
-	if probe.Method != "" || probe.ID == nil {
-		return
-	}
-	p.acpMu.Lock()
-	defer p.acpMu.Unlock()
-	key := string(*probe.ID)
-	cwd, ok := p.pendingCwd[key]
-	if !ok {
-		return
-	}
-	delete(p.pendingCwd, key)
-	if probe.Result == nil || probe.Result.SessionID == "" {
-		return
-	}
-	if p.cwdBySession == nil {
-		p.cwdBySession = make(map[string]string)
-	}
-	p.cwdBySession[probe.Result.SessionID] = cwd
-}
-
-// AcpCwd returns the snooped ACP session working directory, or "" if the client
-// has not issued session/new yet. With several sessions on one agent this is
-// whichever was opened last; AcpCwdFor targets one.
-func (p *StdioPump) AcpCwd() string {
-	p.acpMu.Lock()
-	defer p.acpMu.Unlock()
-	return p.acpCwd
-}
-
-// AcpCwdFor returns the cwd of one ACP session, or "" if the gateway has not
-// seen that session opened or loaded.
-func (p *StdioPump) AcpCwdFor(acpSessionID string) string {
-	p.acpMu.Lock()
-	defer p.acpMu.Unlock()
-	return p.cwdBySession[acpSessionID]
 }
 
 // Attach claims the pump for a new client: bumps the connection generation and
@@ -1255,7 +431,7 @@ func (p *StdioPump) startWriterLocked(conn *websocket.Conn) {
 // clientWriterLoop drains the outbound queue to conn. It runs for the lifetime
 // of one bound client: a write failure or a cancelled context stops it. The
 // queue never blocks the drain loop; a client that falls too far behind is
-// disconnected (see handleStdoutLine).
+// disconnected (see queueLocked).
 //
 // q is passed in rather than read from p.writerQ: a Detach can nil the field
 // before this goroutine first runs.
@@ -1299,19 +475,15 @@ func (p *StdioPump) clientWriterLoop(ctx context.Context, conn *websocket.Conn, 
 	}
 }
 
-func (p *StdioPump) SupportsClose() bool {
-	return p.supportsClose.Load()
-}
-
-// LastStdoutAt returns the timestamp of the agent's most recent stdout line.
-// Zero time means the pump has never received any output — the reaper falls
-// back to DisconnectedAt in that case.
 // AwaitingClient reports whether the agent is waiting on the client to answer
 // one of its requests (a permission prompt, an elicitation, ...).
 func (p *StdioPump) AwaitingClient() bool {
 	return p.reqIDs.hasAgentRequests()
 }
 
+// LastStdoutAt returns the timestamp of the agent's most recent stdout line.
+// Zero time means the pump has never received any output — the reaper falls
+// back to DisconnectedAt in that case.
 func (p *StdioPump) LastStdoutAt() time.Time {
 	p.lastStdoutMu.Lock()
 	defer p.lastStdoutMu.Unlock()

@@ -16,12 +16,50 @@ func newRecoveryPump() *StdioPump {
 	return &StdioPump{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 }
 
+// probeOf parses one ACP frame the way the pump's pipeline does.
+func probeOf(t *testing.T, line string) frameProbe {
+	t.Helper()
+	probe, ok := parseFrameProbe([]byte(line))
+	if !ok {
+		t.Fatalf("parseFrameProbe(%s) failed", line)
+	}
+	return probe
+}
+
+// feedInitialize runs the pump's initialize stage for one agent frame.
+func feedInitialize(p *StdioPump, line string) {
+	raw := []byte(line)
+	probe, _ := parseFrameProbe(raw)
+	p.acp.observeInitialize(probe, raw)
+}
+
+// closeCapableInit is an initialize response advertising sessionCapabilities.close.
+const closeCapableInit = `{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"close":{}}}}}`
+
+// markCloseCapable gives the pump an agent that accepts session/close.
+func markCloseCapable(p *StdioPump) { feedInitialize(p, closeCapableInit) }
+
+// feedSessionID runs the pump's session/new-response stage for one agent frame.
+func feedSessionID(t *testing.T, p *StdioPump, line string) {
+	t.Helper()
+	p.acp.observeSessionID(probeOf(t, line))
+}
+
+// turnReplacement runs the pump's turn stage for one agent frame, exactly as
+// handleStdoutLine does, and reports the replacement frame (if any).
+func turnReplacement(t *testing.T, p *StdioPump, line string) (string, bool) {
+	t.Helper()
+	probe := probeOf(t, line)
+	origin, isReply := p.reqIDs.peek(probe)
+	return p.observeTurn(probe, origin, isReply)
+}
+
 func TestIsProgressEventReadsToolCall(t *testing.T) {
 	line := `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"c1","kind":"edit","status":"in_progress","title":"Editing auth.go"}}}`
-	ev := isProgressEvent(line)
+	ev := progressEventFromProbe(probeOf(t, line))
 	want := progressEvent{toolCallID: "c1", kind: "edit", status: "in_progress"}
 	if ev == nil || *ev != want {
-		t.Fatalf("isProgressEvent = %+v, want %+v", ev, want)
+		t.Fatalf("progressEventFromProbe = %+v, want %+v", ev, want)
 	}
 }
 
@@ -32,8 +70,12 @@ func TestIsProgressEventIgnoresNonTool(t *testing.T) {
 		`not json`,
 	}
 	for _, line := range cases {
-		if ev := isProgressEvent(line); ev != nil {
-			t.Errorf("isProgressEvent(%q) = %+v, want nil", line, ev)
+		probe, ok := parseFrameProbe([]byte(line))
+		if !ok {
+			continue // no parse, no progress event
+		}
+		if ev := progressEventFromProbe(probe); ev != nil {
+			t.Errorf("progressEventFromProbe(%q) = %+v, want nil", line, ev)
 		}
 	}
 }
@@ -69,7 +111,7 @@ func TestMaybeNotifyProgressPushesRunningVerbs(t *testing.T) {
 	if want := []string{"Reading a file", "Running a command"}; fmt.Sprint(fired) != fmt.Sprint(want) {
 		t.Fatalf("pushes = %v, want %v", fired, want)
 	}
-	if _, ok := p.toolKinds["c1"]; ok {
+	if _, ok := p.acp.toolKinds["c1"]; ok {
 		t.Error("finished call's kind was kept")
 	}
 }
@@ -111,7 +153,7 @@ func TestWorkingTitleUsesAgentInfo(t *testing.T) {
 	if got := p.workingTitle(); got != "Agent working" {
 		t.Errorf("before initialize = %q", got)
 	}
-	p.snoopInitialize(`{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentInfo":{"name":"claude-code-acp","title":"Claude Code","version":"1"}}}`)
+	feedInitialize(p, `{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentInfo":{"name":"claude-code-acp","title":"Claude Code","version":"1"}}}`)
 	if got := p.workingTitle(); got != "Claude Code working" {
 		t.Errorf("after initialize = %q", got)
 	}
@@ -121,8 +163,8 @@ func TestWorkingTitleUsesAgentInfo(t *testing.T) {
 // cwd binds when that response comes back with the same request id.
 func TestSessionNewCwdBindsOnResponse(t *testing.T) {
 	p := newRecoveryPump()
-	p.snoopInboundCwd([]byte(`{"jsonrpc":"2.0","id":7,"method":"session/new","params":{"cwd":"/a"}}`))
-	p.snoopInboundCwd([]byte(`{"jsonrpc":"2.0","id":8,"method":"session/new","params":{"cwd":"/b"}}`))
+	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":7,"method":"session/new","params":{"cwd":"/a"}}`))
+	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":8,"method":"session/new","params":{"cwd":"/b"}}`))
 
 	respond := func(line string) {
 		t.Helper()
@@ -130,7 +172,7 @@ func TestSessionNewCwdBindsOnResponse(t *testing.T) {
 		if !ok {
 			t.Fatalf("parseFrameProbe(%s) failed", line)
 		}
-		p.snoopSessionCwdProbe(probe)
+		p.acp.bindPendingCwd(probe)
 	}
 	// Responses arrive out of order; each binds to its own request's cwd.
 	respond(`{"jsonrpc":"2.0","id":8,"result":{"sessionId":"sb"}}`)
@@ -143,10 +185,10 @@ func TestSessionNewCwdBindsOnResponse(t *testing.T) {
 	}
 
 	// A failed session/new binds nothing and drops its pending entry.
-	p.snoopInboundCwd([]byte(`{"jsonrpc":"2.0","id":9,"method":"session/new","params":{"cwd":"/c"}}`))
+	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":9,"method":"session/new","params":{"cwd":"/c"}}`))
 	respond(`{"jsonrpc":"2.0","id":9,"error":{"code":-32000,"message":"nope"}}`)
-	if len(p.pendingCwd) != 0 {
-		t.Fatalf("pendingCwd = %v, want empty after error response", p.pendingCwd)
+	if len(p.acp.pendingCwd) != 0 {
+		t.Fatalf("pendingCwd = %v, want empty after error response", p.acp.pendingCwd)
 	}
 }
 
@@ -154,8 +196,8 @@ func TestSessionNewCwdBindsOnResponse(t *testing.T) {
 // their cwd immediately; pushes for them carry it for the client's deep-link.
 func TestSessionLoadAndResumeCwdBindImmediately(t *testing.T) {
 	p := newRecoveryPump()
-	p.snoopInboundCwd([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"sl","cwd":"/l"}}`))
-	p.snoopInboundCwd([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"sr","cwd":"/r"}}`))
+	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"sl","cwd":"/l"}}`))
+	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"sr","cwd":"/r"}}`))
 	if got := p.AcpCwdFor("sl"); got != "/l" {
 		t.Fatalf("AcpCwdFor(sl) = %q, want /l", got)
 	}
@@ -164,35 +206,35 @@ func TestSessionLoadAndResumeCwdBindImmediately(t *testing.T) {
 	}
 }
 
-func TestSnoopInboundCwd(t *testing.T) {
+func TestObserveInboundCwd(t *testing.T) {
 	p := newRecoveryPump()
 
 	// A non-session/new frame must not set cwd.
-	p.snoopInboundCwd([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1","cwd":"/should/not/apply"}}`))
+	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1","cwd":"/should/not/apply"}}`))
 	if got := p.AcpCwd(); got != "" {
 		t.Fatalf("AcpCwd() after session/prompt = %q, want empty", got)
 	}
 
 	// A session/new with cwd captures it.
-	p.snoopInboundCwd([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/home/user/project"}}`))
+	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/home/user/project"}}`))
 	if got := p.AcpCwd(); got != "/home/user/project" {
 		t.Fatalf("AcpCwd() = %q, want %q", got, "/home/user/project")
 	}
 
 	// A session/load with cwd also captures it (Ferngeist sends session/load on resume).
-	p.snoopInboundCwd([]byte(`{"jsonrpc":"2.0","id":5,"method":"session/load","params":{"sessionId":"s1","cwd":"/home/user/loaded"}}`))
+	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":5,"method":"session/load","params":{"sessionId":"s1","cwd":"/home/user/loaded"}}`))
 	if got := p.AcpCwd(); got != "/home/user/loaded" {
 		t.Fatalf("AcpCwd() after session/load = %q, want %q", got, "/home/user/loaded")
 	}
 
 	// A project switch updates it.
-	p.snoopInboundCwd([]byte(`{"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":"/home/user/other"}}`))
+	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":"/home/user/other"}}`))
 	if got := p.AcpCwd(); got != "/home/user/other" {
 		t.Fatalf("AcpCwd() after switch = %q, want %q", got, "/home/user/other")
 	}
 
 	// Empty cwd is ignored.
-	p.snoopInboundCwd([]byte(`{"jsonrpc":"2.0","id":4,"method":"session/new","params":{"cwd":""}}`))
+	p.acp.observeInbound([]byte(`{"jsonrpc":"2.0","id":4,"method":"session/new","params":{"cwd":""}}`))
 	if got := p.AcpCwd(); got != "/home/user/other" {
 		t.Fatalf("AcpCwd() after empty = %q, want unchanged", got)
 	}

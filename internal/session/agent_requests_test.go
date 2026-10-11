@@ -134,8 +134,8 @@ func TestAgentRequestLiveDeliveryNotRepeatedOnSameGeneration(t *testing.T) {
 	readFrames(t, pump, c, 1)
 }
 
-// Recovering an "already loaded" rejection ends in a synthesized success, which
-// carries the pending requests too.
+// Recovering an "already loaded" rejection announces the resume, ends in a
+// synthesized success, and then carries the pending requests too.
 func TestAgentRequestRedeliveredAfterRecoveredLoad(t *testing.T) {
 	pump := newPump()
 	pump.loadRecovery = newTestLoadRecovery()
@@ -145,8 +145,15 @@ func TestAgentRequestRedeliveredAfterRecoveredLoad(t *testing.T) {
 	agent := pump.reqIDs.outbound(gen, []byte(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"ses_a"}}`))
 	pump.loadRecovery.OnOutbound(agent)
 	pump.handleStdoutLine(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"Session already loaded"}}`, agentIDOf(t, agent)))
-	if got := readFrames(t, pump, c, 2); got[1] != permissionRequest {
-		t.Fatalf("frames = %q", got)
+	got := readFrames(t, pump, c, 3)
+	if got[0] != resumedFrame("ses_a", 0) {
+		t.Fatalf("resume notice = %s", got[0])
+	}
+	if got[1] != `{"id":1,"jsonrpc":"2.0","result":null}` {
+		t.Fatalf("synthesized load success = %s", got[1])
+	}
+	if got[2] != permissionRequest {
+		t.Fatalf("redelivered request = %s", got[2])
 	}
 }
 
@@ -224,15 +231,15 @@ func TestPushSessionIDFollowsTheFrame(t *testing.T) {
 func TestSetModeReplyMidTurnDoesNotDisarmSwallowedFailureDetection(t *testing.T) {
 	pump := newPump()
 	prompt := pump.reqIDs.outbound(1, []byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"ses_a","prompt":[]}}`))
-	pump.markTurnStart(prompt)
+	pump.acp.observeInbound(prompt)
 	mode := pump.reqIDs.outbound(1, []byte(`{"jsonrpc":"2.0","id":2,"method":"session/set_mode","params":{"sessionId":"ses_a","modeId":"x"}}`))
 
 	modeReply := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{}}`, agentIDOf(t, mode))
-	if _, handled := pump.markTurnActivity(modeReply); handled {
+	if _, handled := turnReplacement(t, pump, modeReply); handled {
 		t.Fatal("set_mode reply must pass through")
 	}
 	promptReply := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}`, agentIDOf(t, prompt))
-	if _, handled := pump.markTurnActivity(promptReply); !handled {
+	if _, handled := turnReplacement(t, pump, promptReply); !handled {
 		t.Fatal("empty prompt result must still be flagged as a swallowed failure")
 	}
 }
@@ -312,7 +319,7 @@ func TestSwallowedFailurePushesOnceAndCancelIsSilent(t *testing.T) {
 	events := pushCollector(pump)
 	prompt := func(stopReason string) {
 		req := []byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}`)
-		pump.markTurnStart(req)
+		pump.acp.observeInbound(req)
 		id := agentIDOf(t, pump.reqIDs.outbound(1, req))
 		pump.handleStdoutLine(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"stopReason":%q}}`, id, stopReason))
 	}

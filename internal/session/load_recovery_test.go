@@ -14,6 +14,14 @@ func newTestLoadRecovery() *LoadRecovery {
 	return newLoadRecovery(slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
+// onFrame feeds one agent frame through the recovery policy, parsed the way the
+// pump's pipeline parses it.
+func onFrame(t *testing.T, r *LoadRecovery, line string) ([]string, bool) {
+	t.Helper()
+	probe, ok := parseFrameProbe([]byte(line))
+	return r.OnFrame(line, probe, ok)
+}
+
 func loadRequest(id, sessionID string) []byte {
 	return []byte(`{"jsonrpc":"2.0","id":` + id + `,"method":"session/load","params":{"sessionId":"` + sessionID + `"}}`)
 }
@@ -35,26 +43,40 @@ func TestRecoverAlreadyLoaded(t *testing.T) {
 	r.OnOutbound(loadRequest("1", sid))
 	h1 := updateFrame(sid, "What is this?")
 	h2 := updateFrame(sid, "It is Ferngeist.")
-	r.OnFrame(h1)
-	r.OnFrame(h2)
+	onFrame(t, r, h1)
+	onFrame(t, r, h2)
 
 	firstSuccess := `{"jsonrpc":"2.0","id":1,"result":{"modes":{"currentModeId":"chat","availableModes":[]}}}`
-	if frames, handled := r.OnFrame(firstSuccess); handled {
+	if frames, handled := onFrame(t, r, firstSuccess); handled {
 		t.Fatalf("first successful load must pass through unchanged, got replacement frames: %v", frames)
 	}
 
 	// Second load: agent rejects the duplicate; the recovery module must restore.
 	r.OnOutbound(loadRequest("2", sid))
 	alreadyLoaded := `{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"Session ses_abc is already loaded"}}`
-	frames, handled := r.OnFrame(alreadyLoaded)
+	frames, handled := onFrame(t, r, alreadyLoaded)
 	if !handled {
 		t.Fatal("expected the already-loaded error to be recovered")
 	}
-	if len(frames) != 3 {
-		t.Fatalf("expected 2 history frames + 1 success, got %d frames: %v", len(frames), frames)
+	if len(frames) != 4 {
+		t.Fatalf("expected notice + 2 history frames + 1 success, got %d frames: %v", len(frames), frames)
 	}
-	if frames[0] != h1 || frames[1] != h2 {
-		t.Fatalf("buffered history not replayed in order:\n got %q, %q", frames[0], frames[1])
+	// The replay is announced openly before any of it reaches the client.
+	var notice struct {
+		Method string `json:"method"`
+		Params struct {
+			SessionID      string `json:"sessionId"`
+			ReplayedFrames int    `json:"replayedFrames"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(frames[0]), &notice); err != nil {
+		t.Fatalf("resume notice is not valid JSON: %v", err)
+	}
+	if notice.Method != resumedMethod || notice.Params.SessionID != sid || notice.Params.ReplayedFrames != 2 {
+		t.Fatalf("resume notice = %s, want method %s sessionId %s replayedFrames 2", frames[0], resumedMethod, sid)
+	}
+	if frames[1] != h1 || frames[2] != h2 {
+		t.Fatalf("buffered history not replayed in order:\n got %q, %q", frames[1], frames[2])
 	}
 
 	// The synthesized success must reuse the cached result shape and carry id 2.
@@ -63,14 +85,14 @@ func TestRecoverAlreadyLoaded(t *testing.T) {
 		Result json.RawMessage `json:"result"`
 		Error  json.RawMessage `json:"error"`
 	}
-	if err := json.Unmarshal([]byte(frames[2]), &got); err != nil {
+	if err := json.Unmarshal([]byte(frames[3]), &got); err != nil {
 		t.Fatalf("synthesized success is not valid JSON: %v", err)
 	}
 	if got.ID.String() != "2" {
 		t.Fatalf("synthesized success must echo the second request id, got id=%s", got.ID)
 	}
 	if got.Error != nil {
-		t.Fatalf("synthesized response must not carry an error: %s", frames[2])
+		t.Fatalf("synthesized response must not carry an error: %s", frames[3])
 	}
 	if !strings.Contains(string(got.Result), "currentModeId") {
 		t.Fatalf("synthesized success should reuse the cached load result, got result=%s", got.Result)
@@ -85,19 +107,19 @@ func TestRecoverFallsBackToNullResult(t *testing.T) {
 	const sid = "ses_xyz"
 
 	r.OnOutbound(loadRequest("7", sid))
-	frames, handled := r.OnFrame(
+	frames, handled := onFrame(t, r,
 		`{"jsonrpc":"2.0","id":7,"error":{"message":"session is already loaded"}}`)
 	if !handled {
 		t.Fatal("expected recovery even without buffered history or cached response")
 	}
-	if len(frames) != 1 {
-		t.Fatalf("expected a single synthesized success frame, got %d: %v", len(frames), frames)
+	if len(frames) != 2 {
+		t.Fatalf("expected a resume notice plus a synthesized success, got %d: %v", len(frames), frames)
 	}
 	var got struct {
 		ID     json.Number     `json:"id"`
 		Result json.RawMessage `json:"result"`
 	}
-	if err := json.Unmarshal([]byte(frames[0]), &got); err != nil {
+	if err := json.Unmarshal([]byte(frames[1]), &got); err != nil {
 		t.Fatalf("fallback success is not valid JSON: %v", err)
 	}
 	if got.ID.String() != "7" || string(got.Result) != "null" {
@@ -110,7 +132,7 @@ func TestRecoverFallsBackToNullResult(t *testing.T) {
 func TestUnrelatedLoadErrorPassesThrough(t *testing.T) {
 	r := newTestLoadRecovery()
 	r.OnOutbound(loadRequest("3", "ses_def"))
-	if _, handled := r.OnFrame(
+	if _, handled := onFrame(t, r,
 		`{"jsonrpc":"2.0","id":3,"error":{"message":"unknown session"}}`); handled {
 		t.Fatal("a non already-loaded error must not be recovered")
 	}
@@ -120,7 +142,7 @@ func TestUnrelatedLoadErrorPassesThrough(t *testing.T) {
 // streaming frames with no in-flight load are never rewritten.
 func TestRecoverIgnoresFramesWithoutPendingLoad(t *testing.T) {
 	r := newTestLoadRecovery()
-	if _, handled := r.OnFrame(updateFrame("ses_ghi", "hello")); handled {
+	if _, handled := onFrame(t, r, updateFrame("ses_ghi", "hello")); handled {
 		t.Fatal("frames must pass through when no session/load is in flight")
 	}
 }
@@ -131,8 +153,8 @@ func TestBufferLoadHistoryEvictsOldest(t *testing.T) {
 	r := newTestLoadRecovery()
 	const sid = "ses_big"
 	big := strings.Repeat("x", maxLoadHistoryBytes)
-	r.OnFrame(updateFrame(sid, "first"))
-	r.OnFrame(updateFrame(sid, big))
+	onFrame(t, r, updateFrame(sid, "first"))
+	onFrame(t, r, updateFrame(sid, big))
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -155,22 +177,23 @@ func TestRecoverReplaysPromptsAsUserMessages(t *testing.T) {
 	r := newTestLoadRecovery()
 	const sid = "ses_live"
 	r.OnOutbound(promptRequest(sid, "first question"))
-	r.OnFrame(updateFrame(sid, "first answer"))
+	onFrame(t, r, updateFrame(sid, "first answer"))
 	r.OnOutbound(promptRequest(sid, "second question"))
-	r.OnFrame(updateFrame(sid, "second answer"))
+	onFrame(t, r, updateFrame(sid, "second answer"))
 
 	r.OnOutbound(loadRequest("2", sid))
-	frames, handled := r.OnFrame(`{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"already loaded"}}`)
-	if !handled || len(frames) != 5 {
+	frames, handled := onFrame(t, r, `{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"already loaded"}}`)
+	// History is offset by one: frames[0] is the resume notice.
+	if !handled || len(frames) != 6 {
 		t.Fatalf("expected 4 history frames + success, got %d: %v", len(frames), frames)
 	}
 	for i, want := range []string{"first question", "first answer", "second question", "second answer"} {
-		if !strings.Contains(frames[i], want) {
-			t.Fatalf("frame %d should carry %q, got %s", i, want, frames[i])
+		if !strings.Contains(frames[i+1], want) {
+			t.Fatalf("frame %d should carry %q, got %s", i+1, want, frames[i+1])
 		}
 	}
-	if !strings.Contains(frames[2], `"user_message_chunk"`) {
-		t.Fatalf("prompt should replay as a user message, got %s", frames[2])
+	if !strings.Contains(frames[3], `"user_message_chunk"`) {
+		t.Fatalf("prompt should replay as a user message, got %s", frames[3])
 	}
 }
 
@@ -180,10 +203,10 @@ func TestBufferLoadHistoryEvictsToATurnBoundary(t *testing.T) {
 	const sid = "ses_turns"
 	half := strings.Repeat("x", maxLoadHistoryBytes/2)
 	r.OnOutbound(promptRequest(sid, "q1"))
-	r.OnFrame(updateFrame(sid, half))
-	r.OnFrame(updateFrame(sid, "end of reply one"))
+	onFrame(t, r, updateFrame(sid, half))
+	onFrame(t, r, updateFrame(sid, "end of reply one"))
 	r.OnOutbound(promptRequest(sid, "q2"))
-	r.OnFrame(updateFrame(sid, half))
+	onFrame(t, r, updateFrame(sid, half))
 
 	r.mu.Lock()
 	defer r.mu.Unlock()

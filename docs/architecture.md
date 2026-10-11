@@ -38,10 +38,10 @@ Every connection creates a persistent gateway session with:
 - **Inbound diagnostics** — client-to-agent frames are logged asynchronously to SQLite via a buffered channel (non-blocking, dropped on overflow with counter).
 - **ACP session/close** — before stopping the runtime on session close, the gateway sends a `session/close` JSON-RPC request to the agent if it advertised `sessionCapabilities.close` during initialize. The mock agent supports this for testing.
 
-There is no ring buffer or catchup replay. On WebSocket disconnect:
-1. The pump continues running, discarding agent output.
+The pump buffers each ACP session's `session/update` history (bounded, 8 MiB, trimmed from the oldest end to a turn boundary) so a reconnect can be restored. On WebSocket disconnect:
+1. The pump continues running, discarding agent output for any detached client.
 2. On notable events (turn complete, permission request, agent error, agent crash, or live progress), a push notification is dispatched. Pushes also fire while a client is attached — the client suppresses foreground notifications — so disconnection is not what gates them.
-3. The client reconnects, calls `session/load` on the agent, and resumes live proxying.
+3. The client reconnects and calls `session/load` on the agent. If the agent rejects the duplicate as already loaded — it still holds the session — the gateway restores it itself: an explicit `_ferngeist/resumed` notification, then the buffered history, then a synthesized `session/load` success. The signal tells the client that the restore came from the gateway, not the agent (see [docs/api.md](api.md#acp-bridge)).
 
 ## Session lifecycle
 
@@ -197,7 +197,8 @@ Client-to-agent messages are recorded for debugging/audit. Direction is always c
 
 ## Attach tokens
 
-Single-use, short-lived (5-minute TTL) nonces used to prove ownership of a session at WebSocket connect time. Minted on session creation and resume. Consumed on first WebSocket connect. 64 hex characters (32 random bytes). Stored in memory only (not persisted to SQLite). The token service lives in `internal/session`.
+Single-use, short-lived (5-minute TTL) nonces used to prove ownership of a session at WebSocket connect time. Minted on session creation and resume. Consumed on first WebSocket connect. 64 hex characters (32 random bytes). Stored in memory only (not persisted to SQLite). The token service lives in `internal/session`.
+
 
 ## Startup reconciliation
 
