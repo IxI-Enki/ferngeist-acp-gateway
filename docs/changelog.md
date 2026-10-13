@@ -59,6 +59,10 @@ not be coupled. Full release notes live in GitHub Releases.
   `commit` and `oldPath` to diff one file of a commit; without `commit` it is
   unchanged. Changed-file objects gain optional `oldPath`, set only by
   `/git/commits/{sha}`. (2026-10-14, [5548fe5](https://github.com/arafatamim/ferngeist-acp-gateway/commit/5548fe5))
+- `[additive]` `_ferngeist/resumed` gains an optional `"truncated": true`
+  param: the per-session replay buffer (8 MiB) evicted its oldest frames, so a
+  gateway-restored session starts mid-conversation with earlier history
+  missing. Omitted when the history is intact. (2026-10-13)
 - `[additive]` `_ferngeist/turn_result` — a new gateway→client notification on
   the ACP WebSocket, sent when a `session/prompt` finished while no client was
   attached: `{"jsonrpc":"2.0","method":"_ferngeist/turn_result","params":{"sessionId":…,"stopReason":…,"usage":…,"durationMs":…}}`.
