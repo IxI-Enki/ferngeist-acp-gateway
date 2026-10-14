@@ -1,0 +1,205 @@
+name: Test Installers
+
+# End-to-end install, re-run, upgrade and uninstall checks on real platforms:
+# the installers in this checkout install from the live repos/releases, then
+# upgrade to packages built from this checkout (goreleaser snapshot).
+
+on:
+  pull_request:
+    paths:
+      - packaging/**
+      - goreleaser.yml
+      - .github/workflows/release.yml
+      - .github/workflows/test-install.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache-dependency-path: go.sum
+
+      - name: Build snapshot packages
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --snapshot --clean
+        env:
+          UPDATE_CHANNEL: self
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.pkg.tar.zst
+            dist/*_brew.tar.gz
+            dist/homebrew/Formula/ferngeist-gateway.rb
+          if-no-files-found: error
+
+  # Repo + signatures + package scripts on each distro (as root, no systemd).
+  linux:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:24.04", "fedora:latest", "archlinux:latest"]
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages
+          path: packages
+
+      - name: Install from the live repo, then upgrade to this build
+        run: sh packaging/ci/test-linux.sh packages
+
+  # The real per-user flow: sudo install -> postinstall registers the systemd
+  # user service for the invoking user; re-run, upgrade, uninstall, removal.
+  user-session:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ubuntu, fedora, archlinux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages
+          path: packages
+
+      - name: Ubuntu (runner VM)
+        if: matrix.distro == 'ubuntu'
+        run: |
+          sh packaging/ci/user-session.sh
+          XDG_RUNTIME_DIR="/run/user/$(id -u)" sh packaging/ci/test-user.sh packages
+
+      - name: ${{ matrix.distro }} (systemd container)
+        if: matrix.distro != 'ubuntu'
+        run: sh packaging/ci/systemd-container.sh ${{ matrix.distro }} packages
+
+  # Manual installs: `ferngeist-gateway update` from an old build of this
+  # checkout to the live latest release, then uninstall --purge.
+  self-update:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # update queries the GitHub API; runner IPs exhaust the anonymous limit.
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache-dependency-path: go.sum
+
+      - name: Build this checkout as an old version
+        run: go build -ldflags "-X main.buildVersion=0.0.1 -X main.updateChannel=self" -o old/ ./cmd/ferngeist
+
+      - if: runner.os == 'Linux'
+        run: sh packaging/ci/user-session.sh
+
+      - run: sh packaging/ci/test-self-update.sh old/ferngeist
+
+  brew:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages
+          path: packages
+
+      - name: Linuxbrew + a user session
+        if: runner.os == 'Linux'
+        run: |
+          echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
+          sh packaging/ci/user-session.sh
+
+      - run: sh packaging/ci/test-brew.sh packages
+
+  macos-binary:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Binary install, re-run, uninstall --purge
+        run: |
+          BIN="$HOME/.local/bin/ferngeist-gateway"
+          sh packaging/install.sh --yes --binary
+          sh packaging/ci/wait-daemon.sh "$BIN" 'LAN ENABLED +true'
+          sh packaging/install.sh --yes --binary
+          sh packaging/ci/wait-daemon.sh "$BIN" 'LAN ENABLED +true'
+          "$BIN" daemon uninstall --purge
+          sh packaging/ci/wait-gone.sh "$BIN" "daemon uninstall --purge"
+          [ ! -e "$HOME/Library/Application Support/Ferngeist Gateway" ]
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      SVC_REL: FerngeistGateway/service/bin/ferngeist-gateway.exe
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install.ps1 under PowerShell 7
+        shell: pwsh
+        run: ./packaging/install.ps1 -Yes
+
+      - run: sh packaging/ci/wait-daemon.sh "$(cygpath -u "$LOCALAPPDATA")/$SVC_REL" 'LAN ENABLED +true'
+
+      - name: Re-running install.ps1 keeps it running
+        shell: pwsh
+        run: ./packaging/install.ps1 -Yes
+
+      - run: sh packaging/ci/wait-daemon.sh "$(cygpath -u "$LOCALAPPDATA")/$SVC_REL" 'LAN ENABLED +true'
+
+      - name: daemon uninstall --purge stops it and removes the install
+        run: |
+          SVC="$(cygpath -u "$LOCALAPPDATA")/$SVC_REL"
+          "$SVC" daemon uninstall --purge
+          sh packaging/ci/wait-gone.sh "$SVC" "daemon uninstall --purge"
+          for _ in $(seq 15); do [ -e "$SVC" ] || exit 0; sleep 2; done
+          echo "FAIL: $SVC survived --purge" >&2
+          exit 1
+
+      # A script block mirrors `irm | iex` (no script file) while still
+      # allowing -Yes, which a bare iex cannot pass.
+      - name: install.ps1 under Windows PowerShell 5.1, as irm | iex runs it
+        shell: powershell
+        run: '& ([scriptblock]::Create((Get-Content -Raw packaging/install.ps1))) -Yes -Localhost'
+
+      - run: sh packaging/ci/wait-daemon.sh "$(cygpath -u "$LOCALAPPDATA")/$SVC_REL" 'LAN ENABLED +false'

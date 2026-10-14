@@ -54,9 +54,10 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 It fetches the latest release zip, verifies its checksum, installs the daemon as
-a per-user scheduled task (one UAC prompt to create the task), and adds the CLI
-to your user PATH. Pass `-Lan` to expose the gateway on your network (default is
-localhost-only), `-Yes` to skip the install prompt, `-KeepDownloads` to keep the
+a per-user scheduled task (no UAC prompt), and adds the CLI
+to your user PATH. The gateway listens on your local network by default (same as
+the macOS/Linux installer); pass `-Localhost` to keep it on localhost only,
+`-Yes` to skip the install prompt, `-KeepDownloads` to keep the
 downloaded zip. Updates are manual: run `ferngeist-gateway update` when a new
 release is announced.
 
@@ -81,16 +82,17 @@ Install via the one-command installer (tries brew):
 curl -fsSL https://arafatamim.github.io/ferngeist-acp-gateway/install.sh | sh
 ```
 
-Or tap + install manually:
+Or install manually:
 
 ```bash
-brew tap arafatamim/ferngeist-acp-gateway https://github.com/arafatamim/ferngeist-acp-gateway
-brew install ferngeist-gateway
+brew install arafatamim/tap/ferngeist-gateway
 ```
 
-The formula installs the binary and runs the daemon install (`daemon install --keep-settings --lan`)
-as a per-user service — same as the Linux packages. On macOS it is a LaunchAgent;
-on Linux (Linuxbrew) a systemd user unit. Updates: `brew upgrade ferngeist-gateway`.
+The installer registers the daemon as a per-user service (a LaunchAgent on
+macOS, a systemd user unit on Linuxbrew) with LAN enabled. After a manual
+`brew install`, start it with `ferngeist-gateway daemon install --keep-settings --lan`.
+`brew upgrade ferngeist-gateway` restarts it on the new version automatically;
+if you upgraded from 1.0.0 or earlier, run that `daemon install` command once.
 
 Homebrew installs never trigger Gatekeeper, so no warnings appear. To make the
 gateway reachable only on localhost, re-run `ferngeist-gateway daemon install`.
@@ -215,6 +217,8 @@ All platforms share the same contract:
 
 Notes:
 
+- Removing the apt/dnf/pacman package (`sudo apt remove ferngeist-gateway`,
+  etc.) also runs `daemon uninstall` for the user who ran `sudo`.
 - Uninstall semantics are consistent across platforms: plain `uninstall`
   unregisters the background service and stops the daemon, but leaves every
   installed file in place — a later `daemon install` re-registers the same
@@ -234,6 +238,10 @@ Notes:
 - **Manual installs:** `ferngeist-gateway update` (verifies against the release
   SHA256SUMS before swapping the binary). Package-manager installs refuse to
   self-update; use the package manager instead.
+
+Package-manager installs run the packaged binary directly, so the daemon
+restarts on the new version within seconds of any upgrade, including
+unattended ones.
 
 The daemon checks GitHub Releases periodically and pushes an update-available
 notification to paired devices. Applying is always manual.

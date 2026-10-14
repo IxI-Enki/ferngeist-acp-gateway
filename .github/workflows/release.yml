@@ -15,9 +15,27 @@ on:
         description: "Release tag (e.g. v1.0.0). Only needed for manual dispatch."
         required: true
         type: string
+      dry_run:
+        description: "Snapshot build published to the gh-pages-dryrun branch only (no release assets, formula or live repos touched)."
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+
+# The repo jobs force-push gh-pages, so two overlapping runs would silently
+# drop each other's packages; queue them instead.
+concurrency:
+  group: publish-gateway-release
+  cancel-in-progress: false
+
+env:
+  # Package versions kept per arch in the apt/rpm/pacman repos. GitHub Pages
+  # rejects sites over 1 GB; older versions stay on the Releases page.
+  KEEP_VERSIONS: 3
+  # Branch the repo jobs publish to. A dry run seeds gh-pages-dryrun from
+  # the live gh-pages so pruning and the repo dbs run against real state.
+  PAGES_BRANCH: ${{ inputs.dry_run && 'gh-pages-dryrun' || 'gh-pages' }}
 
 jobs:
   release:
@@ -67,10 +85,12 @@ jobs:
         id: channels
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
         shell: bash
         run: |
           SKIP=""
           [ -z "$WINGET_TOKEN" ] && SKIP="${SKIP:+$SKIP,}winget"
+          [ -z "$HOMEBREW_TAP_DEPLOY_KEY" ] && SKIP="${SKIP:+$SKIP,}homebrew"
           echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
 
       - name: Run goreleaser
@@ -81,11 +101,9 @@ jobs:
           # Skip external publish channels whose secrets are not configured.
           # Goreleaser attempts them with the (empty) token and fails the
           # release otherwise. Builds, archives, checksums, and nfpm packages
-          # always run; the Homebrew formula is generated here (the push to
-          # main is a separate signed git push below, since the main ruleset
-          # requires verified signatures), and the winget push is skipped
-          # when WINGET_TOKEN is unset.
-          args: release --clean --skip=${{ steps.channels.outputs.skip }}
+          # always run; the Homebrew formula push to arafatamim/homebrew-tap
+          # and the winget PR are skipped when their secrets are unset.
+          args: release --clean --skip=${{ steps.channels.outputs.skip }} ${{ inputs.dry_run && '--snapshot' || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Self-managed installs may run `ferngeist-gateway update`; package
@@ -93,8 +111,10 @@ jobs:
           UPDATE_CHANNEL: self
           # Optional external publish channels — activate by setting the secret.
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
 
       - name: Upload changelog to release
+        if: ${{ !inputs.dry_run }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.release_tag.outputs.tag }}
@@ -102,49 +122,6 @@ jobs:
         shell: bash
         run: |
           gh release upload "$TAG" "$CHANGELOG" --clobber
-
-      # Publish the Homebrew formula to main with a SIGNED commit. The
-      # repo's "Protect main" ruleset requires verified signatures; the
-      # goreleaser formula pipes (REST API, and git-upload without an SSH
-      # key) cannot produce them, so goreleaser only generates the formula
-      # and this step pushes it. Idempotent: skips when main already has
-      # this exact content (brew upgrade picks up the same formula).
-      - name: Publish Homebrew formula to main
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APT_GPG_KEY: ${{ secrets.APT_GPG_KEY }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ ! -f dist/homebrew/Formula/ferngeist-gateway.rb ]; then
-            echo "no formula generated; skipping"
-            exit 0
-          fi
-          if [ -z "$APT_GPG_KEY" ]; then
-            echo "APT_GPG_KEY not set — cannot sign the formula commit; skipping"
-            exit 0
-          fi
-          echo "$APT_GPG_KEY" | gpg --batch --import
-          SIGNER="$(gpg --list-secret-keys --with-colons 2>/dev/null | awk -F: '$1=="sec" {print $5; exit}')"
-          echo "signing with $SIGNER"
-          git config --global user.name "Ferngeist Gateway"
-          git config --global user.email "31634638+arafatamim@users.noreply.github.com"
-          git config --global user.signingkey "$SIGNER"
-          git config --global commit.gpgsign true
-          git config --global gpg.program gpg
-          git fetch origin main
-          git checkout -b brew-formula-push FETCH_HEAD
-          mkdir -p Formula
-          cp dist/homebrew/Formula/ferngeist-gateway.rb Formula/ferngeist-gateway.rb
-          # git diff (worktree vs HEAD) is empty for an UNTRACKED file, so
-          # stage first and compare the index against HEAD.
-          git add Formula/ferngeist-gateway.rb
-          if git diff --cached --quiet HEAD -- Formula/ferngeist-gateway.rb; then
-            echo "formula unchanged on main; skipping"
-            exit 0
-          fi
-          git -c commit.gpgsign=true commit -m "homebrew: update ferngeist-gateway formula to ${{ steps.release_tag.outputs.tag }}"
-          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/arafatamim/ferngeist-acp-gateway.git" HEAD:main
 
       # Publish the built .deb files as a workflow artifact so the
       # publish-deb-repo job can assemble the apt repo without racing the
@@ -204,11 +181,11 @@ jobs:
       # first release). GitHub Pages needs a branch to serve.
       - name: Fetch apt repo branch
         run: |
-          if git ls-remote --heads origin gh-pages | grep -q gh-pages; then
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
             git fetch origin gh-pages
-            git worktree add apt-repo gh-pages
+            git worktree add -B "$PAGES_BRANCH" apt-repo FETCH_HEAD
           else
-            git worktree add -b gh-pages apt-repo
+            git worktree add -b "$PAGES_BRANCH" apt-repo
           fi
 
       # Import the signing key (self-generated, stored as a secret). The
@@ -235,6 +212,10 @@ jobs:
             mkdir -p "deb/dists/stable/main/binary-$arch"
             mkdir -p "deb/pool/main/f/ferngeist-gateway"
             cp "$deb" "deb/pool/main/f/ferngeist-gateway/"
+          done
+          # sort -V: 0.10.0 is newer than 0.9.3 (a plain sort gets it wrong).
+          for arch in amd64 arm64; do
+            ls deb/pool/main/f/ferngeist-gateway/*_"$arch".deb 2>/dev/null | sort -V | head -n -"$KEEP_VERSIONS" | xargs -r rm -f --
           done
 
       # The universal installer lives at the Pages root so the one-liner
@@ -314,8 +295,9 @@ jobs:
             echo "No changes to apt repo"
             exit 0
           fi
-          git commit -m "apt: publish release packages"
-          git push origin HEAD:gh-pages
+          # Publish as one parentless commit: history would otherwise keep
+          # every pruned package forever and grow the repo without bound.
+          git push --force origin "$(git commit-tree "$(git write-tree)" -m "apt: publish release packages")":"refs/heads/$PAGES_BRANCH"
 
   # Builds a signed dnf/yum repository on the SAME gh-pages branch (Pages
   # serves it; rpm/ lives next to deb/). Serialized after publish-deb-repo so
@@ -350,11 +332,11 @@ jobs:
 
       - name: Fetch repo branch
         run: |
-          if git ls-remote --heads origin gh-pages | grep -q gh-pages; then
-            git fetch origin gh-pages
-            git worktree add rpm-repo gh-pages
+          if git ls-remote --exit-code --heads origin "$PAGES_BRANCH" >/dev/null; then
+            git fetch origin "$PAGES_BRANCH"
+            git worktree add -B "$PAGES_BRANCH" rpm-repo FETCH_HEAD
           else
-            git worktree add -b gh-pages rpm-repo
+            git worktree add -b "$PAGES_BRANCH" rpm-repo
           fi
 
       # Import the signing key (same key as the apt repo).
@@ -378,7 +360,8 @@ jobs:
             for rpm in ../rpms/*.rpm; do
               echo "signing $rpm"
               # _gpg_name is the portable rpmsign key selector (fingerprint).
-              rpmsign --addsign --define "_gpg_name $SIGNER" "$rpm" >/dev/null 2>&1 || echo "WARN: rpmsign failed for $rpm"
+              # Fail the job: an unsigned rpm is rejected by gpgcheck=1 clients.
+              rpmsign --addsign --define "_gpg_name $SIGNER" "$rpm"
             done
           else
             echo "No key — skipping package signatures."
@@ -392,6 +375,9 @@ jobs:
             esac
             mkdir -p "rpm/$arch"
             cp "$rpm" "rpm/$arch/"
+          done
+          for arch in x86_64 aarch64; do
+            ls "rpm/$arch"/*.rpm 2>/dev/null | sort -V | head -n -"$KEEP_VERSIONS" | xargs -r rm -f --
           done
 
       # Generate repodata/ (createrepo_c) + detached repomd.xml signature.
@@ -428,8 +414,9 @@ jobs:
             echo "No changes to rpm repo"
             exit 0
           fi
-          git commit -m "rpm: publish release packages"
-          git push origin HEAD:gh-pages
+          # Publish as one parentless commit: history would otherwise keep
+          # every pruned package forever and grow the repo without bound.
+          git push --force origin "$(git commit-tree "$(git write-tree)" -m "rpm: publish release packages")":"refs/heads/$PAGES_BRANCH"
 
   # Builds a signed pacman repository on the SAME gh-pages branch (arch/
   # next to deb/ and rpm/). repo-add ships with pacman, which only exists on
@@ -470,11 +457,11 @@ jobs:
 
       - name: Fetch repo branch
         run: |
-          if git ls-remote --heads origin gh-pages | grep -q gh-pages; then
-            git fetch origin gh-pages
-            git worktree add arch-repo gh-pages
+          if git ls-remote --exit-code --heads origin "$PAGES_BRANCH" >/dev/null; then
+            git fetch origin "$PAGES_BRANCH"
+            git worktree add -B "$PAGES_BRANCH" arch-repo FETCH_HEAD
           else
-            git worktree add -b gh-pages arch-repo
+            git worktree add -b "$PAGES_BRANCH" arch-repo
           fi
 
       # Import the signing key (same key as the apt repo).
@@ -505,14 +492,23 @@ jobs:
             mkdir -p "arch/$arch"
             cp "$pkg" "arch/$arch/"
           done
+          # The db only ever lists the newest version, so pruned files are
+          # never referenced. Drop each package's .sig with it.
+          for arch in x86_64 aarch64; do
+            ls "arch/$arch"/*.pkg.tar.zst 2>/dev/null | sort -V | head -n -"$KEEP_VERSIONS" | while read -r pkg; do
+              rm -f "$pkg" "$pkg.sig"
+            done
+          done
           if gpg --list-secret-keys 2>/dev/null | grep -q sec; then
             SIGNER="$(gpg --list-secret-keys --with-colons 2>/dev/null | awk -F: '$1=="sec" {print $5; exit}')"
             for arch in x86_64 aarch64; do
               if ls "arch/$arch"/*.pkg.tar.zst >/dev/null 2>&1; then
                 # Sign each package (pacman SigLevel=Required checks these).
+                # Binary, not armored: repo-add embeds it in the db, and
+                # pacman reports "signature format error" for an armored one.
                 for pkg in "arch/$arch"/*.pkg.tar.zst; do
                   echo "signing $pkg"
-                  gpg --batch --yes --pinentry-mode loopback --passphrase '' -absb -o "$pkg.sig" "$pkg"
+                  gpg --batch --yes --pinentry-mode loopback --passphrase '' --detach-sign -o "$pkg.sig" "$pkg"
                 done
                 # Build the repo db. repo-add creates *.db.tar.gz + a *.db
                 # pointer. On a fresh checkout (no prior .db) that pointer is
@@ -520,11 +516,16 @@ jobs:
                 # GitHub Pages does not reliably follow symlinks, so replace a
                 # symlink with the real file. Same for .files. || true: the
                 # [ -L ] test is false on a fresh repo and must not trip -e.
-                (cd "arch/$arch" && repo-add ferngeist-gateway.db.tar.gz *.pkg.tar.zst)
+                # -p: the glob is lexical (0.10.0 < 0.9.3), so without it an
+                # older package added later would downgrade the db entry.
+                (cd "arch/$arch" && repo-add -p ferngeist-gateway.db.tar.gz *.pkg.tar.zst)
                 { [ -L "arch/$arch/ferngeist-gateway.db" ] && cp "arch/$arch/ferngeist-gateway.db.tar.gz" "arch/$arch/ferngeist-gateway.db"; } || true
                 { [ -L "arch/$arch/ferngeist-gateway.files" ] && cp "arch/$arch/ferngeist-gateway.files.tar.gz" "arch/$arch/ferngeist-gateway.files"; } || true
                 # Sign the db (pacman verifies <repo>.db.tar.gz.sig).
-                gpg --batch --yes --pinentry-mode loopback --passphrase '' -absb -o "arch/$arch/ferngeist-gateway.db.tar.gz.sig" "arch/$arch/ferngeist-gateway.db.tar.gz"
+                gpg --batch --yes --pinentry-mode loopback --passphrase '' --detach-sign -o "arch/$arch/ferngeist-gateway.db.tar.gz.sig" "arch/$arch/ferngeist-gateway.db.tar.gz"
+                # pacman fetches <repo>.db.sig; only a legacy committed symlink
+                # provides it today, so a fresh gh-pages would break SigLevel.
+                ln -sf ferngeist-gateway.db.tar.gz.sig "arch/$arch/ferngeist-gateway.db.sig"
               fi
             done
             # Public key for pacman-key --add (same as deb/rpm).
@@ -544,5 +545,34 @@ jobs:
             echo "No changes to arch repo"
             exit 0
           fi
-          git commit -m "arch: publish release packages"
-          git push origin HEAD:gh-pages
+          # Publish as one parentless commit: history would otherwise keep
+          # every pruned package forever and grow the repo without bound.
+          git push --force origin "$(git commit-tree "$(git write-tree)" -m "arch: publish release packages")":"refs/heads/$PAGES_BRANCH"
+
+  # Installs from the branch just published, before Pages serves it (and
+  # for a dry run, which Pages never serves): repo metadata, signatures,
+  # pruning and the install.sh package channels on each distro.
+  verify-repos:
+    needs: publish-arch-repo
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:24.04", "fedora:latest", "archlinux:latest"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Serve the published repo branch
+        run: |
+          git fetch origin "$PAGES_BRANCH"
+          git worktree add --detach site FETCH_HEAD
+          python3 -m http.server -d site 8000 >/dev/null 2>&1 &
+
+      - name: Install via install.sh from the served repo
+        run: |
+          docker run --rm --network host -v "$PWD:/src" \
+            -e FERNGEIST_REPO_BASE=http://localhost:8000 \
+            "${{ matrix.image }}" sh /src/packaging/ci/test-linux.sh
