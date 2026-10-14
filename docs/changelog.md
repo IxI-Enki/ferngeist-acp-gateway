@@ -46,12 +46,14 @@ against the code.
 
 The **build** version (the daemon binary's `--version` and the mDNS
 `gateway_version` TXT record) is separate from the **contract** version above.
-Releases are tagged with semver (`v0.6.0` … `v1.0.0` so far); the Taskfile
+Releases are tagged with semver (`v0.6.0` … `v1.1.0` so far); the Taskfile
 derives the build version from `git describe`. They are independent and should
 not be coupled. Full release notes live in GitHub Releases.
 
 ## History
 
+- `v1.1.0` — commit history, detached turn results and rebase-safe worktree
+  diffs; additive only, `protocolVersion` stays `v2`:
 - `[additive]` Commit history endpoints: `GET /v1/runtimes/{id}/git/log`
   (paged commit list pinned by `head`, with refs, `pushed`, `remoteUrl` and,
   in a managed worktree, `baseCommit`) and `GET /v1/runtimes/{id}/git/commits/{sha}`
@@ -82,14 +84,15 @@ not be coupled. Full release notes live in GitHub Releases.
   the turn with this instead of its own clock. Any `_meta` the agent sent is
   kept. Only on the result sent to the connection that issued the prompt;
   error replies and `_ferngeist/turn_ended` do not carry it. (2026-10-13, [b3dd51b](https://github.com/arafatamim/ferngeist-acp-gateway/commit/b3dd51b))
-- `[semantic]` Managed-worktree git endpoints (`GET /v1/runtimes/{id}/git/status`
+- `[additive]` Managed-worktree git endpoints (`GET /v1/runtimes/{id}/git/status`
   and `/git/diff`) — the base they compare against is now `git merge-base` of
   the branch the worktree was cut from and the worktree's `HEAD`, instead of
   the fixed `baseCommit` recorded at creation. After the worktree's branch is
   rebased onto a newer base, the diff shows only the agent's changes rather
   than the upstream commits the rebase picked up. Worktrees created before
   this change, and ones whose base branch was deleted, keep comparing against
-  `baseCommit`. (2026-10-13, [79046d0](https://github.com/arafatamim/ferngeist-acp-gateway/commit/79046d0))
+  `baseCommit`. Not `[semantic]`: the response shape and what it
+  means (the agent's changes) are unchanged, so no `protocolVersion` bump. (2026-10-13, [79046d0](https://github.com/arafatamim/ferngeist-acp-gateway/commit/79046d0))
 
 - `v1.0.0` — connecting starts the agent, and the gateway protocol moves
   `v1` → `v2`:

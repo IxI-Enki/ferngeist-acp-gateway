@@ -1,3 +1,37 @@
+## [1.1.0] - 2026-10-15
+
+### 🚀 Features
+
+- *(workspace)* Commit history endpoints for the git sheet (#6)
+- *(session)* Report each prompt's turn duration in its result _meta
+- *(session)* Show turn duration in Turn Complete push
+- *(workspace)* Diff worktrees against merge-base so rebases stop leaking upstream commits
+- *(session)* Keep detached prompt results for the next attach
+- *(session)* Flag truncated history in resume notice
+
+### 🐛 Bug Fixes
+
+- *(packaging)* Installer, upgrade and uninstall fixes with end-to-end CI (#7)
+
+### 💼 Other
+
+- Update ferngeist-gateway formula to v1.0.0
+
+### 📚 Documentation
+
+- *(changelog)* Rebuild contract history per release with commit links
+- *(changelog)* Link turn_result and truncated entries to their commits
+- *(changelog)* Point entry links at the commits on main
+- Rewrite README around app setup and the client API
+
+### 🧪 Testing
+
+- *(api)* Expect detached turn_result ahead of load reply after reconnect
+
+### ⚙️ Miscellaneous Tasks
+
+- Add .gitattributes forcing LF line endings
+- Gofmt-align two test files so gofmt -l is clean
 ## [1.0.0] - 2026-10-11
 
 ### 🚀 Features
