@@ -1,126 +1,152 @@
 # Ferngeist Gateway
 
-`Ferngeist Gateway` is a self-hosted backend service for ACP-compatible agents. Its main purpose is to expose ACP agents through a unified WebSocket API with **resilient sessions** that survive WebSocket disconnection — keeping agents alive, dispatching end-to-end encrypted Web Push notifications (turn complete, permission and input requests, agent errors, agent crashes), and allowing seamless reconnection. It discovers and launches supported agents, provides one authenticated endpoint, and manages pairing and paired devices. It also powers the [Ferngeist](https://github.com/arafatamim/Ferngeist) Android app.
+The desktop half of [Ferngeist](https://github.com/arafatamim/Ferngeist). Install
+it on the computer where your coding agents run, pair your phone, and drive those
+agents from the Ferngeist Android app.
 
-## Install
+It speaks the [Agent Client Protocol (ACP)](https://agentclientprotocol.com), so
+it works with any ACP-compatible agent. The [client API](#client-api) is
+documented and open to other clients.
 
-See [docs/install.md](docs/install.md) for per-OS instructions:
+## Quickstart
 
-- **macOS + Linux (one command):** `curl -fsSL https://arafatamim.github.io/ferngeist-acp-gateway/install.sh | sh`
-- **Windows:** `irm https://arafatamim.github.io/ferngeist-acp-gateway/install.ps1 | iex`
+**1. Install**
 
-Or download the latest release package from the [GitHub releases page](https://github.com/arafatamim/ferngeist-acp-gateway/releases) if you want to install manually.
-
-## Building from source
-
-```bash
-go build -ldflags "-X main.buildVersion=$(git describe --tags --always --dirty 2>/dev/null || echo dev) -X main.buildCommit=$(git rev-parse --short HEAD 2>/dev/null || echo none)" -o ferngeist-gateway ./cmd/ferngeist
+```sh
+# macOS / Linux
+curl -fsSL https://arafatamim.github.io/ferngeist-acp-gateway/install.sh | sh
 ```
-
-This builds the `ferngeist-gateway` binary into the current directory (the
-`buildVersion` ldflag is required — the CLI refuses to start without it).
-Requires Go.
-
-To run the daemon from source without building:
-
-```bash
-go run -ldflags "-X main.buildVersion=dev" ./cmd/ferngeist daemon run
-```
-
-## Usage
-
-### Local use
-
-Run the daemon on the machine hosting the agents:
 
 ```powershell
-# This automatically provisions a secure public URL for the gateway using Tailscale
-ferngeist-gateway daemon run --remote
+# Windows
+irm https://arafatamim.github.io/ferngeist-acp-gateway/install.ps1 | iex
 ```
 
-or
+Homebrew, apt/dnf, pacman and manual installs are covered in
+[docs/install.md](docs/install.md).
 
-```powershell
-# Run the daemon locally on your home network
-ferngeist-gateway daemon run --lan
+**2. Start it as a background service**
+
+Pick how your phone will reach the computer:
+
+```sh
+# From anywhere: a stable HTTPS URL via Tailscale (free account)
+ferngeist-gateway daemon install --remote
+
+# Only at home: phone and computer on the same Wi-Fi
+ferngeist-gateway daemon install --lan
 ```
 
-### Pair a device
+On first `--remote` setup the gateway prints a Tailscale login link and tells
+you which tailnet settings to turn on. See [docs/remote-access.md](docs/remote-access.md).
 
-Pair from the machine running the daemon:
+**3. Pair your phone**
 
-```powershell
+```sh
 ferngeist-gateway pair
 ```
 
-### Run as a service
+Scan the QR code with the Ferngeist app. That's it.
 
-Register the extracted binary as a background service.
+## What you get
 
-```powershell
-ferngeist-gateway daemon install
+- **Sessions that survive your phone sleeping.** Agents keep working when the
+  connection drops, and the app reconnects where it left off.
+- **Push notifications** when a turn finishes, the agent asks for permission or
+  input, or something fails. End-to-end encrypted Web Push via UnifiedPush or
+  the browser; no Google/Firebase account needed.
+- **See what the agent changed.** Browse project files and git diffs from the app.
+- **Self-hosted.** Your code and agents stay on your machine. Revoke any paired
+  device at any time.
+
+## Day-to-day commands
+
+```sh
+ferngeist-gateway daemon status   # is it running, and on which URL?
+ferngeist-gateway devices list    # paired phones
+ferngeist-gateway agents list     # agents the gateway can launch
 ```
 
-Check status:
-```powershell
-ferngeist-gateway daemon status
-```
+Prefer not to install a service? Run it in the foreground with
+`ferngeist-gateway daemon run --remote` (or `--lan`).
 
-### Expose remotely
+## Other ways to expose the gateway
 
-#### Automatic provisioning (powered by Tailscale)
+If you'd rather not use Tailscale, put any tunnel or reverse proxy in front of
+port `5788` and tell the gateway its public URL:
 
-```powershell
-ferngeist-gateway daemon install --remote
-```
+<details>
+<summary>ngrok, Cloudflare Tunnel, reverse proxy</summary>
 
-This embeds a Tailscale node in the gateway, provisions Funnel for public
-access, and gives you a stable `https://<machine>.<tailnet>.ts.net` URL that
-never changes between restarts. One-time Tailscale settings (HTTPS + Funnel
-permission) are required on first boot — the gateway retries and tells you
-exactly what to enable. See [docs/remote-access.md](docs/remote-access.md).
-
-#### Manually
-
-**ngrok**
-
-```powershell
+```sh
+# ngrok
 ngrok http 5788
 ferngeist-gateway daemon install --public-url https://xxxx.ngrok.io
-```
 
-**Cloudflare Tunnel**
-
-```powershell
+# Cloudflare Tunnel
 cloudflared tunnel --url http://localhost:5788
 ferngeist-gateway daemon install --public-url https://xxxx.trycloudflare.com
-```
 
-**Reverse proxy**
-
-```powershell
+# Your own reverse proxy
 ferngeist-gateway daemon install --public-url https://your.domain.example
 ```
 
-Then pair the device and add the public URL in the Ferngeist app.
+Then pair as usual and add the public URL in the app.
 
-## What It Does
+</details>
 
-- exposes ACP agents through one unified WebSocket API
-- discovers supported agents and launches them on demand
-- handles pairing and paired device credentials
-- supports **resilient sessions** that survive WebSocket disconnection with push notification wake-up (Web Push via UnifiedPush or the browser, no Firebase credentials needed) and seamless reconnection
-- supports local and LAN-based access
-- **workspace browsing:** read-only file view (`GET /v1/runtimes/{id}/files`) and git inspection (`git/status`, `git/diff`) so a paired client can see what the agent is working on
+## Client API
+
+The Android app is one client of a documented HTTP + WebSocket API:
+
+- **Standard ACP over WebSocket.** Each chat is a WebSocket carrying plain ACP
+  JSON-RPC, with a few `_ferngeist/` extension notifications.
+- **One endpoint, many agents.** `GET /v1/agents` lists every agent the host can
+  run (from the ACP registry, plus registered custom agents).
+  `POST /v1/agents/{id}/connect` launches one and returns a WebSocket URL.
+  Connecting again opens a parallel chat.
+- **Resilient sessions.** Agent processes outlive the socket.
+  `POST /v1/sessions/{id}/resume` reattaches, and the gateway replays buffered
+  updates.
+- **Pairing and auth built in.** Short-code/QR pairing, per-device
+  credentials with proof-of-possession, and revocation.
+- **Push notifications.** End-to-end encrypted Web Push for turn completion,
+  permission requests and errors.
+- **Workspace access.** Read project files, `git status` and `git diff` for the
+  directory an agent is working in, plus git worktrees for isolated runs.
+- **Discovery.** mDNS advertisement on the LAN, with a protocol version for
+  compatibility checks.
+
+Minimal flow: pair (`POST /v1/pair/start`, `/complete`), connect to an agent,
+open `websocketUrl`, speak ACP. The full contract is in
+[docs/api.md](docs/api.md), and contract changes are tracked in
+[docs/changelog.md](docs/changelog.md).
+
+## Contributing
+
+See [docs/architecture.md](docs/architecture.md) for how the pieces fit together.
+
+**Build from source** (requires Go):
+
+```sh
+go build -ldflags "-X main.buildVersion=$(git describe --tags --always --dirty 2>/dev/null || echo dev) -X main.buildCommit=$(git rev-parse --short HEAD 2>/dev/null || echo none)" -o ferngeist-gateway ./cmd/ferngeist
+```
+
+The `buildVersion` ldflag is required; the CLI refuses to start without it. To
+run without building: `go run -ldflags "-X main.buildVersion=dev" ./cmd/ferngeist daemon run`.
 
 ## Documentation
 
-- [docs/install.md](docs/install.md) - per-OS installation
-- [docs/architecture.md](docs/architecture.md) - system overview and components
-- [docs/usage.md](docs/usage.md) - setup, pairing, and running the daemon
-- [docs/api.md](docs/api.md) - public and admin API surface
-- [docs/security.md](docs/security.md) - security model and remote access notes
-- [docs/pairing.md](docs/pairing.md) - pairing flow and device credentials
-- [docs/remote-access.md](docs/remote-access.md) - tunnel and reverse proxy setup
-- [docs/configuration.md](docs/configuration.md) - environment variables and defaults
-- [docs/development.md](docs/development.md) - build, test, and local development notes
+- [Install](docs/install.md): per-OS installation
+- [Usage](docs/usage.md): running the daemon, pairing, common commands
+- [Remote access](docs/remote-access.md): Tailscale, tunnels, reverse proxies
+- [Security](docs/security.md): security model
+- [Pairing](docs/pairing.md): pairing flow and device credentials
+- [Configuration](docs/configuration.md): environment variables and defaults
+- [API](docs/api.md): public and admin API
+- [Architecture](docs/architecture.md): components overview
+- [Development](docs/development.md): build, test, local development
+
+## License
+
+[AGPL-3.0](LICENSE)
