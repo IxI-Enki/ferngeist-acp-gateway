@@ -62,7 +62,7 @@ not be coupled. Full release notes live in GitHub Releases.
 - `[additive]` `_ferngeist/resumed` gains an optional `"truncated": true`
   param: the per-session replay buffer (8 MiB) evicted its oldest frames, so a
   gateway-restored session starts mid-conversation with earlier history
-  missing. Omitted when the history is intact. (2026-10-13, [9a84927](https://github.com/arafatamim/ferngeist-acp-gateway/commit/9a84927))
+  missing. Omitted when the history is intact. (2026-10-13, [b07ff96](https://github.com/arafatamim/ferngeist-acp-gateway/commit/b07ff96))
 - `[additive]` `_ferngeist/turn_result` — a new gateway→client notification on
   the ACP WebSocket, sent when a `session/prompt` finished while no client was
   attached: `{"jsonrpc":"2.0","method":"_ferngeist/turn_result","params":{"sessionId":…,"stopReason":…,"usage":…,"durationMs":…}}`.
@@ -74,14 +74,14 @@ not be coupled. Full release notes live in GitHub Releases.
   meter stale and the turn untimed. Clients that ignore unknown methods are
   unaffected. `session/resume` now restores like `session/load`: it records
   its session for redelivery, so unanswered agent requests are re-sent after a
-  resume too. (2026-10-13, [85a96b7](https://github.com/arafatamim/ferngeist-acp-gateway/commit/85a96b7))
+  resume too. (2026-10-13, [eb4dfb8](https://github.com/arafatamim/ferngeist-acp-gateway/commit/eb4dfb8))
 - `[additive]` `session/prompt` results gain `_meta.ferngeist.durationMs`: how
   long the turn ran, in milliseconds, from the prompt reaching the gateway to
   the agent's reply, measured on the gateway's monotonic clock. A client whose
   connection stalled (a dozing phone) hears the reply late, so it should time
   the turn with this instead of its own clock. Any `_meta` the agent sent is
   kept. Only on the result sent to the connection that issued the prompt;
-  error replies and `_ferngeist/turn_ended` do not carry it. (2026-10-13, [7babdb6](https://github.com/arafatamim/ferngeist-acp-gateway/commit/7babdb6))
+  error replies and `_ferngeist/turn_ended` do not carry it. (2026-10-13, [b3dd51b](https://github.com/arafatamim/ferngeist-acp-gateway/commit/b3dd51b))
 - `[semantic]` Managed-worktree git endpoints (`GET /v1/runtimes/{id}/git/status`
   and `/git/diff`) — the base they compare against is now `git merge-base` of
   the branch the worktree was cut from and the worktree's `HEAD`, instead of
@@ -89,7 +89,7 @@ not be coupled. Full release notes live in GitHub Releases.
   rebased onto a newer base, the diff shows only the agent's changes rather
   than the upstream commits the rebase picked up. Worktrees created before
   this change, and ones whose base branch was deleted, keep comparing against
-  `baseCommit`. (2026-10-13, [2223d1a](https://github.com/arafatamim/ferngeist-acp-gateway/commit/2223d1a))
+  `baseCommit`. (2026-10-13, [79046d0](https://github.com/arafatamim/ferngeist-acp-gateway/commit/79046d0))
 
 - `v1.0.0` — connecting starts the agent, and the gateway protocol moves
   `v1` → `v2`:
