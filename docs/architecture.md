@@ -168,8 +168,9 @@ so the Ferngeist client can decode them with SDK types it already has:
   enriched with per-file line counts (`git diff HEAD --numstat`, covering the
   whole HEAD → working-tree delta so staged + unstaged edits count together;
   a `--cached` fallback covers repos with no HEAD commit) and raw line counts
-  for untracked files. Has **no ACP equivalent**; the shape is gateway-defined
-  and documented as such.
+  for untracked files, plus a `staged` flag (the index side, `X`, of the
+  porcelain `XY` pair; false for unmerged and untracked entries). Has **no ACP
+  equivalent**; the shape is gateway-defined and documented as such.
 - `GET /v1/runtimes/{id}/git/diff?path=<rel>` — always returns
   `acp.ToolCallContentDiff` (`path`/`oldText`/`newText`/`type:"diff"`): a single
   object with `?path=`, otherwise a JSON array with one entry per changed file.

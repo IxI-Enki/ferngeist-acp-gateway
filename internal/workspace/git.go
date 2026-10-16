@@ -89,6 +89,7 @@ type ChangedFile struct {
 	Binary  bool   `json:"binary"`            // true when git reported "-" for the counts
 	IsDir   bool   `json:"isDir"`             // true for submodules and collapsed untracked dirs
 	OldPath string `json:"oldPath,omitempty"` // rename/copy source; set by CommitChanges only
+	Staged  bool   `json:"staged"`            // true when the index holds a change (X of XY); counts still cover index and worktree together
 }
 
 // ParseGitStatus parses `git status --porcelain=v2` output into a list of
@@ -162,7 +163,8 @@ func ParseGitStatus(out string) []ChangedFile {
 			// submodule (a gitlink directory). A trailing slash marks a collapsed
 			// untracked directory. Both are directories, not files.
 			isDir := strings.HasSuffix(path, "/") || strings.HasPrefix(sub, "S")
-			files = append(files, ChangedFile{Path: path, Status: status, IsDir: isDir})
+			staged := line[0] != 'u' && xy[0] != '.'
+			files = append(files, ChangedFile{Path: path, Status: status, IsDir: isDir, Staged: staged})
 		}
 	}
 	return files

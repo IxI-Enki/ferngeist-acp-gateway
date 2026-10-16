@@ -344,8 +344,9 @@ opened or loaded on this runtime returns `404`.
       "ahead": 2,
       "behind": 0,
       "changed": [
-        { "path": "wip.txt", "status": "?", "added": 1, "removed": 0, "binary": false },
-        { "path": "edited.txt", "status": "M", "added": 1, "removed": 1, "binary": false }
+        { "path": "wip.txt", "status": "?", "added": 1, "removed": 0, "binary": false, "staged": false },
+        { "path": "edited.txt", "status": "M", "added": 1, "removed": 1, "binary": false, "staged": false },
+        { "path": "new.txt", "status": "A", "added": 3, "removed": 0, "binary": false, "staged": true }
       ]
     }
     ```
@@ -359,11 +360,18 @@ opened or loaded on this runtime returns `404`.
     `removed` is `0`.
   - `binary` is `true` when git reports no counts for a binary file (`added` /
     `removed` are then `0`), and for untracked files that contain a NUL byte.
+  - `staged` is `true` when the index (not just the working tree) holds a change
+    — the `X` of the porcelain `XY` pair — and `false` for worktree-only edits,
+    untracked files, and unmerged (conflicted) entries. It is independent of
+    `added`/`removed`: those always count the whole `HEAD` → working-tree delta
+    (above), so a partially staged file reports `staged: true` with both halves
+    of its change counted together.
   - **No ACP schema equivalent:** git status has no counterpart in the ACP v1
     schema, so this shape is **gateway-defined**. `status` uses git porcelain
-    letters (`M`, `A`, `D`, `R`, `?`, ...); `added`/`removed`/`binary` are
-    line-count extensions. The Ferngeist client defines this type itself rather
-    than reusing an SDK type.
+    letters (`M`, `A`, `D`, `R`, `?`, ...); `staged` and the
+    `added`/`removed`/`binary` line counts are gateway extensions (as is
+    `isDir`). The Ferngeist client defines this type itself rather than reusing
+    an SDK type.
   - Error responses:
     - `404` — runtime has no session, or working directory unknown (see above)
     - `422` — `git` is missing from PATH, or the directory is not a git repository
@@ -487,8 +495,9 @@ opened or loaded on this runtime returns `404`.
   - Requires `read` scope.
   - Response: `{ "sha": "<full sha>", "changed": [ChangedFile] }`, using the
     `/git/status` file shape. Renames and copies add `oldPath`; submodules have
-    `isDir: true`. A commit that touched nothing under the directory returns
-    `changed: []`.
+    `isDir: true`. `staged` is always `false` here: the listed files are the
+    commit's own changes, so there is no index/worktree split to report. A
+    commit that touched nothing under the directory returns `changed: []`.
   - Error responses:
     - `400` — invalid or unknown sha
     - `404` — runtime has no session, or working directory unknown (see above)

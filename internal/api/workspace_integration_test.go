@@ -246,6 +246,22 @@ func TestWorkspaceEndpoints_EndToEnd(t *testing.T) {
 		t.Fatalf("partial.txt counts = %+v, want {added:2 removed:1}", f)
 	}
 
+	// staged reflects whether the index holds a change, independent of the
+	// combined counts above: true for index changes (git add / git mv), false
+	// for worktree-only edits and untracked files.
+	for path, want := range map[string]bool{
+		"staged.txt":      true,  // added to the index
+		"partial.txt":     true,  // the b->X edit is staged
+		"renamed_dst.txt": true,  // git mv stages the rename
+		"edited.txt":      false, // worktree-only edit
+		"wip.txt":         false, // untracked
+		"clip é 😎.bin":    false, // untracked
+	} {
+		if f := byPath[path]; f.Staged != want {
+			t.Fatalf("%s staged = %v, want %v", path, f.Staged, want)
+		}
+	}
+
 	// 4. Git diff for the edited file returns a ToolCallContentDiff with the
 	// new text and the committed old text.
 	rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/diff?path=edited.txt")
