@@ -52,6 +52,15 @@ not be coupled. Full release notes live in GitHub Releases.
 
 ## History
 
+- `[additive]` `GET /v1/runtimes/{id}/git/status` changed-file objects gain
+  `staged`: `true` when the index holds a change (the `X` of the porcelain `XY`
+  pair), `false` for worktree-only edits, untracked files, and unmerged
+  (conflicted) entries. `added`/`removed` are unchanged — they still count the
+  whole `HEAD` → working-tree delta — so a partially staged file reports
+  `staged: true` with both halves counted together. Also present (always
+  `false`) on the `/git/commits/{sha}` file shape, whose files are the commit's
+  own changes. (2026-10-16, [377e74e](https://github.com/arafatamim/ferngeist-acp-gateway/commit/377e74e))
+
 - `v1.1.0` — commit history, detached turn results and rebase-safe worktree
   diffs; additive only, `protocolVersion` stays `v2`:
 - `[additive]` Commit history endpoints: `GET /v1/runtimes/{id}/git/log`
