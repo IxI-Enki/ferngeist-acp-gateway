@@ -366,10 +366,10 @@ opened or loaded on this runtime returns `404`.
     ```
   - `kind` is `branch`, `remote`, or `tag`. `isHead` marks the checked-out
     branch; no entry is `isHead` when `HEAD` is detached. `default` is a hint
-    for labelling and sorting only — `origin/HEAD`'s branch when a local branch
+    for labelling, sorting, and the client's preselected target — `origin/HEAD`'s branch when a local branch
     of that name exists, else that alias's own short name (`origin/main`), else
-    a local `main`/`master`, else `""` — and is never auto-selected by the
-    gateway. Refs come in `refs/heads`, `refs/remotes`, `refs/tags` order;
+    a local `main`/`master`, else `""`. The gateway never applies it itself;
+    the client compares against it when the checkout is on another branch. Refs come in `refs/heads`, `refs/remotes`, `refs/tags` order;
     clients group by `kind`.
   - `name` is the short name git displays. It is ambiguous when a tag and a
     branch or remote share it, and `compare=<name>` then resolves by git's own

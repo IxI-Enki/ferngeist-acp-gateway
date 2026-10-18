@@ -162,8 +162,8 @@ func Refs(ctx context.Context, cwd string) (RefsPayload, error) {
 
 // defaultRef picks the picker's labelling hint: origin/HEAD's branch when a
 // local branch of that name exists, else the resolved short name (e.g.
-// "origin/main"), else a local main/master, else "". It is never used to
-// preselect a target.
+// "origin/main"), else a local main/master, else "". The client preselects
+// it as the compare target when the checkout is on another branch.
 func defaultRef(ctx context.Context, cwd string, refs []Ref) string {
 	local := make(map[string]bool, len(refs))
 	for _, r := range refs {
