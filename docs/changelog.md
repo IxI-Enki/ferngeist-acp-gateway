@@ -52,6 +52,16 @@ not be coupled. Full release notes live in GitHub Releases.
 
 ## History
 
+- `[additive]` `GET /v1/runtimes/{id}/files/list` — lists the tracked and
+  untracked, non-ignored files under the session's project directory (the
+  same root `/files?path=` reads): `{ "files": [...], "truncated": false }`,
+  repository-relative and sorted, deduplicated, capped at 50,000 paths, and
+  gzipped when the client sends `Accept-Encoding: gzip`. Read scope required;
+  `404` for an unknown `acpSessionId`, `422` for a non-repo cwd or missing
+  git; no ACP schema equivalent (gateway-defined). No `protocolVersion` bump:
+  a gateway without it answers `404` with no envelope, which the client reads
+  as "unsupported" (2026-10-19, [7b55ffa](https://github.com/arafatamim/ferngeist-acp-gateway/commit/7b55ffa))
+
 - `[additive]` `GET /v1/runtimes/{id}/git/log` — each page gains `total`: the
   size of the walk the page comes from (`git rev-list --count <head>`, or
   `--not <ref>` in compare mode), so a client can size its history list from

@@ -347,6 +347,47 @@ opened or loaded on this runtime returns `404`.
     - `404` — runtime has no session, or the client has not issued
       `session/new`/`session/load` yet (so the working directory is unknown)
 
+- `GET /v1/runtimes/{runtimeId}/files/list`
+  - Lists the files of the runtime's project directory so a client can resolve
+    the bare file names an agent writes out locally. Requires `read` scope.
+    Same `acpSessionId=<id>` semantics as the other workspace endpoints; the
+    listing root is that session's project directory, so every listed path can
+    be passed to `/files?path=` unchanged.
+  - Response:
+    ```json
+    {
+      "files": ["go.mod", "internal/api/proof.go", "internal/api/server.go"],
+      "truncated": false
+    }
+    ```
+  - `files` are repository-relative paths with `/` separators, relative to the
+    session's project directory (not the repository root when the project is a
+    subdirectory), deduplicated and sorted. The listing is
+    `git ls-files -z --cached --others --exclude-standard -- .` run in the
+    project directory: tracked plus untracked files, minus anything
+    `.gitignore`, `.git/info/exclude`, or the global excludes file ignores, so
+    `node_modules/`, `build/`, `.gradle/` and similar stay out. A submodule
+    appears as its gitlink path; opening it through `/files` answers
+    `400 path is a directory`.
+  - **No ACP schema equivalent:** this shape is **gateway-defined**, like
+    `/git/status`.
+  - `truncated` is `true` when the list was cut at the 50,000-path cap
+    (~2.5 MB uncompressed, ~250 KB gzipped). When truncated, a bare name the
+    client cannot find is **unknown**, not absent — it may be past the cut.
+  - The body is gzipped when the request's `Accept-Encoding` includes `gzip`
+    (`Content-Encoding: gzip`, `Vary: Accept-Encoding` — path lists repeat
+    directory prefixes and compress around 10:1); otherwise plain JSON.
+  - Error responses:
+    - `404` — runtime has no session, or working directory unknown (see above)
+    - `422` — `git` is missing from PATH, or the directory is not a git
+      repository. There is no walking-the-filesystem fallback: without git
+      there are no ignore rules, and an unfiltered walk of `node_modules/`
+      would be both huge and useless.
+  - A gateway predating the endpoint answers `404` with no `{"error"}`
+    envelope — the same signal `/git/log` and `/git/refs` use, which clients
+    read as "unsupported" and treat as a fallback to the file names they
+    already know.
+
 - `GET /v1/runtimes/{runtimeId}/git/refs`
   - Lists the refs a client can compare against: every local branch, every
     remote-tracking ref (`origin/*`, with `origin/HEAD`-style aliases dropped),

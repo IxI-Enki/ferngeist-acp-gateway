@@ -1,7 +1,9 @@
 package api
 
 import (
+	"compress/gzip"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -32,6 +34,12 @@ type blobReadResponse struct {
 	acp.BlobResourceContents
 	Size      int  `json:"size"`
 	Truncated bool `json:"truncated"`
+}
+
+// fileListResponse is the payload for GET /v1/runtimes/{id}/files/list.
+type fileListResponse struct {
+	Files     []string `json:"files"`
+	Truncated bool     `json:"truncated"`
 }
 
 // gitStatusResponse is the payload for GET /v1/runtimes/{id}/git/status.
@@ -133,6 +141,46 @@ func (s *Server) handleWorkspaceFile(w http.ResponseWriter, r *http.Request) {
 		Size:      int(info.Size()),
 		Truncated: truncated,
 	})
+}
+
+// writeJSONFileList writes the file-list payload, gzipping the body when the
+// request's Accept-Encoding includes gzip. Scoped to this handler, not a
+// global middleware: the other endpoints' bodies are small and /files content
+// is often already compressed. Vary is set on both paths for correct caching;
+// the 404/422 error paths go through plain writeError on purpose, since error
+// bodies are tiny.
+func writeJSONFileList(w http.ResponseWriter, r *http.Request, status int, payload fileListResponse) {
+	w.Header().Set("Vary", "Accept-Encoding")
+	if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		writeJSON(w, status, payload)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Encoding", "gzip")
+	w.WriteHeader(status)
+	gz := gzip.NewWriter(w)
+	defer gz.Close()
+	_ = json.NewEncoder(gz).Encode(payload)
+}
+
+// handleWorkspaceFileList lists a runtime's project files (tracked plus
+// untracked, ignoring rules honoured). GET /v1/runtimes/{runtimeId}/files/list,
+// shaped like handleWorkspaceFile: read scope, resolveWorkspaceCwd, then the
+// workspace listing.
+func (s *Server) handleWorkspaceFileList(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireGatewayScope(w, r, pairing.ScopeRead); !ok {
+		return
+	}
+	cwd, ok := s.resolveWorkspaceCwd(w, r, r.PathValue("runtimeId"))
+	if !ok {
+		return
+	}
+	files, truncated, err := workspace.ListFiles(r.Context(), cwd, workspace.MaxFileListEntries)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	writeJSONFileList(w, r, http.StatusOK, fileListResponse{Files: files, Truncated: truncated})
 }
 
 // handleWorkspaceGitRefs lists the refs a client can compare against.

@@ -25,6 +25,13 @@ import (
 // endpoint. Larger files are truncated and the response flags truncated=true.
 const MaxFileReadBytes = 1 << 20 // 1 MiB
 
+// MaxFileListEntries caps GET /v1/runtimes/{id}/files/list at 50,000 paths:
+// at about 50 bytes per path that is about 2.5 MB uncompressed, ~250 KB
+// gzipped. Repositories past that are monorepos where a bare name is rarely
+// unique anyway. It sits beside MaxFileReadBytes; unlike the const it is a var
+// so the end-to-end test can lower it (spec: "so a test can lower it").
+var MaxFileListEntries = 50000
+
 // GitCommandTimeout bounds every git invocation so a locked or hanging repo
 // cannot stall the HTTP handler (the server WriteTimeout is 20s).
 const GitCommandTimeout = 15 * time.Second

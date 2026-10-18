@@ -67,11 +67,9 @@ func CompareChanges(ctx context.Context, cwd, ref string) ([]ChangedFile, error)
 	}
 	var untrackedFiles []string
 	untracked := map[string]bool{}
-	for _, path := range strings.Split(others, "\x00") {
-		if path != "" {
-			untracked[path] = true
-			untrackedFiles = append(untrackedFiles, path)
-		}
+	for _, path := range splitNullPaths(others) {
+		untracked[path] = true
+		untrackedFiles = append(untrackedFiles, path)
 	}
 
 	out, err := RunGit(ctx, cwd, "diff", "--name-status", "--relative", ref, "--", ".")
