@@ -52,6 +52,16 @@ not be coupled. Full release notes live in GitHub Releases.
 
 ## History
 
+- `[additive]` `GET /v1/runtimes/{id}/git/log` — each page gains `total`: the
+  size of the walk the page comes from (`git rev-list --count <head>`, or
+  `--not <ref>` in compare mode), so a client can size its history list from
+  any page. It ignores `skip`, `limit` and `beyond`, is `0` for an empty
+  repository or an empty range, and leaves `hasMore` authoritative for paging.
+  Always present; a gateway that predates the field omits it, which is how a
+  client tells that apart from a real `0`. A count failure fails the request
+  with the walk's `422` rather than dropping the field. No `protocolVersion`
+  bump: an older client ignores an unknown field. (2026-10-18, [ac63075](https://github.com/arafatamim/ferngeist-acp-gateway/commit/ac63075))
+
 - `[additive]` Branch comparison for the git sheet:
   `GET /v1/runtimes/{id}/git/refs` lists local branches, `origin/*` refs and
   tags (each with `kind`, `isHead`, and a `default` hint), and `compare=<ref>`
