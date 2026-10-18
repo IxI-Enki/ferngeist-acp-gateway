@@ -127,6 +127,11 @@ func Log(ctx context.Context, cwd, head string, skip, limit int, exclude string,
 	if len(commits) > limit {
 		commits, truncated = commits[:limit], true
 	}
+	if commits == nil {
+		// An empty range (compare with the head's own branch) parses to no
+		// records; a nil slice would marshal as null, but clients expect [].
+		commits = []Commit{}
+	}
 	page.Head, page.Commits, page.HasMore = head, commits, truncated
 	page.RemoteURL = StripRemoteCredentials(strings.TrimSpace(gitOrEmpty(ctx, cwd, "remote", "get-url", "origin")))
 	markPushed(ctx, cwd, head, page.Commits)

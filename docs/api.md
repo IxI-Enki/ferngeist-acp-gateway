@@ -538,7 +538,9 @@ opened or loaded on this runtime returns `404`.
     `target..HEAD` with two-dot semantics (see
     [branch comparison](#workspace-browsing)). `head`, `skip`, `limit`,
     `hasMore`, `remoteUrl` and `baseCommit` are unchanged, so page with the
-    returned `head` as usual even in compare mode.
+    returned `head` as usual even in compare mode. An empty range — comparing a
+    branch with itself, or a target that already contains `head` — is
+    `"commits": []`, never `null`.
   - **`target`:** with `compare` and `beyond=<n>` the response also carries
     `target`, `n` commits of `<ref>`'s own history starting at its tip, newest
     first, in the same shape as `commits`. So `beyond=1` is just the tip and
@@ -586,7 +588,7 @@ opened or loaded on this runtime returns `404`.
     `false`.
   - `baseCommit` is present only inside a [managed worktree](#worktrees): the
     commit the worktree branched from.
-  - An empty repository returns `200` with `head: ""` and no commits.
+  - An empty repository returns `200` with `head: ""` and `"commits": []`.
   - Error responses:
     - `400` — `head` is not 7–64 lowercase hex, or names no commit (for
       example a pinned head removed by a rebase and gc; reload page 1);

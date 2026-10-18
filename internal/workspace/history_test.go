@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -297,5 +298,21 @@ func TestLogCompareRange(t *testing.T) {
 	}
 	if _, err := Log(ctx, dir, "", 0, 50, "nope", 0); statusOf(err) != http.StatusBadRequest {
 		t.Fatalf("unknown exclude err = %v, want 400", err)
+	}
+	// A branch compared with itself is an empty range. The page must still
+	// marshal commits as []: a null makes clients fail to decode the response.
+	self, err := Log(ctx, dir, "", 0, 50, "main", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if self.Commits == nil || len(self.Commits) != 0 || self.HasMore {
+		t.Fatalf("self compare commits = %#v, hasMore=%v, want empty non-nil", self.Commits, self.HasMore)
+	}
+	encoded, err := json.Marshal(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"commits":[]`) {
+		t.Fatalf("self compare json = %s, want an empty commits array", encoded)
 	}
 }
