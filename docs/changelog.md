@@ -62,7 +62,7 @@ not be coupled. Full release notes live in GitHub Releases.
   `compare` plus the resolved `compareCommit` only when an explicit
   `?compare=` was honoured — a worktree's merge-base sha is never reported as a
   comparison. A gateway without `/git/refs` answers `404`, which the client
-  uses to hide the whole affordance. (2026-10-18, [b40a5dc](https://github.com/arafatamim/ferngeist-acp-gateway/commit/b40a5dc))
+  uses to hide the whole affordance. (2026-10-18, [f81472e](https://github.com/arafatamim/ferngeist-acp-gateway/commit/f81472e))
 
 - `[additive]` `GET /v1/runtimes/{id}/git/status` changed-file objects gain
   `staged`: `true` when the index holds a change (the `X` of the porcelain `XY`
