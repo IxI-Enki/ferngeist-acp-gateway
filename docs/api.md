@@ -29,6 +29,10 @@ Base path: `/v1`
 
 - `GET /v1/status`
   - Returns gateway status, build info, discovery state, remote access state, registry status, and runtime counts.
+  - `serverTime` is the gateway's current clock (RFC 3339, UTC). Clients sign
+    proof timestamps as `localNow + (serverTime - localNow at fetch)`, so a
+    device clock that is off does not break authentication. Proof timestamps
+    must fall within ±5 minutes of the gateway's clock.
   - The `remote` object describes how the gateway is reachable:
     ```json
     {
@@ -953,6 +957,28 @@ Errors use a simple JSON envelope:
   "error": "message"
 }
 ```
+
+Auth rejections (`401`, and the scope `403`) also carry a stable `code` and
+the gateway's `serverTime`. Classify them by `code`, never by `error` text:
+
+```json
+{
+  "error": "gateway credential proof expired: client clock differs from the gateway's by -37m13s (allowed ±5m0s)",
+  "code": "proof_expired",
+  "serverTime": "2026-10-19T10:00:00Z"
+}
+```
+
+| `code` | Meaning | Client action |
+|---|---|---|
+| `proof_expired` | Proof timestamp outside ±5 min of `serverTime` (clock skew) | Set offset from `serverTime`, re-sign with a fresh nonce, retry once. Keep the credential. |
+| `proof_replayed` | Nonce already used | Re-sign with a fresh nonce. Keep the credential. |
+| `proof_required` / `proof_invalid` | Proof headers missing, malformed, or signature mismatch | Client bug or wrong key. Do not retry blindly. |
+| `credential_missing` / `credential_invalid` | No bearer token, or token unknown | Re-pair. |
+| `credential_expired` | Bearer token past validity | Call `POST /v1/auth/refresh`. |
+| `credential_grace_expired` | Past the refresh grace window | Re-pair. |
+| `credential_scope` | Credential lacks the required scope (`403`) | Do not retry. |
+| `legacy_credentials_disabled` | Bearer-only credential, gateway requires proof | Re-pair. |
 
 ### Authentication and scopes
 

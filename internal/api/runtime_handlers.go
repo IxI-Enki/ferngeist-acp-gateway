@@ -252,7 +252,7 @@ func (s *Server) handleRuntimeRestart(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(request.Env) > 0 {
 		if err := credential.RequireScope(pairing.ScopeRuntimeRestartEnv); err != nil {
-			writeError(w, http.StatusForbidden, err.Error())
+			s.writeAuthError(w, http.StatusForbidden, err)
 			return
 		}
 	}

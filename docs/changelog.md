@@ -52,6 +52,20 @@ not be coupled. Full release notes live in GitHub Releases.
 
 ## History
 
+- `[additive]` Clock-skew recovery for proof-of-possession. `GET /v1/status`
+  gains `serverTime` (the gateway's clock, RFC 3339 UTC). Every auth rejection
+  (the `401`s and scope `403`s from the credential gate) gains a stable `code`
+  (`proof_required`, `proof_invalid`, `proof_expired`, `proof_replayed`,
+  `credential_missing`, `credential_invalid`, `credential_expired`,
+  `credential_grace_expired`, `credential_scope`,
+  `legacy_credentials_disabled`) and `serverTime`. On `proof_expired`, a client
+  should set its proof clock offset to `serverTime - localNow`, re-sign with a
+  fresh nonce, and retry once. Clients should classify rejections by `code`
+  rather than by the text. The `proof_expired` message now reports the skew,
+  but it still contains `proof expired`, so clients that match on that text
+  keep working. No `protocolVersion` bump: older clients ignore the new fields.
+  (2026-10-19)
+
 - `[additive]` `GET /v1/runtimes/{id}/files/list` — lists the tracked and
   untracked, non-ignored files under the session's project directory (the
   same root `/files?path=` reads): `{ "files": [...], "truncated": false }`,

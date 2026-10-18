@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -37,46 +38,47 @@ func (s *Server) verifyCredentialProof(r *http.Request, rawToken string, credent
 		return nil
 	}
 	if r == nil {
-		return errors.New("gateway credential proof required")
+		return &authError{code: proofRequired, message: "gateway credential proof required"}
 	}
 	timestampText := strings.TrimSpace(r.Header.Get(proofHeaderTimestamp))
 	nonce := strings.TrimSpace(r.Header.Get(proofHeaderNonce))
 	signatureText := strings.TrimSpace(r.Header.Get(proofHeaderSignature))
 	if timestampText == "" || nonce == "" || signatureText == "" {
-		return errors.New("gateway credential proof required")
+		return &authError{code: proofRequired, message: "gateway credential proof required"}
 	}
 	timestampUnix, err := strconv.ParseInt(timestampText, 10, 64)
 	if err != nil {
-		return errors.New("gateway credential proof invalid")
+		return &authError{code: proofInvalid, message: "gateway credential proof invalid"}
 	}
 	now := s.now().UTC()
 	timestamp := time.Unix(timestampUnix, 0).UTC()
 	if timestamp.Before(now.Add(-proofSkewWindow)) || timestamp.After(now.Add(proofSkewWindow)) {
-		return errors.New("gateway credential proof expired")
+		// Keep "proof expired" in the text: clients predating code match on it.
+		return &authError{code: proofExpired, message: fmt.Sprintf("gateway credential proof expired: client clock differs from the gateway's by %s (allowed ±%s)", timestamp.Sub(now).Round(time.Second), proofSkewWindow)}
 	}
 	nonceKey := credential.DeviceID + ":" + nonce
 	if s.proofNonces != nil && s.proofNonces.seen(nonceKey, now) {
-		return errors.New("gateway credential proof replayed")
+		return &authError{code: proofReplayed, message: "gateway credential proof replayed"}
 	}
 	bodyHash, err := requestBodyHash(r, jsonBodyLimit)
 	if err != nil {
-		return errors.New("gateway credential proof invalid")
+		return &authError{code: proofInvalid, message: "gateway credential proof invalid"}
 	}
 	message := buildProofMessage(r.Method, requestPathWithRawQuery(r), rawToken, timestampText, nonce, bodyHash)
 	publicKey, err := cachedProofPublicKey(credential.ProofPublicKey)
 	if err != nil {
-		return errors.New("gateway credential proof invalid")
+		return &authError{code: proofInvalid, message: "gateway credential proof invalid"}
 	}
 	signature, err := decodeProofBase64(signatureText)
 	if err != nil {
-		return errors.New("gateway credential proof invalid")
+		return &authError{code: proofInvalid, message: "gateway credential proof invalid"}
 	}
 	digest := sha256.Sum256([]byte(message))
 	if !ecdsa.VerifyASN1(publicKey, digest[:], signature) {
-		return errors.New("gateway credential proof invalid")
+		return &authError{code: proofInvalid, message: "gateway credential proof invalid"}
 	}
 	if s.proofNonces != nil && !s.proofNonces.use(nonceKey, now) {
-		return errors.New("gateway credential proof replayed")
+		return &authError{code: proofReplayed, message: "gateway credential proof replayed"}
 	}
 	return nil
 }

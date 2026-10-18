@@ -817,6 +817,52 @@ func TestProofBoundCredentialRejectsReplay(t *testing.T) {
 	}
 }
 
+func TestProofClockSkewRejectionCarriesCodeAndServerTime(t *testing.T) {
+	server := newTestServer()
+	credential := pairDeviceWithProof(t, server)
+
+	skewedRequest := httptest.NewRequest(http.MethodGet, "/v1/agents", nil)
+	signProofRequest(t, skewedRequest, credential, nil, time.Now().UTC().Add(-37*time.Minute), "nonce-skewed")
+	skewedRecorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(skewedRecorder, skewedRequest)
+	if skewedRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("skewed status code = %d, want %d", skewedRecorder.Code, http.StatusUnauthorized)
+	}
+	var rejection errorResponse
+	if err := json.Unmarshal(skewedRecorder.Body.Bytes(), &rejection); err != nil {
+		t.Fatalf("Unmarshal(rejection) error = %v", err)
+	}
+	if rejection.Code != proofExpired {
+		t.Fatalf("code = %q, want %q", rejection.Code, proofExpired)
+	}
+	// Clients predating code classify skew by this substring; it must not unpair them.
+	if !strings.Contains(rejection.Error, "proof expired") {
+		t.Fatalf("error = %q, want it to contain %q", rejection.Error, "proof expired")
+	}
+	if rejection.ServerTime == nil {
+		t.Fatal("serverTime missing from proof_expired rejection")
+	}
+
+	// A client correcting by the gateway's clock gets through on the same credential.
+	retryRequest := httptest.NewRequest(http.MethodGet, "/v1/agents", nil)
+	signProofRequest(t, retryRequest, credential, nil, *rejection.ServerTime, "nonce-retry")
+	retryRecorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(retryRecorder, retryRequest)
+	if retryRecorder.Code != http.StatusOK {
+		t.Fatalf("retry status code = %d, want %d", retryRecorder.Code, http.StatusOK)
+	}
+
+	statusRecorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(statusRecorder, httptest.NewRequest(http.MethodGet, "/v1/status", nil))
+	var status statusResponse
+	if err := json.Unmarshal(statusRecorder.Body.Bytes(), &status); err != nil {
+		t.Fatalf("Unmarshal(status) error = %v", err)
+	}
+	if status.ServerTime.IsZero() {
+		t.Fatal("serverTime missing from /v1/status")
+	}
+}
+
 func TestPairingLockoutTracksChallengeAcrossIPs(t *testing.T) {
 	server := newTestServer()
 

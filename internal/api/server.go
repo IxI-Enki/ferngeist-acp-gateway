@@ -143,6 +143,9 @@ type BuildInfo struct {
 // errorResponse is the standard JSON error envelope returned on API errors.
 type errorResponse struct {
 	Error string `json:"error"`
+	// Code and ServerTime are set only on auth rejections; see writeAuthError.
+	Code       string     `json:"code,omitempty"`
+	ServerTime *time.Time `json:"serverTime,omitempty"`
 }
 
 // customAgents returns the custom-agent write policy shared with the admin API.
@@ -158,6 +161,7 @@ type statusResponse struct {
 	Build             BuildInfo          `json:"build"`
 	ProtocolVersion   string             `json:"protocolVersion"`
 	StartedAt         time.Time          `json:"startedAt"`
+	ServerTime        time.Time          `json:"serverTime"` // lets clients offset proof timestamps by their clock skew
 	UptimeSeconds     int64              `json:"uptimeSeconds"`
 	ListenAddr        string             `json:"listenAddr"`
 	LANEnabled        bool               `json:"lanEnabled"`
@@ -542,6 +546,7 @@ func (s *Server) statusSnapshot(includePublicURL bool) statusResponse {
 		Build:             s.build,
 		ProtocolVersion:   ProtocolVersion,
 		StartedAt:         s.startedAt,
+		ServerTime:        now.UTC(),
 		UptimeSeconds:     uptimeSeconds(s.startedAt, now),
 		ListenAddr:        s.cfg.ListenAddr,
 		LANEnabled:        s.cfg.EnableLAN,
