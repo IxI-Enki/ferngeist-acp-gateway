@@ -64,7 +64,7 @@ not be coupled. Full release notes live in GitHub Releases.
   rather than by the text. The `proof_expired` message now reports the skew,
   but it still contains `proof expired`, so clients that match on that text
   keep working. No `protocolVersion` bump: older clients ignore the new fields.
-  (2026-10-19)
+  (2026-10-19, [3adc537](https://github.com/arafatamim/ferngeist-acp-gateway/commit/3adc537))
 
 - `[additive]` `GET /v1/runtimes/{id}/files/list` — lists the tracked and
   untracked, non-ignored files under the session's project directory (the
