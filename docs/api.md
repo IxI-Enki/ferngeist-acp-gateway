@@ -541,6 +541,14 @@ opened or loaded on this runtime returns `404`.
     returned `head` as usual even in compare mode. An empty range — comparing a
     branch with itself, or a target that already contains `head` — is
     `"commits": []`, never `null`.
+  - **`total`:** the size of the whole walk the page comes from —
+    `git rev-list --count <head>`, or `--not <ref>` in compare mode — so a
+    client can size its list from any page. It ignores `skip`, `limit` and
+    `beyond`, is `0` for an empty repository or an empty range, and never
+    decides paging: `hasMore` stays authoritative. Always present; a gateway
+    that predates the field omits it, which is how a client tells that apart
+    from a real `0`. A count failure fails the request with the walk's `422`
+    rather than dropping the field.
   - **`target`:** with `compare` and `beyond=<n>` the response also carries
     `target`, `n` commits of `<ref>`'s own history starting at its tip, newest
     first, in the same shape as `commits`. So `beyond=1` is just the tip and
@@ -553,6 +561,7 @@ opened or loaded on this runtime returns `404`.
     {
       "head": "0901beff…",
       "hasMore": true,
+      "total": 3,
       "remoteUrl": "git@github.com:owner/repo.git",
       "baseCommit": "feabf553…",
       "commits": [

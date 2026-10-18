@@ -401,6 +401,22 @@ func TestWorkspaceEndpoints_EndToEnd(t *testing.T) {
 	if len(lp.Commits) != 1 || !lp.HasMore || lp.Head != lp.Commits[0].SHA || lp.Commits[0].Subject != "add partial" {
 		t.Fatalf("git log page = %+v", lp)
 	}
+	// The page reports the size of the whole walk, not of the page, so a
+	// client can size its list: skip, limit and beyond leave it alone.
+	if lp.Total != 3 {
+		t.Fatalf("git log total = %d, want 3 (the whole walk)", lp.Total)
+	}
+	rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/log?head="+lp.Head+"&limit=1&skip=2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("git log last page code = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var lpLast workspace.LogPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &lpLast); err != nil {
+		t.Fatal(err)
+	}
+	if len(lpLast.Commits) != 1 || lpLast.Total != 3 {
+		t.Fatalf("git log last page = %+v, want one commit and total 3", lpLast)
+	}
 	rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/commits/"+lp.Head)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"path":"partial.txt"`) {
 		t.Fatalf("git commit code = %d, body=%s", rec.Code, rec.Body.String())
@@ -541,6 +557,10 @@ func TestWorkspaceEndpoints_EndToEnd(t *testing.T) {
 	if clp.Head == cmpSha {
 		t.Fatalf("compare log head = %s, want HEAD's sha", clp.Head)
 	}
+	// base is shared, so the range is just this branch's two commits.
+	if clp.Total != 2 {
+		t.Fatalf("compare log total = %d, want 2 (HEAD --not cmp)", clp.Total)
+	}
 	// No target unless asked for; beyond=1 is the target's tip, beyond=2 one more.
 	if len(clp.Target) != 0 {
 		t.Fatalf("compare log target = %+v, want none without beyond", clp.Target)
@@ -555,6 +575,10 @@ func TestWorkspaceEndpoints_EndToEnd(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &clb2); err != nil || len(clb2.Target) != 2 || clb2.Target[0].SHA != cmpSha {
 		t.Fatalf("compare log beyond=2 target = %+v, %v", clb2.Target, err)
 	}
+	// beyond adds target commits but does not change the walk being counted.
+	if clb2.Total != 2 {
+		t.Fatalf("compare log beyond=2 total = %d, want 2", clb2.Total)
+	}
 	// Paging by the pinned head keeps the same range.
 	rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/log?compare=cmp&head="+clp.Head+"&limit=1&skip=1")
 	if rec.Code != http.StatusOK {
@@ -566,6 +590,22 @@ func TestWorkspaceEndpoints_EndToEnd(t *testing.T) {
 	}
 	if len(clp2.Commits) != 1 || clp2.Commits[0].Subject != "add renamed_src" || clp2.HasMore {
 		t.Fatalf("compare log page 2 = %+v, want one commit and no more", clp2)
+	}
+	if clp2.Total != 2 {
+		t.Fatalf("compare log page 2 total = %d, want 2: the range, not the page", clp2.Total)
+	}
+	// A branch compared with itself is an empty walk: no commits and total 0,
+	// while hasMore stays the authority on whether another page exists.
+	rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/log?compare=main")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("self compare log code = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var self workspace.LogPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &self); err != nil {
+		t.Fatal(err)
+	}
+	if len(self.Commits) != 0 || self.Total != 0 || self.HasMore || !strings.Contains(rec.Body.String(), `"commits":[]`) {
+		t.Fatalf("self compare log = %+v, body=%s, want no commits and total 0", self, rec.Body.String())
 	}
 	for _, q := range []string{"compare=nope", "compare=..%2Fetc"} {
 		if rec := do(t, "/v1/runtimes/"+h.runtimeID+"/git/log?"+q); rec.Code != http.StatusBadRequest {
@@ -585,5 +625,42 @@ func TestWorkspaceEndpoints_EndToEnd(t *testing.T) {
 		if rec := do(t, "/v1/runtimes/"+h.runtimeID+path); rec.Code != http.StatusBadRequest {
 			t.Fatalf("%s code = %d, want 400, body=%s", path, rec.Code, rec.Body.String())
 		}
+	}
+
+	// An empty repository answers with head "", no commits and total 0. Its cwd
+	// comes from a second agent session pointed at it.
+	empty := t.TempDir()
+	runGitCLI(t, empty, "init", "-q", "-b", "main")
+	resp2 := h.connectResilient()
+	ws2 := h.dialSessionWS(resp2.SessionID, resp2.AttachToken)
+	defer func() { _ = ws2.CloseNow() }()
+	sendWSMessage(t, ws2, `{"jsonrpc":"2.0","id":"1","method":"initialize","params":{"protocolVersion":1,"capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}`)
+	readWSMessage(t, ws2) // initialize result
+	sendWSMessage(t, ws2, `{"jsonrpc":"2.0","id":"2","method":"authenticate","params":{}}`)
+	readWSMessage(t, ws2) // authenticate result
+	emptyFrame, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      10,
+		"method":  "session/new",
+		"params":  map[string]any{"cwd": empty},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendWSMessage(t, ws2, string(emptyFrame))
+	readWSMessage(t, ws2) // session/new result
+	readWSMessage(t, ws2) // session_info_update notification
+
+	rec = do(t, "/v1/runtimes/"+resp2.RuntimeID+"/git/log")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("empty repo log code = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var emptyLog workspace.LogPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &emptyLog); err != nil {
+		t.Fatal(err)
+	}
+	if emptyLog.Head != "" || len(emptyLog.Commits) != 0 || emptyLog.Total != 0 || emptyLog.HasMore ||
+		!strings.Contains(rec.Body.String(), `"commits":[]`) {
+		t.Fatalf("empty repo log = %+v, body=%s, want head \"\", total 0 and no commits", emptyLog, rec.Body.String())
 	}
 }

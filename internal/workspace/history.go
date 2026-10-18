@@ -54,8 +54,11 @@ type Commit struct {
 
 // LogPage is the /git/log response.
 type LogPage struct {
-	Head       string   `json:"head"`
-	HasMore    bool     `json:"hasMore"`
+	Head    string `json:"head"`
+	HasMore bool   `json:"hasMore"`
+	// Total is the size of the whole walk the page comes from, ignoring skip,
+	// limit and beyond. 0 for an empty repository or an empty range.
+	Total      int      `json:"total"`
 	RemoteURL  string   `json:"remoteUrl"`
 	BaseCommit string   `json:"baseCommit,omitempty"`
 	Commits    []Commit `json:"commits"`
@@ -86,6 +89,11 @@ func ResolveCommit(ctx context.Context, cwd, sha string) (string, error) {
 // With exclude set and beyond > 0, Target also carries beyond commits of that
 // ref's history starting at its tip (clamped to MaxTargetBeyond), so a client
 // can show where the range forks from without a second request.
+//
+// Total is the size of the whole walk — rev-list --count over the same resolved
+// head and exclude — so a client can size its list from any page. It ignores
+// skip, limit and beyond and is 0 for an empty range; HasMore still decides
+// whether another page exists.
 func Log(ctx context.Context, cwd, head string, skip, limit int, exclude string, beyond int) (LogPage, error) {
 	page := LogPage{Commits: []Commit{}}
 	var notArgs []string
@@ -114,6 +122,21 @@ func Log(ctx context.Context, cwd, head string, skip, limit int, exclude string,
 		}
 		return page, nil
 	}
+	// Total counts the whole walk the page comes from, so skip, limit and
+	// beyond cannot change it. A failure here is the walk's own 422: the count
+	// is part of the answer, never a field that silently goes missing.
+	countArgs := []string{"rev-list", "--count", head}
+	countArgs = append(countArgs, notArgs...)
+	countArgs = append(countArgs, "--")
+	countOut, err := RunGit(ctx, cwd, countArgs...)
+	if err != nil {
+		return page, errStatus(http.StatusUnprocessableEntity, err.Error())
+	}
+	total, err := strconv.Atoi(strings.TrimSpace(countOut))
+	if err != nil {
+		return page, errStatus(http.StatusUnprocessableEntity, "cannot count commits: "+countOut)
+	}
+	page.Total = total
 	// log.showSignature=true would print gpg text between records.
 	args := []string{"-c", "log.showSignature=false", "log", "--no-color", "--topo-order", "--decorate=full",
 		"--skip=" + strconv.Itoa(skip), "-n", strconv.Itoa(limit + 1), logFormat, head}
