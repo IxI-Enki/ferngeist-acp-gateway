@@ -24,6 +24,13 @@ const (
 // out option injection ("-…") into the git command line.
 var shaPattern = regexp.MustCompile(`^[0-9a-f]{7,64}$`)
 
+// logFormat is one /git/log record: NUL-separated fields, closed by 0x1e.
+const logFormat = "--format=%H%x00%P%x00%an%x00%ae%x00%at%x00%ct%x00%D%x00%s%x00%b%x1e"
+
+// MaxTargetBeyond caps how many of the compare target's commits one /git/log
+// response carries.
+const MaxTargetBeyond = 50
+
 // Ref is one decoration on a commit.
 type Ref struct {
 	Name   string `json:"name"`
@@ -52,6 +59,9 @@ type LogPage struct {
 	RemoteURL  string   `json:"remoteUrl"`
 	BaseCommit string   `json:"baseCommit,omitempty"`
 	Commits    []Commit `json:"commits"`
+	// Target is the compare target's own history from its tip, newest first;
+	// absent without a compare ref or with beyond 0.
+	Target []Commit `json:"target,omitempty"`
 }
 
 // ResolveCommit validates a client-supplied sha and returns the full object
@@ -72,14 +82,20 @@ func ResolveCommit(ctx context.Context, cwd, sha string) (string, error) {
 // name resolved with ResolveRef whose commits are left out of the walk, so the
 // page is the compare range exclude..head. The whole repo is walked, not just
 // cwd: a pathspec would rewrite parents and break the client's graph.
-func Log(ctx context.Context, cwd, head string, skip, limit int, exclude string) (LogPage, error) {
+//
+// With exclude set and beyond > 0, Target also carries beyond commits of that
+// ref's history starting at its tip (clamped to MaxTargetBeyond), so a client
+// can show where the range forks from without a second request.
+func Log(ctx context.Context, cwd, head string, skip, limit int, exclude string, beyond int) (LogPage, error) {
 	page := LogPage{Commits: []Commit{}}
 	var notArgs []string
+	var targetSHA string
 	if exclude = strings.TrimSpace(exclude); exclude != "" {
 		sha, err := ResolveRef(ctx, cwd, exclude)
 		if err != nil {
 			return page, err
 		}
+		targetSHA = sha
 		// --not negates the revisions after it, so it must follow head.
 		notArgs = []string{"--not", sha}
 	}
@@ -100,8 +116,7 @@ func Log(ctx context.Context, cwd, head string, skip, limit int, exclude string)
 	}
 	// log.showSignature=true would print gpg text between records.
 	args := []string{"-c", "log.showSignature=false", "log", "--no-color", "--topo-order", "--decorate=full",
-		"--skip=" + strconv.Itoa(skip), "-n", strconv.Itoa(limit + 1),
-		"--format=%H%x00%P%x00%an%x00%ae%x00%at%x00%ct%x00%D%x00%s%x00%b%x1e", head}
+		"--skip=" + strconv.Itoa(skip), "-n", strconv.Itoa(limit + 1), logFormat, head}
 	args = append(args, notArgs...)
 	args = append(args, "--")
 	out, err := RunGitLimited(ctx, cwd, maxLogBytes, args...)
@@ -115,7 +130,26 @@ func Log(ctx context.Context, cwd, head string, skip, limit int, exclude string)
 	page.Head, page.Commits, page.HasMore = head, commits, truncated
 	page.RemoteURL = StripRemoteCredentials(strings.TrimSpace(gitOrEmpty(ctx, cwd, "remote", "get-url", "origin")))
 	markPushed(ctx, cwd, head, page.Commits)
+	if targetSHA != "" && beyond > 0 {
+		target, err := targetCommits(ctx, cwd, targetSHA, min(beyond, MaxTargetBeyond))
+		if err != nil {
+			return page, err
+		}
+		page.Target = target
+	}
 	return page, nil
+}
+
+// targetCommits reads up to n commits of sha's history, sha first.
+func targetCommits(ctx context.Context, cwd, sha string, n int) ([]Commit, error) {
+	out, err := RunGitLimited(ctx, cwd, maxLogBytes, "-c", "log.showSignature=false", "log", "--no-color",
+		"--topo-order", "--decorate=full", "-n", strconv.Itoa(n), logFormat, sha, "--")
+	if err != nil {
+		return nil, errStatus(http.StatusUnprocessableEntity, err.Error())
+	}
+	commits, _ := ParseGitLog(out, maxLogBytes)
+	markPushed(ctx, cwd, sha, commits)
+	return commits, nil
 }
 
 // gitOrEmpty returns git's output, or "" when the command fails. For optional

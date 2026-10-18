@@ -133,7 +133,7 @@ func TestLog(t *testing.T) {
 	ctx := context.Background()
 	dir, git := historyRepo(t)
 
-	page, err := Log(ctx, dir, "", 0, 50, "")
+	page, err := Log(ctx, dir, "", 0, 50, "", 0)
 	if err != nil || page.Head != "" || len(page.Commits) != 0 || page.HasMore {
 		t.Fatalf("empty repo = %+v, %v", page, err)
 	}
@@ -143,7 +143,7 @@ func TestLog(t *testing.T) {
 	}
 	git("tag", "v1", "HEAD~1")
 
-	page, err = Log(ctx, dir, "", 0, 2, "")
+	page, err = Log(ctx, dir, "", 0, 2, "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,21 +160,21 @@ func TestLog(t *testing.T) {
 
 	// A commit made between pages does not shift the pinned page 2.
 	git("commit", "-q", "--allow-empty", "-m", "four")
-	page2, err := Log(ctx, dir, page.Head[:7], 2, 2, "")
+	page2, err := Log(ctx, dir, page.Head[:7], 2, 2, "", 0)
 	if err != nil || page2.HasMore || len(page2.Commits) != 1 || page2.Commits[0].Subject != "one" || page2.Head != page.Head {
 		t.Fatalf("page 2 = %+v, %v", page2, err)
 	}
 	// Exactly limit commits left: no more.
-	if p, _ := Log(ctx, dir, page.Head, 1, 2, ""); p.HasMore || len(p.Commits) != 2 {
+	if p, _ := Log(ctx, dir, page.Head, 1, 2, "", 0); p.HasMore || len(p.Commits) != 2 {
 		t.Fatalf("exact page = %+v", p)
 	}
 
 	for _, bad := range []string{"xyz", "abc", "-n1", strings.Repeat("0", 40)} {
-		if _, err := Log(ctx, dir, bad, 0, 2, ""); statusOf(err) != http.StatusBadRequest {
+		if _, err := Log(ctx, dir, bad, 0, 2, "", 0); statusOf(err) != http.StatusBadRequest {
 			t.Fatalf("head %q: err = %v, want 400", bad, err)
 		}
 	}
-	if _, err := Log(ctx, t.TempDir(), "", 0, 2, ""); statusOf(err) != http.StatusUnprocessableEntity {
+	if _, err := Log(ctx, t.TempDir(), "", 0, 2, "", 0); statusOf(err) != http.StatusUnprocessableEntity {
 		t.Fatalf("non-repo err = %v, want 422", err)
 	}
 
@@ -186,7 +186,7 @@ func TestLog(t *testing.T) {
 	git("remote", "add", "origin", origin)
 	git("push", "-q", "origin", "main")
 	git("commit", "-q", "--allow-empty", "-m", "five")
-	page, err = Log(ctx, dir, "", 0, 50, "")
+	page, err = Log(ctx, dir, "", 0, 50, "", 0)
 	if err != nil || page.RemoteURL != origin || page.Commits[0].Pushed || !page.Commits[1].Pushed {
 		t.Fatalf("pushed page = %+v, %v", page, err)
 	}
@@ -268,7 +268,7 @@ func TestLogCompareRange(t *testing.T) {
 	git("commit", "-q", "--allow-empty", "-m", "theirs")
 	git("checkout", "-q", "main")
 
-	page, err := Log(ctx, dir, "", 0, 50, "target")
+	page, err := Log(ctx, dir, "", 0, 50, "target", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,11 +276,26 @@ func TestLogCompareRange(t *testing.T) {
 		page.Commits[0].Subject != "mine two" || page.Commits[1].Subject != "mine one" {
 		t.Fatalf("compare log = %+v", page)
 	}
-	page2, err := Log(ctx, dir, page.Head[:7], 1, 1, "target")
+	// beyond counts the target's commits from its tip: 0 sends none, 1 just the tip.
+	if len(page.Target) != 0 {
+		t.Fatalf("target with beyond=0 = %+v, want none", page.Target)
+	}
+	tip, err := Log(ctx, dir, "", 0, 50, "target", 1)
+	if err != nil || len(tip.Target) != 1 || tip.Target[0].Subject != "theirs" {
+		t.Fatalf("target with beyond=1 = %+v, %v", tip.Target, err)
+	}
+	deeper, err := Log(ctx, dir, "", 0, 50, "target", 2)
+	if err != nil || len(deeper.Target) != 2 || deeper.Target[1].SHA != base {
+		t.Fatalf("target with beyond=2 = %+v, %v", deeper.Target, err)
+	}
+	if plain, _ := Log(ctx, dir, "", 0, 50, "", 5); len(plain.Target) != 0 {
+		t.Fatalf("target without compare = %+v, want none", plain.Target)
+	}
+	page2, err := Log(ctx, dir, page.Head[:7], 1, 1, "target", 0)
 	if err != nil || len(page2.Commits) != 1 || page2.Commits[0].Subject != "mine one" {
 		t.Fatalf("compare log page 2 = %+v, %v", page2, err)
 	}
-	if _, err := Log(ctx, dir, "", 0, 50, "nope"); statusOf(err) != http.StatusBadRequest {
+	if _, err := Log(ctx, dir, "", 0, 50, "nope", 0); statusOf(err) != http.StatusBadRequest {
 		t.Fatalf("unknown exclude err = %v, want 400", err)
 	}
 }

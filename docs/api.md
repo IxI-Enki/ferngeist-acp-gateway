@@ -539,6 +539,13 @@ opened or loaded on this runtime returns `404`.
     [branch comparison](#workspace-browsing)). `head`, `skip`, `limit`,
     `hasMore`, `remoteUrl` and `baseCommit` are unchanged, so page with the
     returned `head` as usual even in compare mode.
+  - **`target`:** with `compare` and `beyond=<n>` the response also carries
+    `target`, `n` commits of `<ref>`'s own history starting at its tip, newest
+    first, in the same shape as `commits`. So `beyond=1` is just the tip and
+    `0` (the default) sends none. `n` is clamped to `0..50` and is `400` when
+    not a non-negative integer. `target` sits outside `commits`, so it never
+    affects `hasMore` or paging; it is absent without `compare`. A client
+    uses it to show where the range forks from in a single request.
   - Response:
     ```json
     {

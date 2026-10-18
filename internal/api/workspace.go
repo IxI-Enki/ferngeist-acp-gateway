@@ -388,7 +388,7 @@ func (s *Server) writeCommitFileDiff(w http.ResponseWriter, r *http.Request, cwd
 }
 
 // handleWorkspaceGitLog returns one page of commit history, newest first.
-// GET /v1/runtimes/{runtimeId}/git/log?head=<sha>&skip=<n>&limit=<n>
+// GET /v1/runtimes/{runtimeId}/git/log?head=<sha>&skip=<n>&limit=<n>&compare=<ref>&beyond=<n>
 func (s *Server) handleWorkspaceGitLog(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireGatewayScope(w, r, pairing.ScopeRead); !ok {
 		return
@@ -413,9 +413,16 @@ func (s *Server) handleWorkspaceGitLog(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = min(max(limit, 1), 200)
 	}
+	beyond := 0
+	if v := q.Get("beyond"); v != "" {
+		if beyond, err = strconv.Atoi(v); err != nil || beyond < 0 {
+			writeError(w, http.StatusBadRequest, "invalid beyond")
+			return
+		}
+	}
 	// Compare mode: ?compare= excludes that ref's commits from the walk, so the
 	// page is the target..head range; workspace.Log validates the ref (a 400).
-	page, err := workspace.Log(r.Context(), cwd, strings.TrimSpace(q.Get("head")), skip, limit, q.Get("compare"))
+	page, err := workspace.Log(r.Context(), cwd, strings.TrimSpace(q.Get("head")), skip, limit, q.Get("compare"), beyond)
 	if err != nil {
 		writeWorkspaceError(w, err)
 		return

@@ -541,6 +541,20 @@ func TestWorkspaceEndpoints_EndToEnd(t *testing.T) {
 	if clp.Head == cmpSha {
 		t.Fatalf("compare log head = %s, want HEAD's sha", clp.Head)
 	}
+	// No target unless asked for; beyond=1 is the target's tip, beyond=2 one more.
+	if len(clp.Target) != 0 {
+		t.Fatalf("compare log target = %+v, want none without beyond", clp.Target)
+	}
+	rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/log?compare=cmp&limit=50&beyond=1")
+	var clb workspace.LogPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &clb); err != nil || len(clb.Target) != 1 || clb.Target[0].SHA != cmpSha {
+		t.Fatalf("compare log beyond=1 target = %+v, %v", clb.Target, err)
+	}
+	rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/log?compare=cmp&limit=50&beyond=2")
+	var clb2 workspace.LogPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &clb2); err != nil || len(clb2.Target) != 2 || clb2.Target[0].SHA != cmpSha {
+		t.Fatalf("compare log beyond=2 target = %+v, %v", clb2.Target, err)
+	}
 	// Paging by the pinned head keeps the same range.
 	rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/log?compare=cmp&head="+clp.Head+"&limit=1&skip=1")
 	if rec.Code != http.StatusOK {
@@ -561,6 +575,8 @@ func TestWorkspaceEndpoints_EndToEnd(t *testing.T) {
 	for _, path := range []string{
 		"/git/log?head=nothex",
 		"/git/log?limit=x",
+		"/git/log?compare=cmp&beyond=x",
+		"/git/log?compare=cmp&beyond=-1",
 		"/git/commits/zzzzzzz",
 		"/git/commits/" + strings.Repeat("0", 40),
 		"/git/diff?commit=" + lp.Head,
