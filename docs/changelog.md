@@ -60,7 +60,7 @@ not be coupled. Full release notes live in GitHub Releases.
   `404` for an unknown `acpSessionId`, `422` for a non-repo cwd or missing
   git; no ACP schema equivalent (gateway-defined). No `protocolVersion` bump:
   a gateway without it answers `404` with no envelope, which the client reads
-  as "unsupported" (2026-10-19, [7b55ffa](https://github.com/arafatamim/ferngeist-acp-gateway/commit/7b55ffa))
+  as "unsupported" (2026-10-19, [537e833](https://github.com/arafatamim/ferngeist-acp-gateway/commit/537e833))
 
 - `[additive]` `GET /v1/runtimes/{id}/git/log` — each page gains `total`: the
   size of the walk the page comes from (`git rev-list --count <head>`, or
