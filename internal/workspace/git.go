@@ -348,7 +348,19 @@ func Changes(ctx context.Context, cwd, ref string) (string, []ChangedFile, error
 	for _, f := range changed {
 		seen[f.Path] = true
 	}
-	for _, line := range strings.Split(nameStatus, "\n") {
+	changed = append(changed, nameStatusChanges(nameStatus, seen)...)
+	return out, changed, nil
+}
+
+// nameStatusChanges parses `git diff --name-status --relative` output into
+// ChangedFile entries: the status is the first letter of the name-status code
+// (`M`, `A`, `D`, `R`, `C`, ...), and a rename/copy reports its destination
+// path (the last tab-separated field) with no OldPath. Paths already in seen
+// are skipped and recorded, so a caller that has a richer source of entries
+// (porcelain status) does not list the same path twice.
+func nameStatusChanges(out string, seen map[string]bool) []ChangedFile {
+	var files []ChangedFile
+	for _, line := range strings.Split(out, "\n") {
 		// `<status>\t<path>`, or `R<score>\t<old>\t<new>` for renames/copies.
 		fields := strings.Split(line, "\t")
 		if len(fields) < 2 || fields[0] == "" {
@@ -359,9 +371,9 @@ func Changes(ctx context.Context, cwd, ref string) (string, []ChangedFile, error
 			continue
 		}
 		seen[path] = true
-		changed = append(changed, ChangedFile{Path: path, Status: fields[0][:1]})
+		files = append(files, ChangedFile{Path: path, Status: fields[0][:1]})
 	}
-	return out, changed, nil
+	return files
 }
 
 // DiffEntry builds one ACP ToolCallContentDiff for a changed file. oldText is

@@ -52,6 +52,18 @@ not be coupled. Full release notes live in GitHub Releases.
 
 ## History
 
+- `[additive]` Branch comparison for the git sheet:
+  `GET /v1/runtimes/{id}/git/refs` lists local branches, `origin/*` refs and
+  tags (each with `kind`, `isHead`, and a `default` hint), and `compare=<ref>`
+  points `/git/status`, `/git/diff` and `/git/log` at another ref's tip
+  instead of `HEAD` (or a managed worktree's base): a two-dot, tip-to-tip
+  comparison with uncommitted work included. `/git/status` returns the strict
+  `git diff <ref>` file set (flat, no staged/unstaged grouping) and echoes
+  `compare` plus the resolved `compareCommit` only when an explicit
+  `?compare=` was honoured — a worktree's merge-base sha is never reported as a
+  comparison. A gateway without `/git/refs` answers `404`, which the client
+  uses to hide the whole affordance. (2026-10-18, [b40a5dc](https://github.com/arafatamim/ferngeist-acp-gateway/commit/b40a5dc))
+
 - `[additive]` `GET /v1/runtimes/{id}/git/status` changed-file objects gain
   `staged`: `true` when the index holds a change (the `X` of the porcelain `XY`
   pair), `false` for worktree-only edits, untracked files, and unmerged

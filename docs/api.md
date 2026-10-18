@@ -278,6 +278,20 @@ it was cut from and its current `HEAD` — instead of `HEAD`, so changes the
 agent already committed on its branch are still listed and diffed, even after
 the branch is rebased onto a newer base.
 
+Because `HEAD` and the worktree's base are the only references the endpoints
+can use, a client can also point them at another branch: `GET
+/v1/runtimes/{id}/git/refs` lists the refs to choose from, and `compare=<ref>`
+on `/git/status`, `/git/diff` and `/git/log` compares against that ref's tip
+instead of `HEAD` (or a managed worktree's base). This is a **two-dot,
+tip-to-tip** comparison with uncommitted work included, not a merge-base one:
+the file list and per-file diffs are `git diff <ref>` read from the working
+tree, and the history range is `<ref>..HEAD`. When the target has moved ahead
+since the fork, the target's newer changes appear in the diff as reversals and
+files only it has appear in the file list — the accepted price of the IDE
+shape. While a target is selected, the worktree's own base ref plays no part,
+except that `/git/log` still reports the worktree's `baseCommit` next to the
+compare range (see below).
+
 One agent can host several ACP sessions, each with its own `cwd`. Every
 workspace endpoint accepts an optional `acpSessionId=<id>` query parameter (the
 ACP session id from `session/new` or `session/load`, not the gateway session id)
@@ -333,6 +347,41 @@ opened or loaded on this runtime returns `404`.
     - `404` — runtime has no session, or the client has not issued
       `session/new`/`session/load` yet (so the working directory is unknown)
 
+- `GET /v1/runtimes/{runtimeId}/git/refs`
+  - Lists the refs a client can compare against: every local branch, every
+    remote-tracking ref (`origin/*`, with `origin/HEAD`-style aliases dropped),
+    and every tag.
+  - Requires `read` scope.
+  - Response:
+    ```json
+    {
+      "default": "main",
+      "refs": [
+        { "name": "main", "kind": "branch", "isHead": true },
+        { "name": "feat/x", "kind": "branch", "isHead": false },
+        { "name": "origin/main", "kind": "remote", "isHead": false },
+        { "name": "v1.1.0", "kind": "tag", "isHead": false }
+      ]
+    }
+    ```
+  - `kind` is `branch`, `remote`, or `tag`. `isHead` marks the checked-out
+    branch; no entry is `isHead` when `HEAD` is detached. `default` is a hint
+    for labelling and sorting only — `origin/HEAD`'s branch when a local branch
+    of that name exists, else that alias's own short name (`origin/main`), else
+    a local `main`/`master`, else `""` — and is never auto-selected by the
+    gateway. Refs come in `refs/heads`, `refs/remotes`, `refs/tags` order;
+    clients group by `kind`.
+  - `name` is the short name git displays. It is ambiguous when a tag and a
+    branch or remote share it, and `compare=<name>` then resolves by git's own
+    precedence (the tag wins, whichever entry the user picked). Send a
+    fully-qualified name instead — `refs/heads/<name>`, `refs/remotes/<name>`,
+    `refs/tags/<name>`, i.e. `refs/{heads,remotes,tags}/` + `name` per the
+    entry's `kind` — which `compare` accepts and resolves unambiguously.
+  - An empty repository returns `200` with `"refs": []` and `"default": ""`.
+  - Error responses:
+    - `404` — runtime has no session, or working directory unknown (see above)
+    - `422` — `git` is missing from PATH, or the directory is not a git repository
+
 - `GET /v1/runtimes/{runtimeId}/git/status`
   - Returns branch, ahead/behind counts, and changed files (with per-file line
     counts) for the runtime's project directory.
@@ -372,7 +421,38 @@ opened or loaded on this runtime returns `404`.
     `added`/`removed`/`binary` line counts are gateway extensions (as is
     `isDir`). The Ferngeist client defines this type itself rather than reusing
     an SDK type.
+  - **Compare mode:** optional `compare=<ref>` points the file list at another
+    ref instead of `HEAD` (or a managed worktree's base) — see
+    [branch comparison](#workspace-browsing). The listed files are
+    `git diff <ref> --name-status` read from the working tree, uncommitted work
+    included, with counts from `git diff <ref> --numstat` and untracked files as
+    `?` counted from disk. The list is **flat**: there is no staged/unstaged
+    grouping (the index split is meaningless against another branch) and
+    `staged` is always `false`. A file that is dirty against `HEAD` but
+    identical to `<ref>` is not listed, so there are no phantom rows; a file
+    only `<ref>` has is listed as a deletion. When `compare` is honoured the
+    response adds two fields:
+    ```json
+    {
+      "branch": "main",
+      "ahead": 2,
+      "behind": 0,
+      "compare": "main",
+      "compareCommit": "9f3c1ab…",
+      "changed": [ … ]
+    }
+    ```
+    `compare` echoes the requested name (the value that was honoured, not the
+    resolved sha) and `compareCommit` carries the full sha it resolved to. Both
+    are **absent** without an explicit `compare=`, and an empty or
+    whitespace-only `compare=` counts as absent — a managed worktree's base is
+    a merge-base *sha*, and it is never reported in `compare`. `ahead`/`behind`
+    keep describing the checkout's upstream tracking branch; they are not the
+    compare range. A client must treat a missing or mismatched `compare` as a
+    failed fetch and never render working-tree data under a branch label.
   - Error responses:
+    - `400` — `compare` is malformed (option-like, whitespace, control
+      characters, `..`, `@{`, or `~^:?*[\`) or names no commit
     - `404` — runtime has no session, or working directory unknown (see above)
     - `422` — `git` is missing from PATH, or the directory is not a git repository
 
@@ -416,9 +496,21 @@ opened or loaded on this runtime returns `404`.
     (so it is omitted for new and untracked files, and for files renamed
     within the working tree); committed history beyond `HEAD` is not included.
   - Both `oldText` and `newText` are truncated to 1 MiB.
+  - **Compare mode:** optional `compare=<ref>` builds `oldText` from that ref's
+    version of the file (`git show <ref>:./<path>`) instead of `HEAD`'s, so the
+    pair is the two-dot, tip-to-tip diff of the working tree against another
+    branch — see [branch comparison](#workspace-browsing). `newText` is still
+    the working-tree content (empty for a file the working tree no longer has),
+    so a file only the target has reads as a deletion. It applies to the
+    single-file **and** the whole-tree form; in the whole-tree form the file set
+    is the same strict two-dot set `/git/status?compare=` reports, so the two
+    always agree (no phantom rows, untracked files included). `compare` is
+    ignored only in **commit mode**, which takes precedence.
   - Error responses:
     - `400` — `path` escapes the project directory (absolute, traversal, or
       symlink escape)
+    - `400` — `compare` is malformed (option-like, whitespace, control
+      characters, `..`, `@{`, or `~^:?*[\`) or names no commit
     - `404` — runtime has no session, or working directory unknown (see above)
     - `422` — `git` is missing from PATH, or the directory is not a git repository
   - **Commit mode:** `?commit=<sha>&path=<rel>[&oldPath=<rel>]` diffs one file
@@ -440,6 +532,13 @@ opened or loaded on this runtime returns `404`.
     sha as `head`. Send that sha back with every later page so commits made in
     between do not shift the offset. `skip` defaults to `0`; `limit` defaults to
     `50` and is clamped to `1..200`.
+  - **Compare mode:** optional `compare=<ref>` lists only the commits reachable
+    from `head` that are **not** reachable from `<ref>` (`git log <head> --not
+    <ref>`) — the range a compare-mode History tab shows, newest first, as
+    `target..HEAD` with two-dot semantics (see
+    [branch comparison](#workspace-browsing)). `head`, `skip`, `limit`,
+    `hasMore`, `remoteUrl` and `baseCommit` are unchanged, so page with the
+    returned `head` as usual even in compare mode.
   - Response:
     ```json
     {
@@ -485,6 +584,8 @@ opened or loaded on this runtime returns `404`.
     - `400` — `head` is not 7–64 lowercase hex, or names no commit (for
       example a pinned head removed by a rebase and gc; reload page 1);
       `skip`/`limit` not integers
+    - `400` — `compare` is malformed (option-like, whitespace, control
+      characters, `..`, `@{`, or `~^:?*[\`) or names no commit
     - `404` — runtime has no session, or working directory unknown (see above)
     - `422` — `git` is missing from PATH, or the directory is not a git repository
 

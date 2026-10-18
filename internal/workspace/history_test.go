@@ -133,7 +133,7 @@ func TestLog(t *testing.T) {
 	ctx := context.Background()
 	dir, git := historyRepo(t)
 
-	page, err := Log(ctx, dir, "", 0, 50)
+	page, err := Log(ctx, dir, "", 0, 50, "")
 	if err != nil || page.Head != "" || len(page.Commits) != 0 || page.HasMore {
 		t.Fatalf("empty repo = %+v, %v", page, err)
 	}
@@ -143,7 +143,7 @@ func TestLog(t *testing.T) {
 	}
 	git("tag", "v1", "HEAD~1")
 
-	page, err = Log(ctx, dir, "", 0, 2)
+	page, err = Log(ctx, dir, "", 0, 2, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,21 +160,21 @@ func TestLog(t *testing.T) {
 
 	// A commit made between pages does not shift the pinned page 2.
 	git("commit", "-q", "--allow-empty", "-m", "four")
-	page2, err := Log(ctx, dir, page.Head[:7], 2, 2)
+	page2, err := Log(ctx, dir, page.Head[:7], 2, 2, "")
 	if err != nil || page2.HasMore || len(page2.Commits) != 1 || page2.Commits[0].Subject != "one" || page2.Head != page.Head {
 		t.Fatalf("page 2 = %+v, %v", page2, err)
 	}
 	// Exactly limit commits left: no more.
-	if p, _ := Log(ctx, dir, page.Head, 1, 2); p.HasMore || len(p.Commits) != 2 {
+	if p, _ := Log(ctx, dir, page.Head, 1, 2, ""); p.HasMore || len(p.Commits) != 2 {
 		t.Fatalf("exact page = %+v", p)
 	}
 
 	for _, bad := range []string{"xyz", "abc", "-n1", strings.Repeat("0", 40)} {
-		if _, err := Log(ctx, dir, bad, 0, 2); statusOf(err) != http.StatusBadRequest {
+		if _, err := Log(ctx, dir, bad, 0, 2, ""); statusOf(err) != http.StatusBadRequest {
 			t.Fatalf("head %q: err = %v, want 400", bad, err)
 		}
 	}
-	if _, err := Log(ctx, t.TempDir(), "", 0, 2); statusOf(err) != http.StatusUnprocessableEntity {
+	if _, err := Log(ctx, t.TempDir(), "", 0, 2, ""); statusOf(err) != http.StatusUnprocessableEntity {
 		t.Fatalf("non-repo err = %v, want 422", err)
 	}
 
@@ -186,7 +186,7 @@ func TestLog(t *testing.T) {
 	git("remote", "add", "origin", origin)
 	git("push", "-q", "origin", "main")
 	git("commit", "-q", "--allow-empty", "-m", "five")
-	page, err = Log(ctx, dir, "", 0, 50)
+	page, err = Log(ctx, dir, "", 0, 50, "")
 	if err != nil || page.RemoteURL != origin || page.Commits[0].Pushed || !page.Commits[1].Pushed {
 		t.Fatalf("pushed page = %+v, %v", page, err)
 	}
@@ -249,5 +249,38 @@ func TestCommitChangesAndDiff(t *testing.T) {
 	files, err = CommitChanges(ctx, sub, git("rev-parse", "HEAD"))
 	if err != nil || !reflect.DeepEqual(files, []ChangedFile{{Path: "side.txt", Status: "A", Added: 1}}) {
 		t.Fatalf("merge files = %+v, %v", files, err)
+	}
+}
+
+// TestLogCompareRange pins the compare history range: HEAD with --not <ref>
+// yields only the commits this branch has that the target does not, paging by
+// the pinned head keeps that range, and an unknown exclude ref is a 400.
+func TestLogCompareRange(t *testing.T) {
+	ctx := context.Background()
+	dir, git := historyRepo(t)
+	git("commit", "-q", "--allow-empty", "-m", "base")
+	base := git("rev-parse", "HEAD")
+	git("commit", "-q", "--allow-empty", "-m", "mine one")
+	git("commit", "-q", "--allow-empty", "-m", "mine two")
+	headed := git("rev-parse", "HEAD")
+	// A commit that exists only on the target side must not appear.
+	git("checkout", "-q", "-b", "target", base)
+	git("commit", "-q", "--allow-empty", "-m", "theirs")
+	git("checkout", "-q", "main")
+
+	page, err := Log(ctx, dir, "", 0, 50, "target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Head != headed || len(page.Commits) != 2 ||
+		page.Commits[0].Subject != "mine two" || page.Commits[1].Subject != "mine one" {
+		t.Fatalf("compare log = %+v", page)
+	}
+	page2, err := Log(ctx, dir, page.Head[:7], 1, 1, "target")
+	if err != nil || len(page2.Commits) != 1 || page2.Commits[0].Subject != "mine one" {
+		t.Fatalf("compare log page 2 = %+v, %v", page2, err)
+	}
+	if _, err := Log(ctx, dir, "", 0, 50, "nope"); statusOf(err) != http.StatusBadRequest {
+		t.Fatalf("unknown exclude err = %v, want 400", err)
 	}
 }

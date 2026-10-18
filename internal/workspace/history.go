@@ -68,10 +68,21 @@ func ResolveCommit(ctx context.Context, cwd, sha string) (string, error) {
 }
 
 // Log returns up to limit commits reachable from head (HEAD when empty),
-// skipping the first skip in topological order. The whole repo is walked, not
-// just cwd: a pathspec would rewrite parents and break the client's graph.
-func Log(ctx context.Context, cwd, head string, skip, limit int) (LogPage, error) {
+// skipping the first skip in topological order. A non-empty exclude is a ref
+// name resolved with ResolveRef whose commits are left out of the walk, so the
+// page is the compare range exclude..head. The whole repo is walked, not just
+// cwd: a pathspec would rewrite parents and break the client's graph.
+func Log(ctx context.Context, cwd, head string, skip, limit int, exclude string) (LogPage, error) {
 	page := LogPage{Commits: []Commit{}}
+	var notArgs []string
+	if exclude = strings.TrimSpace(exclude); exclude != "" {
+		sha, err := ResolveRef(ctx, cwd, exclude)
+		if err != nil {
+			return page, err
+		}
+		// --not negates the revisions after it, so it must follow head.
+		notArgs = []string{"--not", sha}
+	}
 	if head != "" {
 		full, err := ResolveCommit(ctx, cwd, head)
 		if err != nil {
@@ -90,7 +101,9 @@ func Log(ctx context.Context, cwd, head string, skip, limit int) (LogPage, error
 	// log.showSignature=true would print gpg text between records.
 	args := []string{"-c", "log.showSignature=false", "log", "--no-color", "--topo-order", "--decorate=full",
 		"--skip=" + strconv.Itoa(skip), "-n", strconv.Itoa(limit + 1),
-		"--format=%H%x00%P%x00%an%x00%ae%x00%at%x00%ct%x00%D%x00%s%x00%b%x1e", head, "--"}
+		"--format=%H%x00%P%x00%an%x00%ae%x00%at%x00%ct%x00%D%x00%s%x00%b%x1e", head}
+	args = append(args, notArgs...)
+	args = append(args, "--")
 	out, err := RunGitLimited(ctx, cwd, maxLogBytes, args...)
 	if err != nil {
 		return page, errStatus(http.StatusUnprocessableEntity, err.Error())

@@ -40,6 +40,12 @@ type gitStatusResponse struct {
 	Ahead   int                     `json:"ahead"`
 	Behind  int                     `json:"behind"`
 	Changed []workspace.ChangedFile `json:"changed"`
+	// Compare echoes the requested compare ref, and CompareCommit the sha it
+	// resolved to. Both are absent unless an explicit, honoured ?compare= was
+	// given, so a managed worktree's merge-base sha can never be mistaken for a
+	// comparison.
+	Compare       string `json:"compare,omitempty"`
+	CompareCommit string `json:"compareCommit,omitempty"`
 }
 
 // resolveWorkspaceCwd resolves a runtime's ACP project directory via the session
@@ -129,6 +135,24 @@ func (s *Server) handleWorkspaceFile(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleWorkspaceGitRefs lists the refs a client can compare against.
+// GET /v1/runtimes/{runtimeId}/git/refs
+func (s *Server) handleWorkspaceGitRefs(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireGatewayScope(w, r, pairing.ScopeRead); !ok {
+		return
+	}
+	cwd, ok := s.resolveWorkspaceCwd(w, r, r.PathValue("runtimeId"))
+	if !ok {
+		return
+	}
+	payload, err := workspace.Refs(r.Context(), cwd)
+	if err != nil {
+		writeWorkspaceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
 // handleWorkspaceGitStatus returns branch, ahead/behind, and changed files.
 // GET /v1/runtimes/{runtimeId}/git/status
 func (s *Server) handleWorkspaceGitStatus(w http.ResponseWriter, r *http.Request) {
@@ -140,6 +164,35 @@ func (s *Server) handleWorkspaceGitStatus(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+
+	// Compare mode: an explicit ?compare= replaces HEAD (and a managed
+	// worktree's base) with the target's tip for the file list, which comes
+	// from the strict two-dot compare diff. The branch/ahead/behind header
+	// still describes the checkout.
+	resp := gitStatusResponse{}
+	if compare := strings.TrimSpace(r.URL.Query().Get("compare")); compare != "" {
+		sha, err := workspace.ResolveRef(r.Context(), cwd, compare)
+		if err != nil {
+			writeWorkspaceError(w, err)
+			return
+		}
+		out, err := workspace.Status(r.Context(), cwd)
+		if err != nil {
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		changed, err := workspace.CompareChanges(r.Context(), cwd, sha)
+		if err != nil {
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		resp.Changed = changed
+		resp.Compare, resp.CompareCommit = compare, sha
+		parseBranchHeader(&resp, out)
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
 	ref := s.workspaceSvc.BaseRef(r.Context(), cwd)
 	out, changed, err := workspace.Changes(r.Context(), cwd, ref)
 	if err != nil {
@@ -185,7 +238,14 @@ func (s *Server) handleWorkspaceGitStatus(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	resp := gitStatusResponse{Branch: "", Changed: changed}
+	resp.Changed = changed
+	parseBranchHeader(&resp, out)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// parseBranchHeader fills Branch/Ahead/Behind from `git status --branch`
+// porcelain=v2 header lines.
+func parseBranchHeader(resp *gitStatusResponse, out string) {
 	for _, line := range strings.Split(out, "\n") {
 		switch {
 		case strings.HasPrefix(line, "# branch.head "):
@@ -198,7 +258,6 @@ func (s *Server) handleWorkspaceGitStatus(w http.ResponseWriter, r *http.Request
 			resp.Ahead, resp.Behind = ahead, behind
 		}
 	}
-	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleWorkspaceGitDiff returns ACP ToolCallContentDiff entries: a single
@@ -219,6 +278,22 @@ func (s *Server) handleWorkspaceGitDiff(w http.ResponseWriter, r *http.Request) 
 		s.writeCommitFileDiff(w, r, cwd, commit)
 		return
 	}
+
+	// A compare ref replaces HEAD (or a managed worktree's base) as the old
+	// side of every diff below: per-file and whole-tree alike, so `compare` is
+	// never silently ignored. Commit mode above takes precedence and leaves it
+	// unused.
+	ref := s.workspaceSvc.BaseRef(r.Context(), cwd)
+	compare := strings.TrimSpace(r.URL.Query().Get("compare"))
+	if compare != "" {
+		sha, err := workspace.ResolveRef(r.Context(), cwd, compare)
+		if err != nil {
+			writeWorkspaceError(w, err)
+			return
+		}
+		ref = sha
+	}
+
 	if rel := strings.TrimSpace(r.URL.Query().Get("path")); rel != "" {
 		abs, err := workspace.ResolveWithinRoot(cwd, rel)
 		if err != nil {
@@ -232,7 +307,7 @@ func (s *Server) handleWorkspaceGitDiff(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusBadRequest, "path is a directory or submodule, not a file: "+rel)
 			return
 		}
-		entry, err := workspace.DiffEntry(r.Context(), cwd, s.workspaceSvc.BaseRef(r.Context(), cwd), rel, abs)
+		entry, err := workspace.DiffEntry(r.Context(), cwd, ref, rel, abs)
 		if err != nil {
 			writeError(w, http.StatusUnprocessableEntity, err.Error())
 			return
@@ -241,10 +316,16 @@ func (s *Server) handleWorkspaceGitDiff(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Whole-tree: enumerate changed files via git status and emit one entry
-	// per file that has readable or deleted working content.
-	ref := s.workspaceSvc.BaseRef(r.Context(), cwd)
-	_, changed, err := workspace.Changes(r.Context(), cwd, ref)
+	// Whole-tree: enumerate changed files and emit one entry per file that has
+	// readable or deleted working content. In compare mode the set is the
+	// strict two-dot one, so no phantom rows.
+	var changed []workspace.ChangedFile
+	var err error
+	if compare != "" {
+		changed, err = workspace.CompareChanges(r.Context(), cwd, ref)
+	} else {
+		_, changed, err = workspace.Changes(r.Context(), cwd, ref)
+	}
 	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
@@ -332,7 +413,9 @@ func (s *Server) handleWorkspaceGitLog(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = min(max(limit, 1), 200)
 	}
-	page, err := workspace.Log(r.Context(), cwd, strings.TrimSpace(q.Get("head")), skip, limit)
+	// Compare mode: ?compare= excludes that ref's commits from the walk, so the
+	// page is the target..head range; workspace.Log validates the ref (a 400).
+	page, err := workspace.Log(r.Context(), cwd, strings.TrimSpace(q.Get("head")), skip, limit, q.Get("compare"))
 	if err != nil {
 		writeWorkspaceError(w, err)
 		return

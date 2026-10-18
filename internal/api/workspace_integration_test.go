@@ -24,6 +24,16 @@ func runGitCLI(t *testing.T, dir string, args ...string) {
 	}
 }
 
+func runGitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %v: %v", args, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // TestWorkspaceEndpoints_EndToEnd drives a real resilient session, captures the
 // runtime's project cwd from a session/new frame, and asserts the file, git
 // status, and git diff endpoints return the expected data for a temp git repo.
@@ -35,7 +45,7 @@ func TestWorkspaceEndpoints_EndToEnd(t *testing.T) {
 	// Temp git repo: one committed file (committed.txt), one untracked (wip.txt),
 	// and one modified after commit (edited.txt).
 	proj := t.TempDir()
-	runGitCLI(t, proj, "init", "-q")
+	runGitCLI(t, proj, "init", "-q", "-b", "main")
 	runGitCLI(t, proj, "config", "user.email", "t@t")
 	runGitCLI(t, proj, "config", "user.name", "t")
 	runGitCLI(t, proj, "config", "commit.gpgSign", "false")
@@ -45,12 +55,40 @@ func TestWorkspaceEndpoints_EndToEnd(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(proj, "edited.txt"), []byte("old\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	runGitCLI(t, proj, "add", "committed.txt", "edited.txt")
+	// base.txt is the compare fixture: the cmp branch changes it, and the
+	// working tree later takes cmp's content, so it is dirty against HEAD but
+	// identical to cmp.
+	if err := os.WriteFile(filepath.Join(proj, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitCLI(t, proj, "add", "committed.txt", "edited.txt", "base.txt")
 	runGitCLI(t, proj, "commit", "-qm", "init")
+
+	// Compare fixture: the cmp branch changes base.txt and adds cmp-only.txt.
+	// The working tree later takes cmp's base.txt content (dirty against HEAD
+	// but identical to cmp) and leaves cmp-only.txt absent, so a compare against
+	// cmp must show neither as a modification of base.txt.
+	runGitCLI(t, proj, "checkout", "-q", "-b", "cmp")
+	if err := os.WriteFile(filepath.Join(proj, "base.txt"), []byte("cmp\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proj, "cmp-only.txt"), []byte("only\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitCLI(t, proj, "add", "base.txt", "cmp-only.txt")
+	runGitCLI(t, proj, "commit", "-qm", "cmp work")
+	cmpSha := runGitOut(t, proj, "rev-parse", "HEAD")
+	runGitCLI(t, proj, "checkout", "-q", "main")
+	runGitCLI(t, proj, "tag", "v1")
 	if err := os.WriteFile(filepath.Join(proj, "wip.txt"), []byte("wip\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(proj, "edited.txt"), []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The worktree holds cmp's base.txt content: dirty against HEAD, identical
+	// to cmp, so a compare against cmp must not list it.
+	if err := os.WriteFile(filepath.Join(proj, "base.txt"), []byte("cmp\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -189,6 +227,35 @@ func TestWorkspaceEndpoints_EndToEnd(t *testing.T) {
 	rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/status?acpSessionId=never-opened")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("unknown acpSessionId code = %d, want 404", rec.Code)
+	}
+
+	// 5. Ref listing for the compare picker.
+	rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/refs")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("git refs code = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var refs workspace.RefsPayload
+	if err := json.Unmarshal(rec.Body.Bytes(), &refs); err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]workspace.Ref{}
+	for _, r := range refs.Refs {
+		byName[r.Name] = r
+	}
+	if r := byName["main"]; r.Kind != "branch" || !r.IsHead {
+		t.Fatalf("refs main = %+v, want branch with isHead", r)
+	}
+	if r := byName["cmp"]; r.Kind != "branch" || r.IsHead {
+		t.Fatalf("refs cmp = %+v, want branch without isHead", r)
+	}
+	if r := byName["v1"]; r.Kind != "tag" {
+		t.Fatalf("refs v1 = %+v, want tag", r)
+	}
+	if refs.Default != "main" {
+		t.Fatalf("refs default = %q, want main", refs.Default)
+	}
+	if rec := do(t, "/v1/runtimes/"+h.runtimeID+"/git/refs?acpSessionId=never-opened"); rec.Code != http.StatusNotFound {
+		t.Fatalf("refs unknown acpSessionId code = %d, want 404", rec.Code)
 	}
 
 	// 3. Git status lists the untracked and modified files.
@@ -342,6 +409,154 @@ func TestWorkspaceEndpoints_EndToEnd(t *testing.T) {
 	var cd acp.ToolCallContentDiff
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &cd) != nil || cd.NewText != "a\nb\nc\n" || cd.OldText != nil {
 		t.Fatalf("commit diff code = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 7. Compare mode: the file list is the strict two-dot `git diff cmp` set.
+	rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/status?compare=cmp")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("compare status code = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var cs gitStatusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &cs); err != nil {
+		t.Fatal(err)
+	}
+	if cs.Compare != "cmp" || cs.CompareCommit != cmpSha {
+		t.Fatalf("compare status = %+v, want compare cmp and commit %s", cs, cmpSha)
+	}
+	if cs.Branch != "main" {
+		t.Fatalf("compare status branch = %q, want main", cs.Branch)
+	}
+	cmpPaths := map[string]workspace.ChangedFile{}
+	for _, f := range cs.Changed {
+		cmpPaths[f.Path] = f
+	}
+	if f, ok := cmpPaths["base.txt"]; ok {
+		t.Fatalf("base.txt listed: dirty against HEAD but identical to cmp: %+v", f)
+	}
+	if f, ok := cmpPaths["cmp-only.txt"]; !ok || f.Status != "D" || f.Added != 0 || f.Removed != 1 {
+		t.Fatalf("cmp-only.txt = %+v (present=%v), want D with 1 removed", f, ok)
+	}
+	if f, ok := cmpPaths["wip.txt"]; !ok || f.Status != "?" || f.Added != 1 {
+		t.Fatalf("wip.txt = %+v, want untracked with 1 added line", f)
+	}
+	if f, ok := cmpPaths["edited.txt"]; !ok || f.Status != "M" || f.Added != 1 || f.Removed != 1 {
+		t.Fatalf("edited.txt = %+v, want M with 1/1", f)
+	}
+	if f, ok := cmpPaths["renamed_dst.txt"]; !ok || f.Status != "A" || f.Added != 1 {
+		// cmp was cut before the rename, so it holds neither path: the
+		// destination is a plain addition against cmp, not an R.
+		t.Fatalf("renamed_dst.txt = %+v (present=%v), want A with 1 added", f, ok)
+	}
+	if f, ok := cmpPaths["committed.txt"]; ok {
+		t.Fatalf("committed.txt listed against cmp: %+v", f)
+	}
+	for _, f := range cs.Changed {
+		if f.Staged {
+			t.Fatalf("%s staged = true in compare mode, want false", f.Path)
+		}
+	}
+
+	// Without an honoured compare= the field is absent, so a worktree's
+	// merge-base sha can never masquerade as a comparison. An empty or
+	// whitespace-only compare= is not an honoured comparison either.
+	for _, q := range []string{"", "compare=", "compare=%20"} {
+		rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/status?"+q)
+		if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), `"compare"`) {
+			t.Fatalf("git/status?%s code = %d, body=%s", q, rec.Code, rec.Body.String())
+		}
+	}
+	// A malformed or unknown target is a 400: never working-tree data under a
+	// branch label.
+	for _, q := range []string{"compare=..%2Fetc", "compare=-x", "compare=nope"} {
+		if rec := do(t, "/v1/runtimes/"+h.runtimeID+"/git/status?"+q); rec.Code != http.StatusBadRequest {
+			t.Fatalf("git/status?%s code = %d, want 400, body=%s", q, rec.Code, rec.Body.String())
+		}
+	}
+
+	// 7b. Compare mode: oldText comes from the compare ref, so a file that
+	// exists only in the target reads as a deletion. Without compare it has no
+	// oldText at all (cmp-only.txt is not in HEAD), so this distinguishes the
+	// two comparisons.
+	rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/diff?path=cmp-only.txt&compare=cmp")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("compare diff code = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var cdiff acp.ToolCallContentDiff
+	if err := json.Unmarshal(rec.Body.Bytes(), &cdiff); err != nil {
+		t.Fatal(err)
+	}
+	if cdiff.Path != "cmp-only.txt" || cdiff.OldText == nil || *cdiff.OldText != "only\n" || cdiff.NewText != "" {
+		t.Fatalf("compare diff = %+v, want oldText %q and empty newText", cdiff, "only\n")
+	}
+	for _, q := range []string{"compare=nope", "compare=..%2Fetc"} {
+		if rec := do(t, "/v1/runtimes/"+h.runtimeID+"/git/diff?path=base.txt&"+q); rec.Code != http.StatusBadRequest {
+			t.Fatalf("git/diff?path=base.txt&%s code = %d, want 400, body=%s", q, rec.Code, rec.Body.String())
+		}
+	}
+
+	// 7b-2. The whole-tree diff honours compare too: cmp-only.txt is not in HEAD
+	// and not on disk, so without compare it is absent; with compare=cmp it
+	// reads as a deletion with oldText from cmp. base.txt is dirty against HEAD
+	// but identical to cmp, so compare must leave it out.
+	rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/diff?compare=cmp")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("compare whole-tree diff code = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var cgds []acp.ToolCallContentDiff
+	if err := json.Unmarshal(rec.Body.Bytes(), &cgds); err != nil {
+		t.Fatal(err)
+	}
+	wholeByPath := map[string]acp.ToolCallContentDiff{}
+	for _, d := range cgds {
+		wholeByPath[d.Path] = d
+	}
+	if d, ok := wholeByPath["cmp-only.txt"]; !ok || d.OldText == nil || *d.OldText != "only\n" || d.NewText != "" {
+		t.Fatalf("whole-tree compare entry = %+v (present=%v), want cmp-only.txt with oldText from cmp", d, ok)
+	}
+	if d, ok := wholeByPath["base.txt"]; ok {
+		t.Fatalf("base.txt in whole-tree compare: dirty against HEAD but identical to cmp: %+v", d)
+	}
+	for _, q := range []string{"compare=nope", "compare=..%2Fetc"} {
+		if rec := do(t, "/v1/runtimes/"+h.runtimeID+"/git/diff?"+q); rec.Code != http.StatusBadRequest {
+			t.Fatalf("git/diff?%s code = %d, want 400, body=%s", q, rec.Code, rec.Body.String())
+		}
+	}
+
+	// 7c. Compare mode: the history range is HEAD --not cmp, newest first.
+	rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/log?compare=cmp&limit=50")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("compare log code = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var clp workspace.LogPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &clp); err != nil {
+		t.Fatal(err)
+	}
+	var subjects []string
+	for _, c := range clp.Commits {
+		subjects = append(subjects, c.Subject)
+	}
+	if got := strings.Join(subjects, ","); got != "add partial,add renamed_src" {
+		t.Fatalf("compare log subjects = %q, want %q", got, "add partial,add renamed_src")
+	}
+	if clp.Head == cmpSha {
+		t.Fatalf("compare log head = %s, want HEAD's sha", clp.Head)
+	}
+	// Paging by the pinned head keeps the same range.
+	rec = do(t, "/v1/runtimes/"+h.runtimeID+"/git/log?compare=cmp&head="+clp.Head+"&limit=1&skip=1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("compare log page 2 code = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var clp2 workspace.LogPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &clp2); err != nil {
+		t.Fatal(err)
+	}
+	if len(clp2.Commits) != 1 || clp2.Commits[0].Subject != "add renamed_src" || clp2.HasMore {
+		t.Fatalf("compare log page 2 = %+v, want one commit and no more", clp2)
+	}
+	for _, q := range []string{"compare=nope", "compare=..%2Fetc"} {
+		if rec := do(t, "/v1/runtimes/"+h.runtimeID+"/git/log?"+q); rec.Code != http.StatusBadRequest {
+			t.Fatalf("git/log?%s code = %d, want 400, body=%s", q, rec.Code, rec.Body.String())
+		}
 	}
 	for _, path := range []string{
 		"/git/log?head=nothex",

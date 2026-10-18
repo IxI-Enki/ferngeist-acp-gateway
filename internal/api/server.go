@@ -269,6 +269,7 @@ func NewServer(deps Deps) *Server {
 	mux.HandleFunc("POST /v1/agents/{agentId}/stop", server.handleAgentStop)
 	mux.HandleFunc("POST /v1/runtimes/{runtimeId}/restart", server.handleRuntimeRestart)
 	mux.HandleFunc("GET /v1/runtimes/{runtimeId}/files", server.handleWorkspaceFile)
+	mux.HandleFunc("GET /v1/runtimes/{runtimeId}/git/refs", server.handleWorkspaceGitRefs)
 	mux.HandleFunc("GET /v1/runtimes/{runtimeId}/git/status", server.handleWorkspaceGitStatus)
 	mux.HandleFunc("GET /v1/runtimes/{runtimeId}/git/diff", server.handleWorkspaceGitDiff)
 	mux.HandleFunc("GET /v1/runtimes/{runtimeId}/git/log", server.handleWorkspaceGitLog)
