@@ -8,9 +8,11 @@ Ferngeist Gateway is configured through environment variables and persisted stat
 |---|---|---|
 | `FERNGEIST_GATEWAY_LISTEN_ADDR` | Public API listen address | `127.0.0.1:5788` |
 | `FERNGEIST_GATEWAY_ADMIN_ADDR` | Admin API listen address | `127.0.0.1:5789` |
+| `FERNGEIST_GATEWAY_NAME` | Gateway name advertised to clients (falls back to the hostname) | hostname |
 | `FERNGEIST_GATEWAY_ENABLE_LAN` | Enable LAN discovery and access | `false` |
 | `FERNGEIST_GATEWAY_PUBLIC_BASE_URL` | Public URL used for remote access | unset |
 | `FERNGEIST_GATEWAY_STATE_DB` | SQLite state database path | platform default |
+| `FERNGEIST_GATEWAY_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, or `error` | `info` |
 | `FERNGEIST_GATEWAY_LOG_DIR` | Log directory | platform default |
 | `FERNGEIST_GATEWAY_MANAGED_BIN_DIR` | Managed binary install directory | platform default |
 | `FERNGEIST_GATEWAY_JS_RUNTIME` | Runtime for npm-distributed registry agents: `auto` (bun when it is on `PATH`, else node), `bun`, `node`, or `npm` (launch through `npm exec`, the old behavior). See [npm agents](#npm-agents) | `auto` |
@@ -30,7 +32,6 @@ Ferngeist Gateway is configured through environment variables and persisted stat
 |---|---|---|
 | `FERNGEIST_GATEWAY_SESSION_MAX_DISCONNECTED_SECONDS` | TTL for disconnected sessions before reaper closes them | `900` (15 min) |
 | `FERNGEIST_GATEWAY_MAX_SESSIONS_PER_DEVICE` | Max concurrent sessions per device | `5` |
-| `FERNGEIST_GATEWAY_SESSION_REAPER_INTERVAL_SECONDS` | Interval between reaper sweeps | `30` |
 | `FERNGEIST_GATEWAY_PROGRESS_INTERVAL_SECONDS` | Minimum seconds between live progress pushes while the agent is mid-turn | `15` |
 | `FERNGEIST_GATEWAY_FRAME_LOG` | Toggle raw ACP JSON-RPC frame logging; when `1`, every client→agent and agent→client frame is appended to `<log dir>/<agent>-agent.log` as newline-delimited JSON, rotated by `FERNGEIST_GATEWAY_LOG_MAX_BYTES`/`FERNGEIST_GATEWAY_LOG_MAX_BACKUPS` | unset (disabled) |
 
