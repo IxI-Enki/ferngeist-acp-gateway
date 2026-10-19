@@ -46,7 +46,7 @@ against the code.
 
 The **build** version (the daemon binary's `--version` and the mDNS
 `gateway_version` TXT record) is separate from the **contract** version above.
-Releases are tagged with semver (`v0.6.0` … `v1.1.0` so far); the Taskfile
+Releases are tagged with semver (`v0.6.0` … `v1.2.0` so far); the Taskfile
 derives the build version from `git describe`. They are independent and should
 not be coupled. Full release notes live in GitHub Releases.
 

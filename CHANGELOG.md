@@ -1,3 +1,28 @@
+## [1.2.0] - 2026-10-19
+
+### 🚀 Features
+
+- *(workspace)* Report staged state in git status
+- *(api)* Compare the workspace against a branch, remote or tag
+- *(api)* Return the compare target's commits with the log
+- *(workspace)* Report the walk's total size in the git log page
+- *(api)* List the workspace's files
+- *(api)* Let clients recover from proof clock skew
+- *(workspace)* Report a plain checkout's branch start as the git log base
+
+### 🐛 Bug Fixes
+
+- *(workspace)* Send an empty commits array, not null, for an empty range
+
+### 📚 Documentation
+
+- *(changelog)* Record staged in the git status contract
+- *(changelog)* Point branch compare entry at its commit on main
+- *(changelog)* Record total in the git log page contract
+- *(api)* Default is a client preselection hint, not gateway-applied
+- *(changelog)* Point file list entry at its commit on main
+- *(changelog)* Point clock skew entry at its commit on main
+- *(changelog)* Record the git log base for plain checkouts
 ## [1.1.0] - 2026-10-15
 
 ### 🚀 Features
