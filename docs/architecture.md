@@ -42,7 +42,7 @@ Every connection creates a persistent gateway session with:
 > Agent startup is 300–900ms of a cold connect; a booted spare answers
 > `initialize` in a few ms. The spare has never seen a client, so the contract
 > is unchanged. A spare is dropped when its launch command or args no longer
-> match the catalog, when it dies while idle, after 10 idle minutes, and on
+> match the catalog, when it dies while idle, after 2 idle minutes, and on
 > daemon shutdown.
 - **Push notifications** — when the pump detects a notable event (turn complete, permission request, agent error, or live progress) — or the runtime crashes — it emits a platform-neutral notification through the push dispatcher, which delivers it over Web Push to the subscription the device registered. Pushes fire **regardless of whether a client is attached**: the gateway can't tell whether the app is foregrounded or backgrounded (only whether a socket is attached, a poor proxy), so the client decides — it suppresses the notification for a chat already on screen and posts it otherwise, including when the push wakes a killed app. The client reconnects and calls `session/load` on the agent for context restoration.
 - **Inbound diagnostics** — client-to-agent frames are logged asynchronously to SQLite via a buffered channel (non-blocking, dropped on overflow with counter).

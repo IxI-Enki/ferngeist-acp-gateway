@@ -8,9 +8,10 @@ import (
 )
 
 // spareIdleTTL bounds how long a pre-booted agent waits to be claimed. A spare
-// is an idle agent process (hundreds of MB for a node agent), so it only lives
-// while that agent is in active use.
-const spareIdleTTL = 10 * time.Minute
+// is an idle agent process (200-240MB measured for opencode and the npm
+// agents), so it only lives while that agent is in active use: long enough for
+// a list → open-chat hop, and the app's 30s list poll keeps renewing it.
+const spareIdleTTL = 2 * time.Minute
 
 // spare is a pre-booted process waiting for its agent's next Launch. Booting
 // an agent (runtime start, module load) is 300-900ms of every connect; a spare
