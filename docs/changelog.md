@@ -52,6 +52,8 @@ not be coupled. Full release notes live in GitHub Releases.
 
 ## History
 
+- `v1.2.0` — branch comparison, workspace file listing, clock-skew recovery and
+  direct bun/node npm launches; additive only, `protocolVersion` stays `v2`:
 - `[additive]` `GET /v1/runtimes/{id}/git/diff` (whole-tree, no `?path=`) —
   the body is gzipped when the client sends `Accept-Encoding: gzip`, like
   `/files/list`; the JSON is unchanged. No `protocolVersion` bump: clients

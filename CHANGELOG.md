@@ -9,10 +9,12 @@
 - *(api)* List the workspace's files
 - *(api)* Let clients recover from proof clock skew
 - *(workspace)* Report a plain checkout's branch start as the git log base
+- *(acquire)* Launch npm agents on bun or node instead of npm exec
 
 ### 🐛 Bug Fixes
 
 - *(workspace)* Send an empty commits array, not null, for an empty range
+- *(registry)* Serve the cached snapshot while refreshing in the background
 
 ### 📚 Documentation
 
@@ -21,8 +23,20 @@
 - *(changelog)* Record total in the git log page contract
 - *(api)* Default is a client preselection hint, not gateway-applied
 - *(changelog)* Point file list entry at its commit on main
+- Add DeepWiki badge
 - *(changelog)* Point clock skew entry at its commit on main
 - *(changelog)* Record the git log base for plain checkouts
+- *(changelog)* Point git diff gzip entry at its commit on main
+- Cover the expanded workspace surface
+- *(configuration)* Document NAME and LOG_LEVEL, drop the retired reaper interval
+
+### ⚡ Performance
+
+- *(catalog)* Resolve npm bin names once per package
+- *(api)* Parallelize and gzip the whole-tree git diff
+- *(runtime)* Pre-boot one spare process per launched agent
+- *(session)* Stop unmarshalling update content and titles
+- *(runtime)* Idle a spare agent for 2 minutes, not 10
 ## [1.1.0] - 2026-10-15
 
 ### 🚀 Features
