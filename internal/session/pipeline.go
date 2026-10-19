@@ -39,13 +39,9 @@ type frameProbe struct {
 			Discriminator string `json:"sessionUpdate"`
 			ToolCallID    string `json:"toolCallId"`
 			Status        string `json:"status"`
-			Title         string `json:"title"`
 			Kind          string `json:"kind"`
-			// Content is RawMessage because agents emit both a single
-			// object and an array; a typed slice would fail the whole
-			// probe parse on the object shape (history buffering must
-			// never depend on content shape).
-			Content json.RawMessage `json:"content"`
+			// No content or title: no stage reads them, and unmarshalling
+			// them would copy every chunk's text and tool output again.
 		} `json:"update"`
 	} `json:"params"`
 }
