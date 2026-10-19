@@ -772,3 +772,41 @@ func TestRefreshMergesCustomAgents(t *testing.T) {
 		t.Errorf("ManifestValid = false, validation error = %q", agent.ValidationError)
 	}
 }
+
+func TestGetResolvesNpmBinariesOncePerPackage(t *testing.T) {
+	pathDir := t.TempDir()
+	npmName := "npm"
+	if goruntime.GOOS == "windows" {
+		npmName = "npm.exe"
+	}
+	if err := os.WriteFile(filepath.Join(pathDir, npmName), []byte("placeholder"), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	t.Setenv("PATH", pathDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	service := &Service{
+		baseDir:  t.TempDir(),
+		adapters: []Agent{},
+		registry: fakeRegistrySource{
+			snapshot: acpregistry.Snapshot{
+				Version: "1.0.0",
+				Agents: map[string]acpregistry.AgentEntry{
+					"codex-acp": {
+						ID:                "codex-acp",
+						DistributionKinds: []string{"npx"},
+						NpxPackage:        "@zed-industries/codex-acp@0.10.0",
+					},
+				},
+			},
+		},
+	}
+	calls := 0
+	service.SetNpmResolver(func(string) []string { calls++; return []string{"not-on-path"} })
+	for range 3 {
+		if _, err := service.Get("codex-acp"); err != nil {
+			t.Fatalf("Get() error = %v", err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("resolver called %d times, want 1 (npm view is a network call)", calls)
+	}
+}

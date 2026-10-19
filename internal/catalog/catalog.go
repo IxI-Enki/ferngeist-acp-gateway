@@ -121,6 +121,7 @@ type Service struct {
 	resolveNpmBinaries func(string) []string
 	customs            func() []CustomAgent
 	lastRefresh        time.Time
+	npmBins            map[string][]string // resolveNpmBinaries results by package
 }
 
 // catalogRefreshInterval avoids ~5 LookPath/Stat per agent + SQLite on every
@@ -151,6 +152,7 @@ func (s *Service) SetNpmResolver(resolve func(string) []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.resolveNpmBinaries = resolve
+	s.npmBins = nil
 	s.lastRefresh = time.Time{}
 }
 
@@ -320,7 +322,7 @@ func (s *Service) Get(id string) (Agent, error) {
 		}
 	}
 	if resolver != nil && cmd == "npm" && pkg != "" {
-		for _, name := range resolver(pkg) {
+		for _, name := range s.npmBinaryNames(pkg, resolver) {
 			if _, err := exec.LookPath(name); err == nil {
 				agent.Launch.Command = name
 				agent.Launch.Args = append([]string(nil), agent.Registry.NpxArgs...)
@@ -333,6 +335,28 @@ func (s *Service) Get(id string) (Agent, error) {
 		}
 	}
 	return agent, nil
+}
+
+// npmBinaryNames memoizes resolve per package: it runs `npm view` (~1s over
+// the network) and a package's bin names do not change while the daemon runs.
+// Failures are not cached, so the next connect retries.
+func (s *Service) npmBinaryNames(pkg string, resolve func(string) []string) []string {
+	s.mu.RLock()
+	names, ok := s.npmBins[pkg]
+	s.mu.RUnlock()
+	if ok {
+		return names
+	}
+	names = resolve(pkg)
+	if names != nil {
+		s.mu.Lock()
+		if s.npmBins == nil {
+			s.npmBins = make(map[string][]string)
+		}
+		s.npmBins[pkg] = names
+		s.mu.Unlock()
+	}
+	return names
 }
 
 // Refresh revalidates built-in manifests, merges ACP registry metadata, and
