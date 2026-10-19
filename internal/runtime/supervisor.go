@@ -194,6 +194,10 @@ type Process struct {
 
 	done chan struct{}
 	err  error
+	// logsDone is closed once the stderr capture has drained, and launchKey
+	// is what the process was started as (see spareKey).
+	logsDone  chan struct{}
+	launchKey string
 }
 
 // Done is closed when the process has exited.
@@ -275,6 +279,12 @@ type Supervisor struct {
 
 	// installer handles automatic agent acquisition if not present.
 	installer *acquire.Installer
+
+	// spares holds one pre-booted process per agent ID; nil until
+	// EnableSpares. closed stops new spares after Close.
+	spares   map[string]*spare
+	sparesWG sync.WaitGroup
+	closed   bool
 }
 
 // NewSupervisor creates a supervisor rooted at baseDir with optional SQLite
@@ -300,7 +310,18 @@ func (s *Supervisor) Launch(agent catalog.Agent, envOverrides map[string]string)
 	if err != nil {
 		return nil, err
 	}
-	return s.launchProcess(prepared, envOverrides)
+	// A spare runs on the daemon environment, so env overrides launch cold.
+	if len(envOverrides) > 0 {
+		return s.launchProcess(prepared, envOverrides)
+	}
+	proc := s.claimSpare(prepared)
+	if proc == nil {
+		if proc, err = s.launchProcess(prepared, nil); err != nil {
+			return nil, err
+		}
+	}
+	s.refillSpare(prepared)
+	return proc, nil
 }
 
 // prepareAgent applies auto-acquisition and validates launch prerequisites,
@@ -333,6 +354,17 @@ func (s *Supervisor) prepareAgent(agent catalog.Agent) (catalog.Agent, error) {
 // launchProcess is the core transition from a validated catalog agent to a
 // tracked, running process.
 func (s *Supervisor) launchProcess(agent catalog.Agent, envOverrides map[string]string) (*Process, error) {
+	proc, err := s.spawn(agent, envOverrides)
+	if err != nil {
+		return nil, err
+	}
+	s.register(proc)
+	return proc, nil
+}
+
+// spawn starts the agent's process without tracking it as a runtime, so a
+// spare stays out of listings until register.
+func (s *Supervisor) spawn(agent catalog.Agent, envOverrides map[string]string) (*Process, error) {
 	commandPath, workingDir, err := s.resolveLaunch(agent.Launch)
 	if err != nil {
 		return nil, err
@@ -343,7 +375,6 @@ func (s *Supervisor) launchProcess(agent catalog.Agent, envOverrides map[string]
 		AgentID:    agent.ID,
 		AgentName:  agent.DisplayName,
 		Status:     StatusStarting,
-		CreatedAt:  s.now().UTC(),
 		Command:    commandPath,
 		Detected:   agent.Detected,
 		LaunchMode: agent.Launch.Mode,
@@ -370,11 +401,13 @@ func (s *Supervisor) launchProcess(agent catalog.Agent, envOverrides map[string]
 	runtimeInfo.PID = cmd.Process.Pid
 
 	proc := &Process{
-		Runtime: runtimeInfo,
-		Cmd:     cmd,
-		Stdin:   stdinPipe,
-		Stdout:  stdoutPipe,
-		done:    make(chan struct{}),
+		Runtime:   runtimeInfo,
+		Cmd:       cmd,
+		Stdin:     stdinPipe,
+		Stdout:    stdoutPipe,
+		done:      make(chan struct{}),
+		logsDone:  make(chan struct{}),
+		launchKey: spareKey(commandPath, workingDir, agent.Launch.Args),
 	}
 	// The wait goroutine reaps the process and signals Done. The owner calls
 	// RecordExit when Done fires; nothing else waits on the process.
@@ -382,13 +415,22 @@ func (s *Supervisor) launchProcess(agent catalog.Agent, envOverrides map[string]
 		proc.err = cmd.Wait()
 		close(proc.done)
 	}()
+	go func() {
+		defer close(proc.logsDone)
+		s.captureLogs(runtimeInfo.ID, "stderr", stderrPipe, os.Stderr)
+	}()
+	return proc, nil
+}
 
+// register records a spawned process as a running runtime.
+func (s *Supervisor) register(proc *Process) {
+	runtimeInfo := proc.Runtime
+	runtimeInfo.Status = StatusStarting
+	runtimeInfo.CreatedAt = s.now().UTC()
 	s.mu.Lock()
 	s.runtimes[runtimeInfo.ID] = runtimeInfo
 	s.mu.Unlock()
 	s.persistRuntime(runtimeInfo)
-
-	go s.captureLogs(runtimeInfo.ID, "stderr", stderrPipe, os.Stderr)
 
 	s.mu.Lock()
 	runtimeInfo = s.runtimes[runtimeInfo.ID]
@@ -397,7 +439,6 @@ func (s *Supervisor) launchProcess(agent catalog.Agent, envOverrides map[string]
 	s.mu.Unlock()
 	s.persistRuntime(runtimeInfo)
 	proc.Runtime = runtimeInfo
-	return proc, nil
 }
 
 // RecordExit normalizes a process exit into the runtime record: an intentional

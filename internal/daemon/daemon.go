@@ -91,6 +91,10 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 	catalogSvc.SetCustomProvider(customAgentProvider(store, logger))
 	installer := acquire.New(logger, cfg.ManagedBinDir, store)
 	runtimeSvc := gatewayruntime.NewSupervisor(logger, ".", store, installer)
+	// Pre-boot the next process of each agent in use, so a connect skips the
+	// agent's startup (see runtime.spareIdleTTL for how long one idles).
+	runtimeSvc.EnableSpares()
+	defer runtimeSvc.Close() // after serve's session shutdown, before store.Close
 	pairingSvc := pairing.NewServiceWithOptions(logger, store, pairing.Options{
 		ArmTTL:                 cfg.PairingArmTTL,
 		CredentialTTL:          cfg.CredentialTTL,
