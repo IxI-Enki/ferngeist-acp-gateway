@@ -55,7 +55,8 @@ not be coupled. Full release notes live in GitHub Releases.
 - `[additive]` `GET /v1/runtimes/{id}/git/diff` (whole-tree, no `?path=`) —
   the body is gzipped when the client sends `Accept-Encoding: gzip`, like
   `/files/list`; the JSON is unchanged. No `protocolVersion` bump: clients
-  that do not ask for gzip get the plain body (2026-10-19, pending)
+  that do not ask for gzip get the plain body (2026-10-19,
+  [cba44fe](https://github.com/arafatamim/ferngeist-acp-gateway/commit/cba44fe))
 
 - `[additive]` `GET /v1/runtimes/{id}/git/log` reports `baseCommit` outside a
   managed worktree too. For any other checkout it names the commit the
