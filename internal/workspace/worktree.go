@@ -273,6 +273,89 @@ func (s *Service) BaseRef(ctx context.Context, cwd string) string {
 	return "HEAD"
 }
 
+// LogBase is the commit /git/log reports as the workspace's base, which a
+// client uses to tell the branch's own commits from the history it inherited.
+// A managed worktree answers from its record; any other checkout asks git,
+// because a session that began on a PC must read the same way as one that
+// began in a worktree this gateway created. "HEAD" means there is nothing to
+// tell apart.
+func (s *Service) LogBase(ctx context.Context, cwd string) string {
+	if base := s.BaseRef(ctx, cwd); base != "HEAD" {
+		return base
+	}
+	if start, ok := branchStart(ctx, cwd); ok {
+		return start
+	}
+	return forkPoint(ctx, cwd)
+}
+
+// branchStart is the commit the checked-out branch was created at, read from
+// its reflog: the oldest "branch: Created from ..." entry. Unlike merge-base or
+// --fork-point, it keeps naming the right commit after the branch is merged
+// into its base branch, which is the case the client's marking exists for. It
+// reports false for a detached HEAD, a repo without reflogs, and a branch whose
+// reflog has been trimmed past its creation.
+func branchStart(ctx context.Context, cwd string) (string, bool) {
+	name, err := RunGit(ctx, cwd, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if err != nil {
+		return "", false
+	}
+	if name = strings.TrimSpace(name); name == "" {
+		return "", false
+	}
+	out, err := RunGit(ctx, cwd, "reflog", "show", "--no-abbrev", "--format=%H%x00%gs", name)
+	if err != nil {
+		return "", false
+	}
+	// Reflog entries are newest first, so the creation is the last match.
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		sha, subject, ok := strings.Cut(lines[i], "\x00")
+		if !ok || !strings.HasPrefix(subject, "branch: Created from") {
+			continue
+		}
+		if sha = strings.TrimSpace(sha); sha != "" {
+			return sha, true
+		}
+	}
+	return "", false
+}
+
+// forkPoint is merge-base of the default branch and HEAD, for a branch whose
+// reflog no longer names its creation: the trunk it diverged from, which is
+// the same commit until the branch is merged or rebased. A branch that reaches
+// HEAD from there (already merged, or checked out on the trunk itself) has
+// nothing of its own to mark, which is what "HEAD" says.
+func forkPoint(ctx context.Context, cwd string) string {
+	for _, ref := range []string{defaultRefName(ctx, cwd), "main", "master"} {
+		if ref == "" || ref == "HEAD" {
+			continue
+		}
+		mb, err := RunGit(ctx, cwd, "merge-base", "--end-of-options", ref, "HEAD")
+		if err != nil {
+			continue
+		}
+		if mb = strings.TrimSpace(mb); mb == "" {
+			continue
+		}
+		head, err := RunGit(ctx, cwd, "rev-parse", "--verify", "HEAD")
+		if err != nil {
+			continue
+		}
+		if mb != strings.TrimSpace(head) {
+			return mb
+		}
+	}
+	return "HEAD"
+}
+
+// defaultRefName is the trunk the default branch hint would name: origin/HEAD's
+// target when the remote names one, else "". The caller tries local main and
+// master itself, so this only answers what the remote said.
+func defaultRefName(ctx context.Context, cwd string) string {
+	return strings.TrimSpace(gitOrEmpty(ctx, cwd, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"))
+}
+
 // mergeBase returns merge-base of the worktree's recorded base ref and its
 // HEAD: the fork point even after the branch is rebased onto a newer base.
 // It reports false when no ref was recorded (pre-migration rows) or the ref

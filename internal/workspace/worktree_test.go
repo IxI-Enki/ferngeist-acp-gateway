@@ -162,3 +162,103 @@ func TestCreateDefaultsBaseRefToCurrentBranch(t *testing.T) {
 		t.Fatalf("BaseRef = %q, want HEAD's branch main", rec.BaseRef)
 	}
 }
+
+// TestLogBaseNamesAPlainCheckoutsBranchStart covers the checkout the gateway
+// never created: the branch's own commit must still read as its own after the
+// trunk has moved past it, which merge-base alone cannot answer.
+func TestLogBaseNamesAPlainCheckoutsBranchStart(t *testing.T) {
+	repo, c1 := initMainRepo(t)
+	svc, _ := newWorktreeTestService(t)
+	ctx := context.Background()
+
+	runIn := func(dir string, args ...string) {
+		t.Helper()
+		if _, err := RunGit(ctx, dir, args...); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+
+	runIn(repo, "checkout", "-qb", "feat/x")
+	commitFile(t, repo, "work.txt", "mine\n", "my work")
+
+	if got := svc.LogBase(ctx, repo); got != c1 {
+		t.Fatalf("LogBase = %q, want the branch start %q", got, c1)
+	}
+
+	// The trunk takes the branch's commit, then the branch is checked out
+	// again: the start it names must not have moved.
+	runIn(repo, "checkout", "-q", "main")
+	commitFile(t, repo, "up.txt", "up\n", "upstream")
+	runIn(repo, "merge", "-q", "--no-ff", "-m", "merge feat/x", "feat/x")
+	runIn(repo, "checkout", "-q", "feat/x")
+
+	if got := svc.LogBase(ctx, repo); got != c1 {
+		t.Fatalf("LogBase after the trunk moved = %q, want %q", got, c1)
+	}
+	if n, err := RunGit(ctx, repo, "rev-list", "--count", c1+"..HEAD"); err != nil || strings.TrimSpace(n) != "1" {
+		t.Fatalf("commits since the base = %q (err %v), want 1", n, err)
+	}
+}
+
+// TestLogBaseFallsBackToMergeBaseWhenTheReflogForgets: a branch whose reflog no
+// longer records its creation still names its trunk fork point while it has
+// commits of its own, and stops claiming anything once the trunk has them.
+func TestLogBaseFallsBackToMergeBaseWhenTheReflogForgets(t *testing.T) {
+	repo, c1 := initMainRepo(t)
+	svc, _ := newWorktreeTestService(t)
+	ctx := context.Background()
+
+	runIn := func(args ...string) {
+		t.Helper()
+		if _, err := RunGit(ctx, repo, args...); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+
+	runIn("checkout", "-qb", "feat/x")
+	commitFile(t, repo, "work.txt", "mine\n", "my work")
+	runIn("reflog", "expire", "--expire=now", "--all")
+
+	if got := svc.LogBase(ctx, repo); got != c1 {
+		t.Fatalf("LogBase without a reflog = %q, want the fork point %q", got, c1)
+	}
+
+	// Merged into the trunk and with no reflog to read, the branch's own
+	// commits are not knowable: the trunk's history must not be claimed.
+	runIn("checkout", "-q", "main")
+	runIn("merge", "-q", "--no-ff", "-m", "merge feat/x", "feat/x")
+	runIn("checkout", "-q", "feat/x")
+
+	if got := svc.LogBase(ctx, repo); got != "HEAD" {
+		t.Fatalf("LogBase for a merged branch without a reflog = %q, want HEAD", got)
+	}
+}
+
+// TestLogBaseIsHeadOnTheTrunk: a checkout sitting on its own trunk has nothing
+// of its own to mark.
+func TestLogBaseIsHeadOnTheTrunk(t *testing.T) {
+	repo, _ := initMainRepo(t)
+	svc, _ := newWorktreeTestService(t)
+
+	if got := svc.LogBase(context.Background(), repo); got != "HEAD" {
+		t.Fatalf("LogBase on the trunk = %q, want HEAD", got)
+	}
+}
+
+// TestLogBasePrefersAManagedWorktreesBase: worktrees this gateway created keep
+// answering from their record, base ref and all.
+func TestLogBasePrefersAManagedWorktreesBase(t *testing.T) {
+	repo, c1 := initMainRepo(t)
+	svc, _ := newWorktreeTestService(t)
+	ctx := context.Background()
+
+	rec, err := svc.Create(ctx, CreateRequest{Repo: repo, Base: "main", Branch: "feat/x"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	commitFile(t, rec.Path, "agent.txt", "work\n", "agent work")
+
+	if got := svc.LogBase(ctx, rec.Path); got != c1 {
+		t.Fatalf("LogBase in a managed worktree = %q, want %q", got, c1)
+	}
+}

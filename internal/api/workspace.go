@@ -475,7 +475,7 @@ func (s *Server) handleWorkspaceGitLog(w http.ResponseWriter, r *http.Request) {
 		writeWorkspaceError(w, err)
 		return
 	}
-	if base := s.workspaceSvc.BaseRef(r.Context(), cwd); base != "HEAD" {
+	if base := s.workspaceSvc.LogBase(r.Context(), cwd); base != "HEAD" {
 		page.BaseCommit = base
 	}
 	writeJSON(w, http.StatusOK, page)
