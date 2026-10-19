@@ -63,10 +63,12 @@ type Client struct {
 	ttl        time.Duration
 	now        func() time.Time
 
-	mu        sync.Mutex
-	cached    Snapshot
-	cachedAt  time.Time
-	lastError string
+	mu         sync.Mutex
+	cached     Snapshot
+	cachedAt   time.Time
+	lastError  string
+	fetched    bool // a fetch has been attempted; later calls never block
+	refreshing bool
 }
 
 type registryDocument struct {
@@ -119,17 +121,38 @@ func (c *Client) Close() {
 	c.transport.CloseIdleConnections()
 }
 
-// Snapshot returns the cached registry snapshot when it is still fresh and only
-// reaches over the network on cache miss or TTL expiry.
+// Snapshot blocks on the network only for the first fetch. After that it
+// answers at once from the last good snapshot (or the last error) and, when
+// that is stale or failed, refreshes in the background: an offline or slow
+// registry must not stall the API calls that read the catalog.
 func (c *Client) Snapshot(ctx context.Context) (Snapshot, error) {
 	c.mu.Lock()
-	if c.cachedAt.IsZero() || c.now().After(c.cachedAt.Add(c.ttl)) {
+	if !c.fetched {
+		c.fetched, c.refreshing = true, true
 		c.mu.Unlock()
-		return c.refresh(ctx)
+		snapshot, err := c.refresh(ctx)
+		c.mu.Lock()
+		c.refreshing = false
+		c.mu.Unlock()
+		return snapshot, err
 	}
-	snapshot := c.cached
-	c.mu.Unlock()
-	return snapshot, nil
+	defer c.mu.Unlock()
+	if (c.cachedAt.IsZero() || c.now().After(c.cachedAt.Add(c.ttl))) && !c.refreshing {
+		c.refreshing = true
+		go func() {
+			_, _ = c.refresh(context.Background())
+			c.mu.Lock()
+			c.refreshing = false
+			c.mu.Unlock()
+		}()
+	}
+	if c.cachedAt.IsZero() {
+		if c.lastError != "" {
+			return Snapshot{}, errors.New(c.lastError)
+		}
+		return Snapshot{}, errors.New("registry fetch in progress")
+	}
+	return c.cached, nil
 }
 
 // Status exposes fetch health for diagnostics without forcing a refresh.

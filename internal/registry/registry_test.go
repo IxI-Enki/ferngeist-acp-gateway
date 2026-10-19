@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -167,5 +168,34 @@ func TestClientParsesUvxDistribution(t *testing.T) {
 	}
 	if len(entry.UvxArgs) != 1 || entry.UvxArgs[0] != "-x" {
 		t.Fatalf("UvxArgs = %v, want [-x]", entry.UvxArgs)
+	}
+}
+
+func TestClientServesStaleSnapshotWithoutBlocking(t *testing.T) {
+	hang := make(chan struct{})
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) > 1 {
+			<-hang // registry gone slow/offline after the first fetch
+			return
+		}
+		_, _ = w.Write([]byte(`{"version":"1","agents":[{"id":"a"}]}`))
+	}))
+	defer server.Close()
+	defer close(hang)
+
+	client := New(server.URL, time.Hour)
+	if _, err := client.Snapshot(context.Background()); err != nil {
+		t.Fatalf("first Snapshot() error = %v", err)
+	}
+	client.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+
+	start := time.Now()
+	snapshot, err := client.Snapshot(context.Background())
+	if err != nil || snapshot.Version != "1" {
+		t.Fatalf("stale Snapshot() = %+v, %v; want cached version 1", snapshot, err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("stale Snapshot() took %v; want it served without waiting on the network", elapsed)
 	}
 }
