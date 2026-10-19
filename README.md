@@ -1,5 +1,7 @@
 # Ferngeist Gateway
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/arafatamim/ferngeist-acp-gateway)
+
 The desktop half of [Ferngeist](https://github.com/arafatamim/Ferngeist). Install
 it on the computer where your coding agents run, pair your phone, and drive those
 agents from the Ferngeist Android app.
