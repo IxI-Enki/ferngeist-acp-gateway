@@ -52,6 +52,18 @@ not be coupled. Full release notes live in GitHub Releases.
 
 ## History
 
+- `[additive]` `GET /v1/runtimes/{id}/git/log` reports `baseCommit` outside a
+  managed worktree too. For any other checkout it names the commit the
+  checked-out branch started from — the oldest `branch: Created from …` reflog
+  entry — falling back to the merge-base with `origin/HEAD`, `main` or `master`
+  when the reflog no longer records the creation. It is omitted (`HEAD`) for a
+  detached HEAD, the trunk itself, and a branch whose own commits the trunk
+  already contains, and it keeps its existing meaning inside a managed worktree
+  (the worktree's merge-base with its recorded base ref). A client that reads
+  the field now gets the marking on plain checkouts too; one that does not is
+  unaffected. No `protocolVersion` bump. (2026-10-19,
+  [1628f12](https://github.com/arafatamim/ferngeist-acp-gateway/commit/1628f12))
+
 - `[additive]` Clock-skew recovery for proof-of-possession. `GET /v1/status`
   gains `serverTime` (the gateway's clock, RFC 3339 UTC). Every auth rejection
   (the `401`s and scope `403`s from the credential gate) gains a stable `code`

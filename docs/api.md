@@ -640,8 +640,15 @@ opened or loaded on this runtime returns `404`.
   - `pushed` is `true` when some `origin/*` branch contains the commit. With no
     `origin` refs, or too many local-only commits to list, every commit is
     `false`.
-  - `baseCommit` is present only inside a [managed worktree](#worktrees): the
-    commit the worktree branched from.
+  - `baseCommit` is the commit the checked-out branch started from, so a client
+    can tell the branch's own commits from the history it inherited. Inside a
+    [managed worktree](#worktrees) it is the commit the worktree branched from
+    (its merge-base with the recorded base ref). In any other checkout it comes
+    from the branch's reflog — the oldest `branch: Created from …` entry —
+    falling back to the merge-base with `origin/HEAD`, then `main` or `master`,
+    when the reflog no longer records the creation. Omitted (`HEAD`) when there
+    is nothing to mark: a detached HEAD, the trunk itself, or a branch whose
+    commits the trunk already contains.
   - An empty repository returns `200` with `head: ""` and `"commits": []`.
   - Error responses:
     - `400` — `head` is not 7–64 lowercase hex, or names no commit (for
