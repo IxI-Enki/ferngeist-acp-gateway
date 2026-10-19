@@ -151,20 +151,22 @@ daemon. Neither the dispatcher nor the session layer changes.
 ## Workspace browsing
 
 The gateway exposes **read-only** views into the code the agent is working on
-(files, git status, git diff) so a phone client can inspect the project without
-an editor. The anchor is the **project directory the client opened in the
-agent**: the session's ACP state records the ACP `session/new` request's
-`params.cwd` inbound (and re-captures it from `session/load`, which Ferngeist
-sends when resuming a session) in `internal/session/acpstate.go`, holds it under
-the same lock as the ACP session id, and surfaces it via
-`RuntimeSession.WorkingDir(runtimeID)` (`internal/session/lifecycle.go`). This is
-deliberately **not** the launch working directory — PATH-resolved agents run in
-the gateway's own cwd, which is not the project.
+(files, file lists, git status, diff, history and refs) so a phone client can
+inspect the project without an editor. The anchor is the **project directory
+the client opened in the agent**: the session's ACP state records the ACP
+`session/new` request's `params.cwd` inbound (and re-captures it from
+`session/load`, which Ferngeist sends when resuming a session) in
+`internal/session/acpstate.go`, holds it under the same lock as the ACP session
+id, and surfaces it via `RuntimeSession.WorkingDir(runtimeID)`
+(`internal/session/lifecycle.go`). This is deliberately **not** the launch
+working directory — PATH-resolved agents run in the gateway's own cwd, which is
+not the project.
 
-The three handlers live in `internal/api/workspace.go` and are gated behind the
-same `ScopeRead` auth used by `handleRuntimeLogs`. Their payloads reuse the ACP
-**v1** schema types vendored in `github.com/coder/acp-go-sdk` (package `acp`)
-so the Ferngeist client can decode them with SDK types it already has:
+The workspace handlers live in `internal/api/workspace.go` and are gated behind
+the same `ScopeRead` auth used by `handleRuntimeLogs`. The file and git
+payloads reuse the ACP **v1** schema types vendored in
+`github.com/coder/acp-go-sdk` (package `acp`) so the Ferngeist client can decode
+them with SDK types it already has:
 
 - `GET /v1/runtimes/{id}/files?path=<rel>` — bounded file read confined to the
   project directory (streams through `io.LimitReader` at the 1 MiB cap, so a
@@ -173,6 +175,10 @@ so the Ferngeist client can decode them with SDK types it already has:
   detection) return an `acp.BlobResourceContents` (`blob` base64/`uri`/`mimeType`).
   `size`/`truncated` are gateway extensions (`size` is the full on-disk file
   size); `uri` is the absolute `file://` URI.
+- `GET /v1/runtimes/{id}/files/list` — the tracked and untracked, non-ignored
+  paths under the project directory (`git ls-files -z --cached --others
+  --exclude-standard`), sorted and deduplicated, capped at 50,000 and gzipped
+  on request. Lets a client resolve the bare file names an agent writes out.
 - `GET /v1/runtimes/{id}/git/status` — `git -C <cwd> status --porcelain=v2 --branch`,
   enriched with per-file line counts (`git diff HEAD --numstat`, covering the
   whole HEAD → working-tree delta so staged + unstaged edits count together;
@@ -190,6 +196,19 @@ so the Ferngeist client can decode them with SDK types it already has:
   against `HEAD`; `oldText` is present only when the file exists in `HEAD`, so
   new/untracked files and files renamed within the working tree have it
   omitted. Committed history beyond `HEAD` is not included.
+- `GET /v1/runtimes/{id}/git/log?head=<sha>&skip=<n>&limit=<n>` — paged commit
+  history, newest first, with per-commit refs and `pushed`, the walk's `total`,
+  and `baseCommit` (a managed worktree's base or a plain checkout's branch
+  start). `compare=<ref>` restricts the walk to `<ref>..HEAD`; `beyond=<n>`
+  also returns the target's own tip commits.
+- `GET /v1/runtimes/{id}/git/commits/{sha}` — the files a commit changed under
+  the project directory, compared with its first parent.
+- `GET /v1/runtimes/{id}/git/refs` — local branches, `origin/*` refs and tags
+  for the compare picker, plus a `default` labelling hint.
+
+`compare=<ref>` on `/git/status`, `/git/diff` and `/git/log` points them at
+another ref's tip — a two-dot comparison with the working tree included —
+instead of `HEAD` or the managed worktree's base.
 
 **Path confinement.** `resolveWithinRoot` rejects any path that escapes the
 project directory: absolute paths, `..` traversal, and symlink escapes (both the
