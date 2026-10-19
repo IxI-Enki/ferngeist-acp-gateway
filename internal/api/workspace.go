@@ -16,6 +16,7 @@ import (
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/session"
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/workspace"
 	"github.com/coder/acp-go-sdk"
+	"golang.org/x/sync/errgroup"
 )
 
 // fileReadResponse is the payload for GET /v1/runtimes/{id}/files. It embeds
@@ -143,13 +144,13 @@ func (s *Server) handleWorkspaceFile(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// writeJSONFileList writes the file-list payload, gzipping the body when the
-// request's Accept-Encoding includes gzip. Scoped to this handler, not a
-// global middleware: the other endpoints' bodies are small and /files content
+// writeJSONGzip writes payload, gzipping the body when the request's
+// Accept-Encoding includes gzip. Used by the file list and whole-tree diff, not
+// a global middleware: the other endpoints' bodies are small and /files content
 // is often already compressed. Vary is set on both paths for correct caching;
 // the 404/422 error paths go through plain writeError on purpose, since error
 // bodies are tiny.
-func writeJSONFileList(w http.ResponseWriter, r *http.Request, status int, payload fileListResponse) {
+func writeJSONGzip(w http.ResponseWriter, r *http.Request, status int, payload any) {
 	w.Header().Set("Vary", "Accept-Encoding")
 	if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 		writeJSON(w, status, payload)
@@ -180,7 +181,7 @@ func (s *Server) handleWorkspaceFileList(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
-	writeJSONFileList(w, r, http.StatusOK, fileListResponse{Files: files, Truncated: truncated})
+	writeJSONGzip(w, r, http.StatusOK, fileListResponse{Files: files, Truncated: truncated})
 }
 
 // handleWorkspaceGitRefs lists the refs a client can compare against.
@@ -378,8 +379,12 @@ func (s *Server) handleWorkspaceGitDiff(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
-	entries := make([]acp.ToolCallContentDiff, 0, len(changed))
-	for _, f := range changed {
+	// One git show per file: run them in parallel (bounded, order kept) so a
+	// large change set is not a serial chain of process spawns.
+	slots := make([]*acp.ToolCallContentDiff, len(changed))
+	var group errgroup.Group
+	group.SetLimit(8)
+	for i, f := range changed {
 		// Submodules and collapsed untracked dirs are directories, not files;
 		// they cannot be diffed as file content (git show HEAD:<path> fails
 		// for a gitlink, ReadFileLimited fails on a dir). /git/status reports
@@ -391,15 +396,23 @@ func (s *Server) handleWorkspaceGitDiff(w http.ResponseWriter, r *http.Request) 
 		if err != nil {
 			continue
 		}
-		entry, err := workspace.DiffEntry(r.Context(), cwd, ref, f.Path, abs)
-		if err != nil {
+		group.Go(func() error {
 			// Skip files we cannot build a diff for (e.g. unreadable), but
 			// keep going for the rest.
-			continue
-		}
-		entries = append(entries, entry)
+			if entry, err := workspace.DiffEntry(r.Context(), cwd, ref, f.Path, abs); err == nil {
+				slots[i] = &entry
+			}
+			return nil
+		})
 	}
-	writeJSON(w, http.StatusOK, entries)
+	_ = group.Wait()
+	entries := make([]acp.ToolCallContentDiff, 0, len(changed))
+	for _, entry := range slots {
+		if entry != nil {
+			entries = append(entries, *entry)
+		}
+	}
+	writeJSONGzip(w, r, http.StatusOK, entries)
 }
 
 // writeCommitFileDiff answers /git/diff?commit=<sha>&path=<rel>[&oldPath=<rel>]:

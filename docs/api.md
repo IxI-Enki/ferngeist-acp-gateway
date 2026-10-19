@@ -512,6 +512,9 @@ opened or loaded on this runtime returns `404`.
     `?path=` the body is a **single object**; without it, the body is a **JSON
     array** with one object per changed file (the same file set `/git/status`
     reports).
+  - The whole-tree body is gzipped when the request's `Accept-Encoding`
+    includes `gzip` (`Content-Encoding: gzip`, `Vary: Accept-Encoding`); it
+    carries every changed file's full old and new text.
   - `oldText` is the committed version of the file (`git show HEAD:<path>`);
     it is omitted (absent from the JSON, not `null`) for new/untracked files
     or when there is no HEAD commit. `newText` is the working-tree file content

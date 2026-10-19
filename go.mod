@@ -10,6 +10,7 @@ require (
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/urfave/cli/v3 v3.8.0
 	go.uber.org/goleak v1.3.0
+	golang.org/x/sync v0.22.0
 	modernc.org/sqlite v1.47.0
 	tailscale.com v1.102.2
 )
@@ -58,7 +59,6 @@ require (
 	golang.org/x/mod v0.37.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/term v0.45.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
