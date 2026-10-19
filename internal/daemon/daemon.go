@@ -90,6 +90,8 @@ func Run(ctx context.Context, build api.BuildInfo) error {
 	// client edits show up without a daemon restart.
 	catalogSvc.SetCustomProvider(customAgentProvider(store, logger))
 	installer := acquire.New(logger, cfg.ManagedBinDir, store)
+	installer.SetJSRuntime(cfg.JSRuntime)
+	installer.PruneNpm() // before any agent launches from an install dir
 	runtimeSvc := gatewayruntime.NewSupervisor(logger, ".", store, installer)
 	// Pre-boot the next process of each agent in use, so a connect skips the
 	// agent's startup (see runtime.spareIdleTTL for how long one idles).

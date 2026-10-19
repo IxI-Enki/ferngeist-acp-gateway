@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/arafatamim/ferngeist-acp-gateway/internal/catalog"
@@ -25,6 +26,11 @@ type Installer struct {
 	httpClient *http.Client
 	managedDir string
 	store      *storage.SQLiteStore
+
+	// mu guards the npm agent fields (see npm.go).
+	mu            sync.Mutex
+	jsRuntime     string
+	npmInstalling map[string]bool // install dir -> background install running
 }
 
 func New(logger *slog.Logger, managedDir string, store *storage.SQLiteStore) *Installer {

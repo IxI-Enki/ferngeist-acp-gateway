@@ -337,6 +337,9 @@ func (s *Supervisor) prepareAgent(agent catalog.Agent) (catalog.Agent, error) {
 			agent = acquiredAgent
 		}
 	}
+	if s.installer != nil {
+		agent = s.installer.EnsureNpm(agent)
+	}
 
 	// Validate all prerequisites before attempting launch
 	if !agent.Detected {

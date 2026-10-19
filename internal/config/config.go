@@ -103,6 +103,10 @@ type Config struct {
 	// TailscalePrivate restricts exposure to the tailnet only (tsnet
 	// ListenTLS / `tailscale serve`) instead of public Funnel.
 	TailscalePrivate bool
+	// JSRuntime runs npm-distributed agents: "auto" (bun when installed, else
+	// node), "bun", "node", or "npm" (keep launching through npm exec).
+	// Empty/invalid values mean "auto".
+	JSRuntime string
 }
 
 type PersistedSettings struct {
@@ -149,6 +153,7 @@ func Load() Config {
 		TailscaleAuthKey:       strings.TrimSpace(os.Getenv("FERNGEIST_GATEWAY_TAILSCALE_AUTH_KEY")),
 		TailscaleHostname:      envOrDefault("FERNGEIST_GATEWAY_TAILSCALE_HOSTNAME", "ferngeist-gateway"),
 		TailscalePrivate:       envBool("FERNGEIST_GATEWAY_TAILSCALE_PRIVATE"),
+		JSRuntime:              normalizeJSRuntime(os.Getenv("FERNGEIST_GATEWAY_JS_RUNTIME")),
 	}
 	// UpdateCheckEnabled defaults to true; only an explicit false/0 disables it.
 	cfg.UpdateCheckEnabled = true
@@ -218,6 +223,15 @@ func normalizeTailscaleMode(value string) string {
 		return strings.ToLower(strings.TrimSpace(value))
 	default:
 		return "off"
+	}
+}
+
+func normalizeJSRuntime(value string) string {
+	switch v := strings.ToLower(strings.TrimSpace(value)); v {
+	case "bun", "node", "npm":
+		return v
+	default:
+		return "auto"
 	}
 }
 

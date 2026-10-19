@@ -248,6 +248,6 @@ endpoint. No package reaches into another's snapshot state.
 ## Notes
 
 - Agent support comes from the ACP registry plus local helper adapters.
-- The gateway can auto-acquire managed binaries when supported.
+- The gateway can auto-acquire managed binaries when supported, and installs npm-distributed agents once to launch them on bun or node directly instead of through `npm exec` (`internal/acquire/npm.go`, see [docs/configuration.md](configuration.md#npm-agents)).
 - The Ferngeist Android app uses this service as its backend.
 - See [docs/api.md](api.md) for the full API surface, including session endpoints and push token registration.

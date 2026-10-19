@@ -13,6 +13,7 @@ Ferngeist Gateway is configured through environment variables and persisted stat
 | `FERNGEIST_GATEWAY_STATE_DB` | SQLite state database path | platform default |
 | `FERNGEIST_GATEWAY_LOG_DIR` | Log directory | platform default |
 | `FERNGEIST_GATEWAY_MANAGED_BIN_DIR` | Managed binary install directory | platform default |
+| `FERNGEIST_GATEWAY_JS_RUNTIME` | Runtime for npm-distributed registry agents: `auto` (bun when it is on `PATH`, else node), `bun`, `node`, or `npm` (launch through `npm exec`, the old behavior). See [npm agents](#npm-agents) | `auto` |
 | `FERNGEIST_GATEWAY_REGISTRY_URL` | ACP registry URL | ACP default |
 | `FERNGEIST_GATEWAY_CREDENTIAL_TTL_SECONDS` | Paired device token lifetime | `7 days` |
 | `FERNGEIST_GATEWAY_CREDENTIAL_GRACE_SECONDS` | How long an expired credential stays recoverable via refresh; `0` disables grace (hard-delete-on-expiry) | `90 days` |
@@ -51,6 +52,31 @@ Ferngeist Gateway is configured through environment variables and persisted stat
 | `FERNGEIST_GATEWAY_PAIRING_COMPLETE_REFILL_SECONDS` | Rate limit refill for pairing complete |
 | `FERNGEIST_GATEWAY_PAIRING_BURST_PER_IP` | Per-IP burst limit |
 | `FERNGEIST_GATEWAY_PAIRING_BURST_GLOBAL` | Global burst limit |
+
+## npm agents
+
+Registry agents published on npm (claude-acp, codex-acp, pi-acp, ...) are
+installed once into `<managed bin dir>/npm/<package>@<version>` and launched
+directly with the runtime `FERNGEIST_GATEWAY_JS_RUNTIME` picks, instead of
+through `npm exec`. The `npm exec` wrapper is a second node process that idles
+for the agent's whole life and re-checks the package on every launch. Measured
+on claude-acp: an idle agent drops from 227 MB to 119 MB on node and 74 MB on
+bun, and it answers `initialize` in ~110–200 ms instead of 0.4–1.4 s.
+
+- The first launch of a new agent version still goes through `npm exec` while
+  the gateway runs `npm install` in the background; later launches use the
+  install. A failed install is logged and the agent keeps launching through
+  `npm exec`.
+- Only exact-version packages are installed (the registry pins versions). On
+  startup the daemon removes all but the newest install of each package and any
+  install that was interrupted.
+- `npm` must be on `PATH` to install, and the chosen runtime to launch. When
+  neither bun nor node is found, or with `FERNGEIST_GATEWAY_JS_RUNTIME=npm`, the
+  agent launches through `npm exec` as before.
+- Agents are built and tested on node. If one misbehaves under bun, set
+  `FERNGEIST_GATEWAY_JS_RUNTIME=node`.
+- Unlike `npm exec`, a direct launch does not put the package's
+  `node_modules/.bin` on `PATH` or set `npm_*` variables.
 
 ## Notes
 
